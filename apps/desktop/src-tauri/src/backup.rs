@@ -6,7 +6,7 @@
 //!
 //! 文件格式：MAGIC("SDBK") | ver(1B) | salt(16B) | nonce(12B) | ciphertext(JSON payload)
 
-use crate::crypto::{self, KEY_LEN};
+use crate::crypto;
 use crate::store::{ServerRow, Store};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;

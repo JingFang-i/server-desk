@@ -464,7 +464,20 @@ pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
         .unwrap_or_default();
     let sidecar_path = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("serverdesk-mcp").display().to_string()))
+        .and_then(|exe| {
+            let dir = exe.parent()?;
+            // 开发：target/debug 同目录；macOS .app：Contents/Resources；Windows：安装目录
+            let candidates = [
+                dir.join("serverdesk-mcp"),
+                dir.join("../Resources/serverdesk-mcp"),
+                dir.join("serverdesk-mcp.exe"),
+                dir.join("../Resources/serverdesk-mcp.exe"),
+            ];
+            candidates
+                .iter()
+                .find(|p| p.exists())
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_else(|| "serverdesk-mcp".into());
     let config_json = serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {

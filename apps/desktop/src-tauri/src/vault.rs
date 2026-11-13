@@ -110,7 +110,7 @@ fn from_hex(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn argon2_kek(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-    let mut kek = Zeroizing::new(crate::crypto::argon2_kek(password, salt).map_err(VaultError::Io)?);
+    let kek = Zeroizing::new(crate::crypto::argon2_kek(password, salt).map_err(VaultError::Io)?);
     Ok(kek)
 }
 
