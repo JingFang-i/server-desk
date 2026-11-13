@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
-const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT: usize = 512 * 1024;
 const RECONNECT_MAX: usize = 2;
 
@@ -18,6 +17,8 @@ const RECONNECT_MAX: usize = 2;
 #[serde(rename_all = "camelCase")]
 pub enum ConnStatus {
     Connected,
+    /// 由「不在连接池中」推断，非池内显式状态（供前端/契约使用）
+    #[allow(dead_code)]
     Disconnected,
 }
 
@@ -196,7 +197,7 @@ impl SshPool {
     pub async fn disconnect(&self, server_id: &str) -> bool {
         let mut pool = self.pool.lock().await;
         match self.take(&mut pool, server_id) {
-            Some(mut s) => {
+            Some(s) => {
                 let _ = s
                     .disconnect(Disconnect::ByApplication, "client close", "en")
                     .await;

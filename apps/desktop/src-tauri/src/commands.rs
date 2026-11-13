@@ -3,7 +3,7 @@
 //! AI 侧（M3 起）走 MCP sidecar → guard 安全管线，结果绝不含凭据字段。
 
 use crate::crypto;
-use crate::ssh::{self, ConnInfo, ConnParams, ExecResult};
+use crate::ssh::{ConnInfo, ConnParams, ExecResult};
 use crate::state::AppState;
 use crate::vault::{MigrationOutcome, VaultStatus};
 use chrono::Utc;
@@ -312,7 +312,7 @@ pub async fn ssh_test(state: State<'_, AppState>, server_id: String) -> Result<T
         .await;
     let latency = started.elapsed().as_millis() as u64;
     match res {
-        Ok(mut session) => {
+        Ok(session) => {
             let _ = session
                 .disconnect(russh::Disconnect::ByApplication, "test", "en")
                 .await;

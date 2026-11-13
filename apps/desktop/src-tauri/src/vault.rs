@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const KEYCHAIN_SERVICE: &str = "com.qsmx.serverdesk";
 const KEYCHAIN_USER: &str = "vault-dek";
