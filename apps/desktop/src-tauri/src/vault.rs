@@ -110,14 +110,7 @@ fn from_hex(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn argon2_kek(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    // OWASP 推荐：m=19MiB, t=2, p=1
-    let params = Params::new(19_456, 2, 1, Some(KEY_LEN))
-        .map_err(|e| VaultError::Io(format!("Argon2 参数非法: {e}")))?;
-    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut kek = Zeroizing::new([0u8; KEY_LEN]);
-    a2.hash_password_into(password.as_bytes(), salt, &mut kek[..])
-        .map_err(|e| VaultError::Io(format!("Argon2 派生失败: {e}")))?;
+    let mut kek = Zeroizing::new(crate::crypto::argon2_kek(password, salt).map_err(VaultError::Io)?);
     Ok(kek)
 }
 

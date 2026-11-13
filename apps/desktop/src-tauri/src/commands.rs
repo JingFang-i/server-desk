@@ -477,3 +477,126 @@ pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
     .map_err(|e| e.to_string())?;
     Ok(McpInfo { port, token, sidecar_path, config_json })
 }
+
+// ---------- 备份与恢复 ----------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSettings {
+    pub enabled: bool,
+    pub keep: u32,
+    pub interval_hours: u32,
+    pub last_run: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupInfo {
+    pub settings: BackupSettings,
+    pub files: Vec<crate::backup::BackupFileMeta>,
+}
+
+fn read_auto_settings(store: &crate::store::Store) -> BackupSettings {
+    let meta = |k: &str| store.get_meta(k).ok().flatten();
+    BackupSettings {
+        enabled: meta("auto_backup_enabled").map(|s| s == "1").unwrap_or(false),
+        keep: meta("auto_backup_keep").and_then(|s| s.parse().ok()).unwrap_or(7),
+        interval_hours: meta("auto_backup_interval_hours")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24),
+        last_run: meta("auto_backup_last"),
+    }
+}
+
+#[tauri::command]
+pub fn backup_info(state: State<'_, Arc<AppState>>) -> Result<BackupInfo, String> {
+    Ok(BackupInfo {
+        settings: read_auto_settings(&state.store),
+        files: crate::backup::list_auto_backups(&state.dir),
+    })
+}
+
+#[tauri::command]
+pub fn backup_export(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    password: String,
+) -> Result<crate::backup::ExportResult, String> {
+    if !state.vault.is_unlocked() {
+        return Err("保险库已锁定，请先解锁".into());
+    }
+    let res = crate::backup::export_encrypted(&state.store, std::path::Path::new(&path), &password)?;
+    ops::audit(&state, "user", None, "backup_export", &truncate(&path, 300), &format!("{} 台", res.count));
+    Ok(res)
+}
+
+#[tauri::command]
+pub fn backup_restore(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    password: String,
+    mode: String,
+) -> Result<crate::backup::RestoreResult, String> {
+    let payload = crate::backup::read_payload(std::path::Path::new(&path), &password)?;
+    let res = crate::backup::restore_payload(&state.store, &payload, &mode)?;
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "backup_restore",
+        &format!("{mode}:{}", truncate(&path, 200)),
+        &format!("{} 台", res.imported),
+    );
+    Ok(res)
+}
+
+#[tauri::command]
+pub fn auto_backup_now(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let s = read_auto_settings(&state.store);
+    let path = crate::backup::run_auto_backup(&state.store, &state.vault, &state.dir, s.keep as usize)?;
+    state.store.set_meta("auto_backup_last", &now())?;
+    ops::audit(&state, "user", None, "auto_backup_now", "手动触发自动备份", "ok");
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+pub fn auto_backup_save_settings(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+    keep: u32,
+    interval_hours: u32,
+) -> Result<BackupInfo, String> {
+    state.store.set_meta("auto_backup_enabled", if enabled { "1" } else { "0" })?;
+    state.store.set_meta("auto_backup_keep", &keep.clamp(1, 50).to_string())?;
+    state.store.set_meta("auto_backup_interval_hours", &interval_hours.clamp(1, 168).to_string())?;
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "auto_backup_settings",
+        &format!("enabled={enabled} keep={keep} interval={interval_hours}h"),
+        "ok",
+    );
+    Ok(BackupInfo {
+        settings: read_auto_settings(&state.store),
+        files: crate::backup::list_auto_backups(&state.dir),
+    })
+}
+
+#[tauri::command]
+pub fn auto_backup_restore(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    mode: String,
+) -> Result<crate::backup::RestoreResult, String> {
+    let res = crate::backup::restore_auto_backup(&state.store, &state.vault, &state.dir, &name, &mode)?;
+    ops::audit(&state, "user", None, "auto_backup_restore", &name, &format!("{} 台", res.imported));
+    Ok(res)
+}
+
+#[tauri::command]
+pub fn auto_backup_delete(state: State<'_, Arc<AppState>>, name: String) -> Result<(), String> {
+    crate::backup::delete_auto_backup(&state.dir, &name)?;
+    ops::audit(&state, "user", None, "auto_backup_delete", &name, "ok");
+    Ok(())
+}

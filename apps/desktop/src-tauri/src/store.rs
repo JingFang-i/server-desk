@@ -220,6 +220,69 @@ impl Store {
             .map_err(|e| format!("清空数据失败: {e}"))
     }
 
+    /// 备份恢复-覆盖模式：事务内清空并重建服务器表（保留审计日志）。
+    pub fn replace_all_servers(&self, rows: &[ServerRow]) -> Result<(), String> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("开启事务失败: {e}"))?;
+        tx.execute_batch("DELETE FROM servers; DELETE FROM known_hosts;")
+            .map_err(|e| format!("清空服务器失败: {e}"))?;
+        for r in rows {
+            tx.execute(
+                &format!(
+                    "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+                ),
+                params![
+                    r.id,
+                    r.name,
+                    r.host,
+                    r.port as i64,
+                    r.username,
+                    r.auth_type,
+                    r.secret_blob,
+                    r.group_name,
+                    r.tags,
+                    r.notes,
+                    r.allow_ai as i64,
+                    r.created_at,
+                    r.updated_at
+                ],
+            )
+            .map_err(|e| format!("插入失败: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("提交事务失败: {e}"))
+    }
+
+    /// 备份恢复-合并模式：按 id 存在则整体更新，不存在则插入。
+    pub fn upsert_server(&self, r: &ServerRow) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            &format!(
+                "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+                 ON CONFLICT(id) DO UPDATE SET name=?2, host=?3, port=?4, username=?5, auth_type=?6, \
+                 secret_blob=?7, group_name=?8, tags=?9, notes=?10, allow_ai=?11, updated_at=?13"
+            ),
+            params![
+                r.id,
+                r.name,
+                r.host,
+                r.port as i64,
+                r.username,
+                r.auth_type,
+                r.secret_blob,
+                r.group_name,
+                r.tags,
+                r.notes,
+                r.allow_ai as i64,
+                r.created_at,
+                r.updated_at
+            ],
+        )
+        .map_err(|e| format!("合并失败: {e}"))?;
+        Ok(())
+    }
+
     // ---------- known_hosts（TOFU） ----------
 
     pub fn get_host_fingerprint(&self, server_id: &str) -> Result<Option<String>, String> {

@@ -22,6 +22,18 @@ pub fn remove_legacy_key(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(LEGACY_KEY_FILE));
 }
 
+/// Argon2id 口令派生 KEK（保险库与备份文件共用，OWASP 参数 19MiB/t=2/p=1）。
+pub fn argon2_kek(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(19_456, 2, 1, Some(KEY_LEN))
+        .map_err(|e| format!("Argon2 参数非法: {e}"))?;
+    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut kek = [0u8; KEY_LEN];
+    a2.hash_password_into(password.as_bytes(), salt, &mut kek)
+        .map_err(|e| format!("Argon2 派生失败: {e}"))?;
+    Ok(kek)
+}
+
 /// 加密：输出 nonce(12B) || ciphertext。
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new(key.into());

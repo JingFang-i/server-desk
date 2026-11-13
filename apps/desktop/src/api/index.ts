@@ -100,6 +100,34 @@ export interface McpInfo {
   configJson: string;
 }
 
+export interface BackupSettings {
+  enabled: boolean;
+  keep: number;
+  intervalHours: number;
+  lastRun: string | null;
+}
+
+export interface BackupFileMeta {
+  name: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+export interface BackupInfo {
+  settings: BackupSettings;
+  files: BackupFileMeta[];
+}
+
+export interface ExportResult {
+  count: number;
+  path: string;
+}
+
+export interface RestoreResult {
+  imported: number;
+  mode: string;
+}
+
 // ---------- API ----------
 
 export const api = {
@@ -137,4 +165,16 @@ export const api = {
   auditList: (limit?: number, source?: string) =>
     invoke<AuditEntry[]>("audit_list", { limit, source }),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
+  // 备份与恢复
+  backupInfo: () => invoke<BackupInfo>("backup_info"),
+  backupExport: (path: string, password: string) =>
+    invoke<ExportResult>("backup_export", { path, password }),
+  backupRestore: (path: string, password: string, mode: string) =>
+    invoke<RestoreResult>("backup_restore", { path, password, mode }),
+  autoBackupNow: () => invoke<string>("auto_backup_now"),
+  autoBackupSaveSettings: (enabled: boolean, keep: number, intervalHours: number) =>
+    invoke<BackupInfo>("auto_backup_save_settings", { enabled, keep, intervalHours }),
+  autoBackupRestore: (name: string, mode: string) =>
+    invoke<RestoreResult>("auto_backup_restore", { name, mode }),
+  autoBackupDelete: (name: string) => invoke<void>("auto_backup_delete", { name }),
 };
