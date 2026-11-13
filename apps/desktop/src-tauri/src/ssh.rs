@@ -107,9 +107,9 @@ struct Pool {
     sessions: HashMap<String, Handle<HostKeyVerifier>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SshPool {
-    pool: AsyncMutex<Pool>,
+    pool: Arc<AsyncMutex<Pool>>,
 }
 
 fn make_config() -> Arc<russh::client::Config> {

@@ -1,6 +1,10 @@
 // ServerDesk 桌面应用 Rust 后端入口。
+mod approvals;
 mod commands;
 mod crypto;
+mod guard;
+mod ipc;
+mod ops;
 mod ssh;
 mod state;
 mod store;
@@ -26,6 +30,7 @@ fn main() {
                 Ok(false) => {}
                 Err(e) => eprintln!("保险库：钥匙串自动解锁失败（{e}），需要手动解锁"),
             }
+            let guard = guard::Guard::load(&store);
 
             // 空闲自动锁巡检：每 30s 检查一次，锁上时广播事件给前端
             let vault_for_task = vault.clone();
@@ -40,11 +45,24 @@ fn main() {
                 }
             });
 
-            app.manage(AppState {
+            let state = Arc::new(AppState {
                 store,
                 vault,
                 ssh: ssh::SshPool::new(),
+                guard,
+                approvals: approvals::Approvals::default(),
+                handle: app.handle().clone(),
+                dir: dir.clone(),
             });
+            app.manage(state.clone());
+
+            // 本地 IPC（MCP sidecar 桥）：token 文件 0600，端口随机
+            let state_for_ipc = state.clone();
+            let dir_for_ipc = dir.clone();
+            tauri::async_runtime::spawn(async move {
+                ipc::serve(state_for_ipc, dir_for_ipc).await;
+            });
+
             eprintln!("ServerDesk 数据目录: {}", dir.display());
             Ok(())
         })
@@ -68,7 +86,18 @@ fn main() {
             commands::ssh_disconnect,
             commands::ssh_status,
             commands::ssh_exec,
-            commands::ssh_reset_hostkey
+            commands::ssh_reset_hostkey,
+            // AI 安全管线
+            commands::guard_info,
+            commands::guard_set_rules,
+            commands::mcp_set_enabled,
+            // 审批
+            commands::approvals_pending,
+            commands::approval_decide,
+            // 审计
+            commands::audit_list,
+            // MCP 接入信息
+            commands::mcp_info
         ])
         .run(tauri::generate_context!())
         .expect("ServerDesk 启动失败");

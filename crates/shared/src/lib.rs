@@ -61,3 +61,60 @@ pub struct TestResult {
     pub latency_ms: Option<u64>,
     pub message: String,
 }
+
+// ---------- MCP sidecar ⇄ 主应用 的本地 IPC 契约 ----------
+
+/// sidecar → 主应用 的工具调用请求（经 127.0.0.1 HTTP + Bearer token）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcRequest {
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// 主应用 → sidecar 的统一应答。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl IpcResponse {
+    pub fn ok(data: serde_json::Value) -> Self {
+        Self { ok: true, data, error: None }
+    }
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self { ok: false, data: serde_json::Value::Null, error: Some(msg.into()) }
+    }
+}
+
+/// 应用数据目录（主应用 Tauri app_data_dir 与 sidecar 推导保持一致）。
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Library/Application Support/com.qsmx.serverdesk"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA").map(|h| std::path::PathBuf::from(h).join("com.qsmx.serverdesk"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("HOME").map(|h| {
+            let mut p = match std::env::var_os("XDG_DATA_HOME") {
+                Some(x) => std::path::PathBuf::from(x),
+                None => {
+                    let mut p = std::path::PathBuf::from(h);
+                    p.push(".local/share");
+                    p
+                }
+            };
+            p.push("com.qsmx.serverdesk");
+            p
+        })
+    }
+}

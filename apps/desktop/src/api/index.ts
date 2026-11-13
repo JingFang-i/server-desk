@@ -68,6 +68,38 @@ export interface ExecResult {
   truncated: boolean;
 }
 
+export interface PendingApproval {
+  id: string;
+  serverId: string;
+  serverName: string;
+  command: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface AuditEntry {
+  id: number;
+  ts: string;
+  source: string;
+  serverId: string | null;
+  action: string;
+  detail: string;
+  outcome: string;
+}
+
+export interface GuardInfo {
+  deny: string[];
+  approval: string[];
+  aiEnabled: boolean;
+}
+
+export interface McpInfo {
+  port: number;
+  token: string;
+  sidecarPath: string;
+  configJson: string;
+}
+
 // ---------- API ----------
 
 export const api = {
@@ -94,4 +126,15 @@ export const api = {
   sshExec: (serverId: string, command: string, timeoutSecs?: number) =>
     invoke<ExecResult>("ssh_exec", { serverId, command, timeoutSecs }),
   sshResetHostkey: (serverId: string) => invoke<void>("ssh_reset_hostkey", { serverId }),
+  // AI 安全管线 / 审批 / 审计 / MCP
+  guardInfo: () => invoke<GuardInfo>("guard_info"),
+  guardSetRules: (deny: string[], approval: string[]) =>
+    invoke<GuardInfo>("guard_set_rules", { deny, approval }),
+  mcpSetEnabled: (enabled: boolean) => invoke<GuardInfo>("mcp_set_enabled", { enabled }),
+  approvalsPending: () => invoke<PendingApproval[]>("approvals_pending"),
+  approvalDecide: (id: string, approve: boolean) =>
+    invoke<void>("approval_decide", { id, approve }),
+  auditList: (limit?: number, source?: string) =>
+    invoke<AuditEntry[]>("audit_list", { limit, source }),
+  mcpInfo: () => invoke<McpInfo>("mcp_info"),
 };

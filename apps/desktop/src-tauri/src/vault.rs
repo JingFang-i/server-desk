@@ -245,6 +245,10 @@ impl Vault {
         self.inner().dek = None;
     }
 
+    pub fn is_unlocked(&self) -> bool {
+        self.inner().dek.is_some()
+    }
+
     /// 取 DEK（同时刷新活动时间）；若已越过空闲阈值则先自动锁定。
     pub fn dek(&self) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
         let mut g = self.inner();

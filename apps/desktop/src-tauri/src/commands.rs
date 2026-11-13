@@ -1,15 +1,24 @@
 //! Tauri IPC 命令层：前端唯一入口。
 //! 凭据仅在解密后短暂存在于内存；用户本人的增删改查会经由前端表单往返（属预期行为）。
-//! AI 侧（M3 起）走 MCP sidecar → guard 安全管线，结果绝不含凭据字段。
+//! AI 侧走 MCP sidecar → ipc → ops 安全管线，结果不含凭据且已脱敏。
 
-use crate::crypto;
-use crate::ssh::{ConnInfo, ConnParams, ExecResult};
+use crate::guard::GuardRules;
+use crate::ops;
 use crate::state::AppState;
-use crate::vault::{MigrationOutcome, VaultStatus};
+use crate::vault::VaultStatus;
 use chrono::Utc;
 use shared::{AuthMethod, ServerConfig, TestResult};
-use tauri::State;
+use std::sync::Arc;
+use tauri::{Emitter, State};
 use uuid::Uuid;
+
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
 
 fn now() -> String {
     Utc::now().to_rfc3339()
@@ -19,61 +28,45 @@ fn default_true() -> bool {
     true
 }
 
-fn audit(state: &AppState, source: &str, server_id: Option<&str>, action: &str, detail: &str, outcome: &str) {
-    let _ = state.store.insert_audit(&now(), source, server_id, action, detail, outcome);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
-
 // ---------- 保险库 ----------
 
 #[tauri::command]
-pub fn vault_status(state: State<'_, AppState>) -> Result<VaultStatus, String> {
+pub fn vault_status(state: State<'_, Arc<AppState>>) -> Result<VaultStatus, String> {
     Ok(state.vault.status())
 }
 
 #[tauri::command]
-pub fn vault_setup(state: State<'_, AppState>, password: String) -> Result<Option<String>, String> {
+pub fn vault_setup(state: State<'_, Arc<AppState>>, password: String) -> Result<Option<String>, String> {
     state.vault.setup(&password).map_err(|e| e.to_string())?;
     let mig = state
         .vault
         .migrate_legacy_if_needed(&state.store)
         .map_err(|e| e.to_string())?;
-    audit(&state, "user", None, "vault_setup", "初始化主密码保险库", "ok");
-    Ok(migration_summary(&mig))
+    ops::audit(&state, "user", None, "vault_setup", "初始化主密码保险库", "ok");
+    Ok(mig.summary())
 }
 
 #[tauri::command]
-pub fn vault_unlock(state: State<'_, AppState>, password: String) -> Result<Option<String>, String> {
+pub fn vault_unlock(state: State<'_, Arc<AppState>>, password: String) -> Result<Option<String>, String> {
     state.vault.unlock(&password).map_err(|e| e.to_string())?;
     let mig = state
         .vault
         .migrate_legacy_if_needed(&state.store)
         .map_err(|e| e.to_string())?;
-    audit(&state, "user", None, "vault_unlock", "解锁保险库", "ok");
-    Ok(migration_summary(&mig))
-}
-
-fn migration_summary(m: &MigrationOutcome) -> Option<String> {
-    m.summary()
+    ops::audit(&state, "user", None, "vault_unlock", "解锁保险库", "ok");
+    Ok(mig.summary())
 }
 
 #[tauri::command]
-pub fn vault_lock(state: State<'_, AppState>) -> Result<(), String> {
+pub fn vault_lock(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.vault.lock();
-    audit(&state, "user", None, "vault_lock", "手动锁定保险库", "ok");
+    ops::audit(&state, "user", None, "vault_lock", "手动锁定保险库", "ok");
     Ok(())
 }
 
 #[tauri::command]
 pub fn vault_set_settings(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     auto_lock_minutes: u64,
     keychain_auto_unlock: bool,
 ) -> Result<VaultStatus, String> {
@@ -81,7 +74,7 @@ pub fn vault_set_settings(
         .vault
         .set_settings(auto_lock_minutes, keychain_auto_unlock)
         .map_err(|e| e.to_string())?;
-    audit(
+    ops::audit(
         &state,
         "user",
         None,
@@ -94,10 +87,10 @@ pub fn vault_set_settings(
 
 /// 危险操作：忘记主密码时的重置（清空全部数据，不可恢复）。
 #[tauri::command]
-pub fn vault_reset(state: State<'_, AppState>) -> Result<(), String> {
+pub fn vault_reset(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.store.wipe_all()?;
     state.vault.reset().map_err(|e| e.to_string())?;
-    audit(&state, "user", None, "vault_reset", "重置保险库并清空数据", "ok");
+    ops::audit(&state, "user", None, "vault_reset", "重置保险库并清空数据", "ok");
     Ok(())
 }
 
@@ -142,9 +135,13 @@ fn validate(input: &SaveServerInput) -> Result<(), String> {
     }
 }
 
-fn row_to_config(dek: &[u8; crypto::KEY_LEN], r: &crate::store::ServerRow) -> Result<ServerConfig, String> {
-    let plain = crypto::decrypt(dek, &r.secret_blob)?;
-    let auth: AuthMethod = serde_json::from_slice(&plain).map_err(|e| format!("凭据数据损坏: {e}"))?;
+fn row_to_config(
+    dek: &[u8; crate::crypto::KEY_LEN],
+    r: &crate::store::ServerRow,
+) -> Result<ServerConfig, String> {
+    let plain = crate::crypto::decrypt(dek, &r.secret_blob)?;
+    let auth: AuthMethod =
+        serde_json::from_slice(&plain).map_err(|e| format!("凭据数据损坏: {e}"))?;
     let tags: Vec<String> = serde_json::from_str(&r.tags).unwrap_or_default();
     Ok(ServerConfig {
         id: r.id.clone(),
@@ -162,34 +159,18 @@ fn row_to_config(dek: &[u8; crypto::KEY_LEN], r: &crate::store::ServerRow) -> Re
     })
 }
 
-/// 加载并解密单台服务器配置（凭据仅存在于调用栈内）。
-fn load_server_config(state: &AppState, server_id: &str) -> Result<ServerConfig, String> {
-    let dek = state.vault.dek().map_err(|e| e.to_string())?;
-    let row = state
-        .store
-        .get(server_id)?
-        .ok_or("服务器不存在或已被删除")?;
-    row_to_config(&dek, &row)
-}
-
-fn conn_params(cfg: &ServerConfig) -> ConnParams {
-    ConnParams {
-        host: cfg.host.clone(),
-        port: cfg.port,
-        username: cfg.username.clone(),
-        auth: cfg.auth.clone(),
-    }
-}
-
 #[tauri::command]
-pub fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerConfig>, String> {
+pub fn list_servers(state: State<'_, Arc<AppState>>) -> Result<Vec<ServerConfig>, String> {
     let dek = state.vault.dek().map_err(|e| e.to_string())?;
     let rows = state.store.list()?;
     rows.iter().map(|r| row_to_config(&dek, r)).collect()
 }
 
 #[tauri::command]
-pub fn save_server(state: State<'_, AppState>, input: SaveServerInput) -> Result<ServerConfig, String> {
+pub fn save_server(
+    state: State<'_, Arc<AppState>>,
+    input: SaveServerInput,
+) -> Result<ServerConfig, String> {
     validate(&input)?;
     let dek = state.vault.dek().map_err(|e| e.to_string())?;
     let is_new = input.id.is_none();
@@ -209,7 +190,7 @@ pub fn save_server(state: State<'_, AppState>, input: SaveServerInput) -> Result
     };
 
     let cred_json = serde_json::to_vec(&input.auth).map_err(|e| e.to_string())?;
-    let blob = crypto::encrypt(&dek, &cred_json)?;
+    let blob = crate::crypto::encrypt(&dek, &cred_json)?;
 
     let row = crate::store::ServerRow {
         id,
@@ -243,7 +224,7 @@ pub fn save_server(state: State<'_, AppState>, input: SaveServerInput) -> Result
             return Err("服务器不存在或已被删除".into());
         }
     }
-    audit(
+    ops::audit(
         &state,
         "user",
         Some(&row.id),
@@ -255,13 +236,13 @@ pub fn save_server(state: State<'_, AppState>, input: SaveServerInput) -> Result
 }
 
 #[tauri::command]
-pub async fn delete_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn delete_server(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     let deleted = state.store.delete(&id)?;
     if !deleted {
         return Err("服务器不存在或已被删除".into());
     }
     let _ = state.ssh.disconnect(&id).await;
-    audit(&state, "user", Some(&id), "delete_server", "删除服务器", "ok");
+    ops::audit(&state, "user", Some(&id), "delete_server", "删除服务器", "ok");
     Ok(())
 }
 
@@ -303,12 +284,12 @@ pub async fn test_connection(host: String, port: u16) -> Result<TestResult, Stri
 
 /// 已保存服务器的完整 SSH 认证测试（建立连接后立即断开）。
 #[tauri::command]
-pub async fn ssh_test(state: State<'_, AppState>, server_id: String) -> Result<TestResult, String> {
-    let cfg = load_server_config(&state, &server_id)?;
+pub async fn ssh_test(state: State<'_, Arc<AppState>>, server_id: String) -> Result<TestResult, String> {
+    let cfg = ops::load_server_config(&state, &server_id)?;
     let started = std::time::Instant::now();
     let res = state
         .ssh
-        .establish(&state.store, &server_id, &conn_params(&cfg))
+        .establish(&state.store, &server_id, &ops::conn_params(&cfg))
         .await;
     let latency = started.elapsed().as_millis() as u64;
     match res {
@@ -316,7 +297,7 @@ pub async fn ssh_test(state: State<'_, AppState>, server_id: String) -> Result<T
             let _ = session
                 .disconnect(russh::Disconnect::ByApplication, "test", "en")
                 .await;
-            audit(&state, "user", Some(&server_id), "ssh_test", "SSH 认证测试", "ok");
+            ops::audit(&state, "user", Some(&server_id), "ssh_test", "SSH 认证测试", "ok");
             Ok(TestResult {
                 ok: true,
                 latency_ms: Some(latency),
@@ -324,7 +305,7 @@ pub async fn ssh_test(state: State<'_, AppState>, server_id: String) -> Result<T
             })
         }
         Err(e) => {
-            audit(
+            ops::audit(
                 &state,
                 "user",
                 Some(&server_id),
@@ -340,13 +321,13 @@ pub async fn ssh_test(state: State<'_, AppState>, server_id: String) -> Result<T
 // ---------- SSH 连接池 ----------
 
 #[tauri::command]
-pub async fn ssh_connect(state: State<'_, AppState>, server_id: String) -> Result<(), String> {
-    let cfg = load_server_config(&state, &server_id)?;
+pub async fn ssh_connect(state: State<'_, Arc<AppState>>, server_id: String) -> Result<(), String> {
+    let cfg = ops::load_server_config(&state, &server_id)?;
     state
         .ssh
-        .connect(&state.store, &server_id, conn_params(&cfg))
+        .connect(&state.store, &server_id, ops::conn_params(&cfg))
         .await?;
-    audit(
+    ops::audit(
         &state,
         "user",
         Some(&server_id),
@@ -358,60 +339,141 @@ pub async fn ssh_connect(state: State<'_, AppState>, server_id: String) -> Resul
 }
 
 #[tauri::command]
-pub async fn ssh_disconnect(state: State<'_, AppState>, server_id: String) -> Result<(), String> {
+pub async fn ssh_disconnect(state: State<'_, Arc<AppState>>, server_id: String) -> Result<(), String> {
     let _ = state.ssh.disconnect(&server_id).await;
-    audit(&state, "user", Some(&server_id), "ssh_disconnect", "断开连接", "ok");
+    ops::audit(&state, "user", Some(&server_id), "ssh_disconnect", "断开连接", "ok");
     Ok(())
 }
 
 #[tauri::command]
-pub async fn ssh_status(state: State<'_, AppState>) -> Result<Vec<ConnInfo>, String> {
+pub async fn ssh_status(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::ssh::ConnInfo>, String> {
     Ok(state.ssh.status().await)
 }
 
+/// 手动命令执行：不经过 AI 拦截/审批，但写审计（detail 脱敏）。
 #[tauri::command]
 pub async fn ssh_exec(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     server_id: String,
     command: String,
     timeout_secs: Option<u64>,
-) -> Result<ExecResult, String> {
-    let command = command.trim().to_string();
-    if command.is_empty() {
-        return Err("命令不能为空".into());
-    }
-    let cfg = load_server_config(&state, &server_id)?;
-    let timeout =
-        std::time::Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
-    let res = state
-        .ssh
-        .exec(&state.store, &server_id, &conn_params(&cfg), &command, timeout)
-        .await;
-    match &res {
-        Ok(r) => audit(
-            &state,
-            "manual",
-            Some(&server_id),
-            "ssh_exec",
-            &truncate(&command, 500),
-            &format!("exit={:?} len={}", r.exit_code, r.stdout.len() + r.stderr.len()),
-        ),
-        Err(e) => audit(
-            &state,
-            "manual",
-            Some(&server_id),
-            "ssh_exec",
-            &truncate(&command, 500),
-            &truncate(e, 300),
-        ),
-    }
-    res
+) -> Result<crate::ssh::ExecResult, String> {
+    let timeout = timeout_secs.unwrap_or(30);
+    ops::run_command(&state, &server_id, &command, timeout, "manual").await
 }
 
 /// 重置某服务器的主机密钥指纹（确认服务器重装/换钥后使用）。
 #[tauri::command]
-pub fn ssh_reset_hostkey(state: State<'_, AppState>, server_id: String) -> Result<(), String> {
+pub fn ssh_reset_hostkey(state: State<'_, Arc<AppState>>, server_id: String) -> Result<(), String> {
     state.store.clear_host_fingerprint(&server_id)?;
-    audit(&state, "user", Some(&server_id), "ssh_reset_hostkey", "重置主机密钥指纹", "ok");
+    ops::audit(&state, "user", Some(&server_id), "ssh_reset_hostkey", "重置主机密钥指纹", "ok");
     Ok(())
+}
+
+// ---------- AI 安全管线（guard） ----------
+
+#[tauri::command]
+pub fn guard_info(state: State<'_, Arc<AppState>>) -> crate::guard::GuardInfo {
+    state.guard.info()
+}
+
+#[tauri::command]
+pub fn guard_set_rules(
+    state: State<'_, Arc<AppState>>,
+    deny: Vec<String>,
+    approval: Vec<String>,
+) -> Result<crate::guard::GuardInfo, String> {
+    state
+        .guard
+        .set_rules(&state.store, GuardRules { deny, approval })
+        .map_err(|e| e.to_string())?;
+    ops::audit(&state, "user", None, "guard_set_rules", "更新安全规则", "ok");
+    Ok(state.guard.info())
+}
+
+#[tauri::command]
+pub fn mcp_set_enabled(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+) -> Result<crate::guard::GuardInfo, String> {
+    state
+        .guard
+        .set_ai_enabled(&state.store, enabled)
+        .map_err(|e| e.to_string())?;
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "mcp_set_enabled",
+        &format!("AI 接入 {}", if enabled { "开启" } else { "关闭" }),
+        "ok",
+    );
+    Ok(state.guard.info())
+}
+
+// ---------- 审批 ----------
+
+#[tauri::command]
+pub fn approvals_pending(state: State<'_, Arc<AppState>>) -> Vec<crate::approvals::PendingApproval> {
+    state.approvals.pending()
+}
+
+#[tauri::command]
+pub fn approval_decide(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    approve: bool,
+) -> Result<(), String> {
+    if !state.approvals.decide(&id, approve) {
+        return Err("审批不存在或已过期".into());
+    }
+    let _ = state.handle.emit("approvals-updated", ());
+    Ok(())
+}
+
+// ---------- 审计 ----------
+
+#[tauri::command]
+pub fn audit_list(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<i64>,
+    source: Option<String>,
+) -> Result<Vec<crate::store::AuditEntry>, String> {
+    state.store.audit_list(limit.unwrap_or(200), source.as_deref())
+}
+
+// ---------- MCP 接入信息 ----------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpInfo {
+    pub port: u16,
+    pub token: String,
+    pub sidecar_path: String,
+    pub config_json: String,
+}
+
+#[tauri::command]
+pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
+    let port = std::fs::read_to_string(state.dir.join("ipc-port"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let token = std::fs::read_to_string(state.dir.join("ipc-token"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let sidecar_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("serverdesk-mcp").display().to_string()))
+        .unwrap_or_else(|| "serverdesk-mcp".into());
+    let config_json = serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "serverdesk": {
+                "command": sidecar_path,
+                "args": []
+            }
+        }
+    }))
+    .map_err(|e| e.to_string())?;
+    Ok(McpInfo { port, token, sidecar_path, config_json })
 }

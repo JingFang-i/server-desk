@@ -57,6 +57,18 @@ pub struct ServerRow {
 
 const COLS: &str = "id,name,host,port,username,auth_type,secret_blob,group_name,tags,notes,allow_ai,created_at,updated_at";
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEntry {
+    pub id: i64,
+    pub ts: String,
+    pub source: String,
+    pub server_id: Option<String>,
+    pub action: String,
+    pub detail: String,
+    pub outcome: String,
+}
+
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServerRow> {
     Ok(ServerRow {
         id: row.get(0)?,
@@ -116,6 +128,14 @@ impl Store {
         let conn = self.lock()?;
         let sql = format!("SELECT {COLS} FROM servers WHERE id = ?1");
         conn.query_row(&sql, params![id], map_row)
+            .optional()
+            .map_err(|e| format!("查询失败: {e}"))
+    }
+
+    pub fn find_by_name(&self, name: &str) -> Result<Option<ServerRow>, String> {
+        let conn = self.lock()?;
+        let sql = format!("SELECT {COLS} FROM servers WHERE name = ?1");
+        conn.query_row(&sql, params![name], map_row)
             .optional()
             .map_err(|e| format!("查询失败: {e}"))
     }
@@ -232,6 +252,26 @@ impl Store {
         Ok(n > 0)
     }
 
+    // ---------- meta ----------
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.lock()?;
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(|e| format!("读取 meta 失败: {e}"))
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|e| format!("写入 meta 失败: {e}"))?;
+        Ok(())
+    }
+
     // ---------- 审计 ----------
 
     pub fn insert_audit(
@@ -251,5 +291,47 @@ impl Store {
         )
         .map_err(|e| format!("写审计失败: {e}"))?;
         Ok(())
+    }
+
+    pub fn audit_list(&self, limit: i64, source: Option<&str>) -> Result<Vec<AuditEntry>, String> {
+        let conn = self.lock()?;
+        let limit = limit.clamp(1, 1000);
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<AuditEntry> {
+            Ok(AuditEntry {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                source: r.get(2)?,
+                server_id: r.get(3)?,
+                action: r.get(4)?,
+                detail: r.get(5)?,
+                outcome: r.get(6)?,
+            })
+        };
+        let mut entries = Vec::new();
+        match source {
+            Some(s) if s != "all" => {
+                let mut stmt = conn
+                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome FROM audit_log WHERE source=?1 ORDER BY id DESC LIMIT ?2")
+                    .map_err(|e| format!("查询审计失败: {e}"))?;
+                let rows = stmt
+                    .query_map(params![s, limit], map_row)
+                    .map_err(|e| format!("查询审计失败: {e}"))?;
+                for r in rows {
+                    entries.push(r.map_err(|e| e.to_string())?);
+                }
+            }
+            _ => {
+                let mut stmt = conn
+                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome FROM audit_log ORDER BY id DESC LIMIT ?1")
+                    .map_err(|e| format!("查询审计失败: {e}"))?;
+                let rows = stmt
+                    .query_map(params![limit], map_row)
+                    .map_err(|e| format!("查询审计失败: {e}"))?;
+                for r in rows {
+                    entries.push(r.map_err(|e| e.to_string())?);
+                }
+            }
+        }
+        Ok(entries)
     }
 }
