@@ -1,0 +1,581 @@
+<script setup lang="ts">
+import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
+import {
+  NButton,
+  NDataTable,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NPopconfirm,
+  NRadioButton,
+  NRadioGroup,
+  NSelect,
+  NSwitch,
+  NTag,
+  useMessage,
+  type DataTableColumns,
+  type FormInst,
+  type FormRules,
+} from "naive-ui";
+import { api, type SaveServerInput, type ServerConfig } from "../api";
+import { useServersStore } from "../stores/servers";
+
+const store = useServersStore();
+const message = useMessage();
+
+// ---------- 连接状态 ----------
+const connMap = ref<Record<string, boolean>>({});
+const connectingId = ref<string | null>(null);
+let statusTimer: number | undefined;
+
+async function refreshConnStatus() {
+  try {
+    const list = await api.sshStatus();
+    const map: Record<string, boolean> = {};
+    for (const c of list) map[c.serverId] = c.status === "connected";
+    connMap.value = map;
+  } catch {
+    /* 锁定状态下静默 */
+  }
+}
+
+onMounted(() => {
+  store.load().catch((e) => message.error(String(e)));
+  refreshConnStatus();
+  statusTimer = window.setInterval(refreshConnStatus, 5000);
+});
+onUnmounted(() => {
+  if (statusTimer) window.clearInterval(statusTimer);
+});
+
+// ---------- 列表过滤 ----------
+const keyword = ref("");
+const groupFilter = ref<string | null>(null);
+const filtered = computed(() =>
+  store.servers.filter((s) => {
+    const kw = keyword.value.trim().toLowerCase();
+    const kwOk =
+      !kw ||
+      [s.name, s.host, s.username, ...(s.tags ?? [])]
+        .join(" ")
+        .toLowerCase()
+        .includes(kw);
+    const gOk = !groupFilter.value || s.group === groupFilter.value;
+    return kwOk && gOk;
+  })
+);
+const groupOptions = computed(() => store.groups.map((g) => ({ label: g, value: g })));
+
+// ---------- 连接 / 测试 / 执行 ----------
+async function connectRow(row: ServerConfig) {
+  connectingId.value = row.id;
+  try {
+    if (connMap.value[row.id]) {
+      await api.sshDisconnect(row.id);
+      message.info(`「${row.name}」已断开`);
+    } else {
+      await api.sshConnect(row.id);
+      message.success(`「${row.name}」已连接（保活 30s）`);
+    }
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    connectingId.value = null;
+    refreshConnStatus();
+  }
+}
+
+async function testRow(row: ServerConfig) {
+  message.loading(`正在测试「${row.name}」的 SSH 认证…`, { duration: 1500 });
+  try {
+    const r = await api.sshTest(row.id);
+    if (r.ok) message.success(`「${row.name}」${r.message}`);
+    else message.error(`「${row.name}」${r.message}`);
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    refreshConnStatus();
+  }
+}
+
+async function resetHostkey(row: ServerConfig) {
+  try {
+    await api.sshResetHostkey(row.id);
+    message.success(`「${row.name}」主机密钥指纹已重置，下次连接将重新记录`);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+// 执行命令弹窗
+const execModal = ref(false);
+const execTarget = ref<ServerConfig | null>(null);
+const execCommand = ref("uptime");
+const execRunning = ref(false);
+const execOutput = ref<{ stdout: string; stderr: string; exitCode: number | null; truncated: boolean } | null>(null);
+
+function openExec(row: ServerConfig) {
+  execTarget.value = row;
+  execOutput.value = null;
+  execCommand.value = "uptime";
+  execModal.value = true;
+}
+
+async function runExec() {
+  if (!execTarget.value || !execCommand.value.trim()) return;
+  execRunning.value = true;
+  execOutput.value = null;
+  try {
+    execOutput.value = await api.sshExec(execTarget.value.id, execCommand.value, 60);
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    execRunning.value = false;
+    refreshConnStatus();
+  }
+}
+
+// ---------- 表格 ----------
+const rowKey = (r: ServerConfig) => r.id;
+const columns = computed<DataTableColumns<ServerConfig>>(() => [
+  {
+    title: "名称",
+    key: "name",
+    minWidth: 170,
+    render: (row) =>
+      h("div", null, [
+        h("div", { style: "font-weight:600" }, row.name),
+        h("div", { style: "font-size:12px;opacity:.65" }, `${row.host}:${row.port}`),
+      ]),
+  },
+  { title: "用户名", key: "username", width: 100 },
+  {
+    title: "认证",
+    key: "auth",
+    width: 80,
+    render: (row) =>
+      row.auth.type === "password"
+        ? h(NTag, { size: "small", type: "info", bordered: false }, { default: () => "密码" })
+        : h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "私钥" }),
+  },
+  { title: "分组", key: "group", width: 100, render: (row) => row.group ?? "—" },
+  {
+    title: "标签",
+    key: "tags",
+    minWidth: 130,
+    render: (row) =>
+      row.tags.length
+        ? h(
+            "div",
+            { style: "display:flex;gap:4px;flex-wrap:wrap" },
+            row.tags.map((t) =>
+              h(NTag, { size: "tiny", bordered: false }, { default: () => t })
+            )
+          )
+        : "—",
+  },
+  {
+    title: "连接",
+    key: "conn",
+    width: 84,
+    render: (row) =>
+      connMap.value[row.id]
+        ? h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "已连接" })
+        : h(NTag, { size: "small", bordered: false }, { default: () => "未连接" }),
+  },
+  {
+    title: "AI",
+    key: "allowAi",
+    width: 74,
+    render: (row) =>
+      row.allowAi
+        ? h(NTag, { size: "small", type: "warning", bordered: false }, { default: () => "允许" })
+        : h(NTag, { size: "small", bordered: false }, { default: () => "禁止" }),
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 300,
+    render: (row) =>
+      h("div", { style: "display:flex;gap:6px" }, [
+        h(
+          NButton,
+          {
+            size: "small",
+            type: connMap.value[row.id] ? "warning" : "primary",
+            secondary: connMap.value[row.id],
+            loading: connectingId.value === row.id,
+            onClick: () => connectRow(row),
+          },
+          { default: () => (connMap.value[row.id] ? "断开" : "连接") }
+        ),
+        h(
+          NButton,
+          { size: "small", onClick: () => openExec(row) },
+          { default: () => "命令" }
+        ),
+        h(
+          NButton,
+          { size: "small", onClick: () => testRow(row) },
+          { default: () => "SSH 测试" }
+        ),
+        h(
+          NButton,
+          { size: "small", onClick: () => openEdit(row) },
+          { default: () => "编辑" }
+        ),
+        h(
+          NPopconfirm,
+          { onPositiveClick: () => removeRow(row) },
+          {
+            trigger: () =>
+              h(NButton, { size: "small", type: "error", ghost: true }, { default: () => "删除" }),
+            default: () => `确认删除「${row.name}」？该操作不可恢复。`,
+          }
+        ),
+        h(
+          NPopconfirm,
+          { onPositiveClick: () => resetHostkey(row) },
+          {
+            trigger: () =>
+              h(NButton, { size: "small", quaternary: true }, { default: () => "重置指纹" }),
+            default: () =>
+              `确认重置「${row.name}」的主机密钥指纹？仅应在服务器重装/更换主机密钥后使用。`,
+          }
+        ),
+      ]),
+  },
+]);
+
+// ---------- 新增 / 编辑表单 ----------
+const showModal = ref(false);
+const editingId = ref<string | null>(null);
+const formRef = ref<FormInst | null>(null);
+const saving = ref(false);
+
+interface FormModel {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: "password" | "key";
+  password: string;
+  privateKey: string;
+  passphrase: string | null;
+  group: string | null;
+  tags: string[];
+  notes: string | null;
+  allowAi: boolean;
+}
+
+const emptyModel = (): FormModel => ({
+  name: "",
+  host: "",
+  port: 22,
+  username: "root",
+  authType: "password",
+  password: "",
+  privateKey: "",
+  passphrase: null,
+  group: null,
+  tags: [],
+  notes: null,
+  allowAi: true,
+});
+const model = reactive<FormModel>(emptyModel());
+
+const rules: FormRules = {
+  name: { required: true, message: "请输入名称", trigger: "blur" },
+  host: { required: true, message: "请输入主机地址", trigger: "blur" },
+  username: { required: true, message: "请输入用户名", trigger: "blur" },
+  port: { required: true, type: "number", message: "请输入端口", trigger: "blur" },
+};
+
+function openCreate() {
+  Object.assign(model, emptyModel());
+  editingId.value = null;
+  showModal.value = true;
+}
+
+function openEdit(row: ServerConfig) {
+  Object.assign(model, emptyModel(), {
+    name: row.name,
+    host: row.host,
+    port: row.port,
+    username: row.username,
+    authType: row.auth.type,
+    password: row.auth.type === "password" ? row.auth.password : "",
+    privateKey: row.auth.type === "key" ? row.auth.privateKey : "",
+    passphrase: row.auth.type === "key" ? row.auth.passphrase : null,
+    group: row.group,
+    tags: [...row.tags],
+    notes: row.notes,
+    allowAi: row.allowAi,
+  });
+  editingId.value = row.id;
+  showModal.value = true;
+}
+
+function buildInput(): SaveServerInput {
+  const auth =
+    model.authType === "password"
+      ? { type: "password" as const, password: model.password }
+      : {
+          type: "key" as const,
+          privateKey: model.privateKey,
+          passphrase: model.passphrase || null,
+        };
+  return {
+    id: editingId.value,
+    name: model.name.trim(),
+    host: model.host.trim(),
+    port: model.port,
+    username: model.username.trim(),
+    auth,
+    group: model.group,
+    tags: model.tags,
+    notes: model.notes,
+    allowAi: model.allowAi,
+  };
+}
+
+async function submit() {
+  try {
+    await formRef.value?.validate();
+  } catch {
+    return;
+  }
+  if (model.authType === "password" && !model.password) {
+    message.error("密码不能为空");
+    return;
+  }
+  if (model.authType === "key" && !model.privateKey.trim()) {
+    message.error("私钥内容不能为空");
+    return;
+  }
+  saving.value = true;
+  try {
+    await store.save(buildInput());
+    message.success(editingId.value ? "服务器已更新" : "服务器已添加");
+    showModal.value = false;
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function removeRow(row: ServerConfig) {
+  try {
+    await store.remove(row.id);
+    message.success(`已删除「${row.name}」`);
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    refreshConnStatus();
+  }
+}
+
+async function testForm() {
+  try {
+    const r = await api.testConnection(model.host.trim(), model.port);
+    if (r.ok) message.success(r.message);
+    else message.error(r.message);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+</script>
+
+<template>
+  <div class="page">
+    <div class="toolbar">
+      <n-input
+        v-model:value="keyword"
+        placeholder="搜索名称 / 主机 / 用户名 / 标签"
+        clearable
+        style="width: 300px"
+      />
+      <n-select
+        v-model:value="groupFilter"
+        :options="groupOptions"
+        placeholder="全部分组"
+        clearable
+        style="width: 170px"
+      />
+      <div style="flex: 1" />
+      <n-button type="primary" @click="openCreate">＋ 新增服务器</n-button>
+    </div>
+
+    <n-data-table
+      :columns="columns"
+      :data="filtered"
+      :loading="store.loading"
+      :bordered="false"
+      size="small"
+      :row-key="rowKey"
+    />
+
+    <n-modal
+      v-model:show="showModal"
+      preset="card"
+      :title="editingId ? '编辑服务器' : '新增服务器'"
+      style="width: 660px"
+    >
+      <n-form
+        ref="formRef"
+        :model="model"
+        :rules="rules"
+        label-placement="left"
+        label-width="96"
+      >
+        <n-form-item label="名称" path="name">
+          <n-input v-model:value="model.name" placeholder="如：生产-网关-01" />
+        </n-form-item>
+        <n-form-item label="主机" path="host">
+          <n-input v-model:value="model.host" placeholder="IP 或域名" />
+        </n-form-item>
+        <n-form-item label="端口" path="port">
+          <n-input-number
+            v-model:value="model.port"
+            :min="1"
+            :max="65535"
+            style="width: 150px"
+          />
+        </n-form-item>
+        <n-form-item label="用户名" path="username">
+          <n-input v-model:value="model.username" placeholder="如：root" />
+        </n-form-item>
+        <n-form-item label="认证方式">
+          <n-radio-group v-model:value="model.authType">
+            <n-radio-button value="password">密码</n-radio-button>
+            <n-radio-button value="key">SSH 私钥</n-radio-button>
+          </n-radio-group>
+        </n-form-item>
+        <n-form-item v-if="model.authType === 'password'" label="密码">
+          <n-input
+            v-model:value="model.password"
+            type="password"
+            show-password-on="click"
+            placeholder="登录密码"
+          />
+        </n-form-item>
+        <template v-else>
+          <n-form-item label="私钥">
+            <n-input
+              v-model:value="model.privateKey"
+              type="textarea"
+              :rows="6"
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+            />
+          </n-form-item>
+          <n-form-item label="私钥口令">
+            <n-input
+              v-model:value="model.passphrase"
+              type="password"
+              show-password-on="click"
+              placeholder="无则留空"
+            />
+          </n-form-item>
+        </template>
+        <n-form-item label="分组">
+          <n-select
+            v-model:value="model.group"
+            :options="groupOptions"
+            tag
+            filterable
+            clearable
+            placeholder="选择或输入新分组"
+          />
+        </n-form-item>
+        <n-form-item label="标签">
+          <n-select
+            v-model:value="model.tags"
+            :options="[]"
+            tag
+            filterable
+            multiple
+            placeholder="输入后回车添加"
+          />
+        </n-form-item>
+        <n-form-item label="允许 AI">
+          <n-switch v-model:value="model.allowAi" />
+          <span class="hint">关闭后 MCP 工具不可操作此服务器（M3 生效）</span>
+        </n-form-item>
+        <n-form-item label="备注">
+          <n-input v-model:value="model.notes" type="textarea" :rows="2" />
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div style="display: flex; gap: 8px; justify-content: flex-end">
+          <n-button :disabled="!model.host" @click="testForm">测试 TCP 连接</n-button>
+          <n-button @click="showModal = false">取消</n-button>
+          <n-button type="primary" :loading="saving" @click="submit">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <n-modal
+      v-model:show="execModal"
+      preset="card"
+      :title="execTarget ? `执行命令 · ${execTarget.name}` : '执行命令'"
+      style="width: 760px"
+    >
+      <div style="display: flex; gap: 8px">
+        <n-input
+          v-model:value="execCommand"
+          placeholder="如：df -h /"
+          @keyup.enter="runExec"
+        />
+        <n-button type="primary" :loading="execRunning" @click="runExec">
+          执行（60s 超时）
+        </n-button>
+      </div>
+      <p class="hint" style="margin: 8px 0 0">
+        手动执行记录会写入审计日志。M3 起 AI Agent 调用将经过高危命令拦截与审批管线。
+      </p>
+      <div v-if="execOutput" class="execout">
+        <div class="execline">
+          <n-tag size="small" :type="execOutput.exitCode === 0 ? 'success' : 'error'" :bordered="false">
+            exit = {{ execOutput.exitCode ?? "无" }}
+          </n-tag>
+          <n-tag v-if="execOutput.truncated" size="small" type="warning" :bordered="false">
+            输出已截断
+          </n-tag>
+        </div>
+        <pre v-if="execOutput.stdout" class="pre">stdout：
+{{ execOutput.stdout }}</pre>
+        <pre v-if="execOutput.stderr" class="pre preerr">stderr：
+{{ execOutput.stderr }}</pre>
+      </div>
+    </n-modal>
+  </div>
+</template>
+
+<style scoped>
+.execout {
+  margin-top: 12px;
+}
+.execline {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.pre {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 6px 0;
+}
+.preerr {
+  color: #ff8a8a;
+}
+</style>

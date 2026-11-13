@@ -1,0 +1,26 @@
+[package]
+name = "serverdesk"
+version.workspace = true
+edition.workspace = true
+description = "ServerDesk — 本地服务器管理工具"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+shared = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+russh = { workspace = true }
+argon2 = { workspace = true }
+keyring = { workspace = true }
+zeroize = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
