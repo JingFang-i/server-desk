@@ -20,6 +20,7 @@ import {
   type FormRules,
 } from "naive-ui";
 import { api, type SaveServerInput, type ServerConfig } from "../api";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
 
 const store = useServersStore();
@@ -387,6 +388,32 @@ async function testForm() {
     message.error(String(e));
   }
 }
+
+// 从文件导入私钥（~/.ssh/id_ed25519、id_rsa、*.pem 等）
+const importingKey = ref(false);
+async function pickKeyFile() {
+  importingKey.value = true;
+  try {
+    const path = await open({
+      title: "选择私钥文件",
+      multiple: false,
+      filters: [
+        { name: "私钥文件", extensions: ["pem", "key"] },
+        { name: "所有文件", extensions: ["*"] },
+      ],
+    });
+    if (typeof path !== "string") return;
+    const content = await api.readKeyFile(path);
+    model.privateKey = content;
+    message.success(
+      `已导入私钥：${path.split("/").pop()}（如有口令请在下方填写）`
+    );
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    importingKey.value = false;
+  }
+}
 </script>
 
 <template>
@@ -464,12 +491,20 @@ async function testForm() {
         </n-form-item>
         <template v-else>
           <n-form-item label="私钥">
-            <n-input
-              v-model:value="model.privateKey"
-              type="textarea"
-              :rows="6"
-              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-            />
+            <div style="width: 100%">
+              <n-input
+                v-model:value="model.privateKey"
+                type="textarea"
+                :rows="6"
+                placeholder="粘贴私钥内容，或点击下方按钮从文件导入"
+              />
+              <div style="margin-top: 6px">
+                <n-button size="small" :loading="importingKey" @click="pickKeyFile">
+                  选择私钥文件…
+                </n-button>
+                <span class="hint">支持 id_ed25519 / id_rsa / *.pem 等 OpenSSH/PEM 明文私钥</span>
+              </div>
+            </div>
           </n-form-item>
           <n-form-item label="私钥口令">
             <n-input

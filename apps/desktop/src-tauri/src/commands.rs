@@ -493,6 +493,23 @@ pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
 
 // ---------- 备份与恢复 ----------
 
+/// 读取用户通过文件对话框选择的私钥文件内容（仅明文 PEM/openssh 格式回填表单）。
+#[tauri::command]
+pub fn read_key_file(path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.is_file() {
+        return Err("所选路径不是文件".into());
+    }
+    let content = std::fs::read_to_string(&p).map_err(|e| format!("读取私钥文件失败: {e}"))?;
+    let trimmed = content.trim();
+    if !trimmed.contains("PRIVATE KEY") {
+        return Err("文件内容不像私钥（未找到 PRIVATE KEY 标记），请确认选择了正确的文件".into());
+    }
+    // 规范化行尾（CRLF → LF）并保留标准结尾换行，方便直接被 russh 解析
+    let normalized = trimmed.replace("\r\n", "\n").to_string();
+    Ok(format!("{normalized}\n"))
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupSettings {

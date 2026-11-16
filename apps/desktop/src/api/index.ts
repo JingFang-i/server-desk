@@ -177,4 +177,6 @@ export const api = {
   autoBackupRestore: (name: string, mode: string) =>
     invoke<RestoreResult>("auto_backup_restore", { name, mode }),
   autoBackupDelete: (name: string) => invoke<void>("auto_backup_delete", { name }),
+  // 私钥文件导入
+  readKeyFile: (path: string) => invoke<string>("read_key_file", { path }),
 };

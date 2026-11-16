@@ -156,7 +156,9 @@ fn main() {
             commands::auto_backup_now,
             commands::auto_backup_save_settings,
             commands::auto_backup_restore,
-            commands::auto_backup_delete
+            commands::auto_backup_delete,
+            // 私钥文件导入
+            commands::read_key_file
         ])
         .run(tauri::generate_context!())
         .expect("ServerDesk 启动失败");
