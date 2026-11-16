@@ -397,10 +397,7 @@ async function pickKeyFile() {
     const path = await open({
       title: "选择私钥文件",
       multiple: false,
-      filters: [
-        { name: "私钥文件", extensions: ["pem", "key"] },
-        { name: "所有文件", extensions: ["*"] },
-      ],
+      // 不按后缀过滤：id_ed25519 / id_rsa 等默认私钥无后缀；选错内容由后端 PRIVATE KEY 标记校验兜底
     });
     if (typeof path !== "string") return;
     const content = await api.readKeyFile(path);
