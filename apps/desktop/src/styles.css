@@ -8,6 +8,13 @@ body,
   margin: 0;
   padding: 0;
 }
+/* 应用全局为深色基底：NConfigProvider 的 darkTheme 只影响组件配色，
+   不会自动给页面底层上色，必须在这里显式声明，否则出现白底白字 */
+html,
+body {
+  background: #101014;
+  color: rgba(255, 255, 255, 0.9);
+}
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
