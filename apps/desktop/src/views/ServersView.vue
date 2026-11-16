@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
+  NAlert,
   NButton,
   NDataTable,
   NDropdown,
@@ -475,8 +476,15 @@ async function pickKeyFile() {
         style="width: 170px"
       />
       <div style="flex: 1" />
+      <n-button :loading="store.loading" @click="store.load()">刷新</n-button>
       <n-button type="primary" @click="openCreate">＋ 新增服务器</n-button>
     </div>
+
+    <n-alert v-if="store.loadError" type="error" style="margin-bottom: 2px">
+      <div style="font-size: 12px; white-space: pre-wrap; line-height: 1.7">
+        {{ store.loadError }}
+      </div>
+    </n-alert>
 
     <n-data-table
       :columns="columns"

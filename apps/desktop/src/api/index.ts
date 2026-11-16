@@ -128,6 +128,11 @@ export interface RestoreResult {
   mode: string;
 }
 
+export interface ListServersResult {
+  servers: ServerConfig[];
+  errors: string[];
+}
+
 // ---------- API ----------
 
 export const api = {
@@ -140,7 +145,7 @@ export const api = {
     invoke<VaultStatus>("vault_set_settings", { autoLockMinutes, keychainAutoUnlock }),
   vaultReset: () => invoke<void>("vault_reset"),
   // 服务器资产
-  listServers: () => invoke<ServerConfig[]>("list_servers"),
+  listServers: () => invoke<ListServersResult>("list_servers"),
   saveServer: (input: SaveServerInput) => invoke<ServerConfig>("save_server", { input }),
   deleteServer: (id: string) => invoke<void>("delete_server", { id }),
   // 连接测试

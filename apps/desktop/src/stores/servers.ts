@@ -4,10 +4,11 @@ import { api, type SaveServerInput, type ServerConfig } from "../api";
 interface ServersState {
   servers: ServerConfig[];
   loading: boolean;
+  loadError: string | null;
 }
 
 export const useServersStore = defineStore("servers", {
-  state: (): ServersState => ({ servers: [], loading: false }),
+  state: (): ServersState => ({ servers: [], loading: false, loadError: null }),
   getters: {
     groups(state): string[] {
       return Array.from(
@@ -22,8 +23,15 @@ export const useServersStore = defineStore("servers", {
   actions: {
     async load() {
       this.loading = true;
+      this.loadError = null;
       try {
-        this.servers = await api.listServers();
+        const res = await api.listServers();
+        this.servers = res.servers;
+        if (res.errors.length) {
+          this.loadError = res.errors.join("\n");
+        }
+      } catch (e) {
+        this.loadError = String(e);
       } finally {
         this.loading = false;
       }

@@ -159,11 +159,27 @@ fn row_to_config(
     })
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListServersResult {
+    pub servers: Vec<ServerConfig>,
+    /// 解密/解析失败的行（不拖垮整个列表，前端可见提示）
+    pub errors: Vec<String>,
+}
+
 #[tauri::command]
-pub fn list_servers(state: State<'_, Arc<AppState>>) -> Result<Vec<ServerConfig>, String> {
+pub fn list_servers(state: State<'_, Arc<AppState>>) -> Result<ListServersResult, String> {
     let dek = state.vault.dek().map_err(|e| e.to_string())?;
     let rows = state.store.list()?;
-    rows.iter().map(|r| row_to_config(&dek, r)).collect()
+    let mut servers = Vec::new();
+    let mut errors = Vec::new();
+    for r in rows {
+        match row_to_config(&dek, &r) {
+            Ok(c) => servers.push(c),
+            Err(e) => errors.push(format!("「{}」读取失败：{e}", r.name)),
+        }
+    }
+    Ok(ListServersResult { servers, errors })
 }
 
 #[tauri::command]
