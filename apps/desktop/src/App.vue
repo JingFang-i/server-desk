@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import {
   NConfigProvider,
+  NDialogProvider,
   NLayout,
   NLayoutSider,
   NLayoutContent,
