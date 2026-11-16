@@ -3,28 +3,60 @@ import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   NButton,
   NDataTable,
+  NDropdown,
   NForm,
   NFormItem,
+  NIcon,
   NInput,
   NInputNumber,
   NModal,
-  NPopconfirm,
   NRadioButton,
   NRadioGroup,
   NSelect,
   NSwitch,
   NTag,
+  NTooltip,
+  useDialog,
   useMessage,
   type DataTableColumns,
+  type DropdownOption,
   type FormInst,
   type FormRules,
 } from "naive-ui";
+import { EllipsisVertical, LinkOutline, TerminalOutline } from "@vicons/ionicons5";
 import { api, type SaveServerInput, type ServerConfig } from "../api";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
 
 const store = useServersStore();
 const message = useMessage();
+const dialog = useDialog();
+
+// 行内下拉操作菜单
+const actionOptions: DropdownOption[] = [
+  { label: "SSH 测试", key: "test" },
+  { label: "编辑", key: "edit" },
+  { label: "重置指纹", key: "reset" },
+  { type: "divider", key: "d1" },
+  { label: "删除", key: "delete", props: { style: { color: "#e88080" } } },
+];
+
+function handleAction(key: string, row: ServerConfig) {
+  switch (key) {
+    case "test":
+      testRow(row);
+      break;
+    case "edit":
+      openEdit(row);
+      break;
+    case "reset":
+      confirmResetHostkey(row);
+      break;
+    case "delete":
+      confirmRemove(row);
+      break;
+  }
+}
 
 // ---------- 连接状态 ----------
 const connMap = ref<Record<string, boolean>>({});
@@ -110,6 +142,26 @@ async function resetHostkey(row: ServerConfig) {
   }
 }
 
+function confirmRemove(row: ServerConfig) {
+  dialog.warning({
+    title: "删除确认",
+    content: `确认删除「${row.name}」？该操作不可恢复。`,
+    positiveText: "删除",
+    negativeText: "取消",
+    onPositiveClick: () => removeRow(row),
+  });
+}
+
+function confirmResetHostkey(row: ServerConfig) {
+  dialog.warning({
+    title: "重置主机密钥指纹",
+    content: `确认重置「${row.name}」的指纹？仅应在服务器重装/更换主机密钥后使用。`,
+    positiveText: "重置",
+    negativeText: "取消",
+    onPositiveClick: () => resetHostkey(row),
+  });
+}
+
 // 执行命令弹窗
 const execModal = ref(false);
 const execTarget = ref<ServerConfig | null>(null);
@@ -144,28 +196,28 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
   {
     title: "名称",
     key: "name",
-    minWidth: 170,
+    width: 190,
     render: (row) =>
       h("div", null, [
-        h("div", { style: "font-weight:600" }, row.name),
-        h("div", { style: "font-size:12px;opacity:.65" }, `${row.host}:${row.port}`),
+        h("div", { style: "font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, row.name),
+        h("div", { style: "font-size:12px;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, `${row.host}:${row.port}`),
       ]),
   },
-  { title: "用户名", key: "username", width: 100 },
+  { title: "用户名", key: "username", width: 84 },
   {
     title: "认证",
     key: "auth",
-    width: 80,
+    width: 70,
     render: (row) =>
       row.auth.type === "password"
         ? h(NTag, { size: "small", type: "info", bordered: false }, { default: () => "密码" })
         : h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "私钥" }),
   },
-  { title: "分组", key: "group", width: 100, render: (row) => row.group ?? "—" },
+  { title: "分组", key: "group", width: 90, render: (row) => row.group ?? "—" },
   {
     title: "标签",
     key: "tags",
-    minWidth: 130,
+    width: 130,
     render: (row) =>
       row.tags.length
         ? h(
@@ -180,7 +232,7 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
   {
     title: "连接",
     key: "conn",
-    width: 84,
+    width: 76,
     render: (row) =>
       connMap.value[row.id]
         ? h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "已连接" })
@@ -189,7 +241,7 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
   {
     title: "AI",
     key: "allowAi",
-    width: 74,
+    width: 56,
     render: (row) =>
       row.allowAi
         ? h(NTag, { size: "small", type: "warning", bordered: false }, { default: () => "允许" })
@@ -198,52 +250,45 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
   {
     title: "操作",
     key: "actions",
-    width: 300,
+    width: 104,
     render: (row) =>
-      h("div", { style: "display:flex;gap:6px" }, [
+      h("div", { style: "display:flex;gap:6px;align-items:center" }, [
+        h(NTooltip, null, {
+          trigger: () =>
+            h(
+              NButton,
+              {
+                size: "tiny",
+                circle: true,
+                type: connMap.value[row.id] ? "warning" : "primary",
+                loading: connectingId.value === row.id,
+                onClick: () => connectRow(row),
+              },
+              {
+                icon: () => h(NIcon, null, { default: () => h(LinkOutline) }),
+              }
+            ),
+          default: () => (connMap.value[row.id] ? "断开连接" : "连接"),
+        }),
+        h(NTooltip, null, {
+          trigger: () =>
+            h(
+              NButton,
+              { size: "tiny", circle: true, onClick: () => openExec(row) },
+              { icon: () => h(NIcon, null, { default: () => h(TerminalOutline) }) }
+            ),
+          default: () => "执行命令",
+        }),
         h(
-          NButton,
+          NDropdown,
+          { options: actionOptions, trigger: "click", onSelect: (key: string) => handleAction(key, row) },
           {
-            size: "small",
-            type: connMap.value[row.id] ? "warning" : "primary",
-            secondary: connMap.value[row.id],
-            loading: connectingId.value === row.id,
-            onClick: () => connectRow(row),
-          },
-          { default: () => (connMap.value[row.id] ? "断开" : "连接") }
-        ),
-        h(
-          NButton,
-          { size: "small", onClick: () => openExec(row) },
-          { default: () => "命令" }
-        ),
-        h(
-          NButton,
-          { size: "small", onClick: () => testRow(row) },
-          { default: () => "SSH 测试" }
-        ),
-        h(
-          NButton,
-          { size: "small", onClick: () => openEdit(row) },
-          { default: () => "编辑" }
-        ),
-        h(
-          NPopconfirm,
-          { onPositiveClick: () => removeRow(row) },
-          {
-            trigger: () =>
-              h(NButton, { size: "small", type: "error", ghost: true }, { default: () => "删除" }),
-            default: () => `确认删除「${row.name}」？该操作不可恢复。`,
-          }
-        ),
-        h(
-          NPopconfirm,
-          { onPositiveClick: () => resetHostkey(row) },
-          {
-            trigger: () =>
-              h(NButton, { size: "small", quaternary: true }, { default: () => "重置指纹" }),
             default: () =>
-              `确认重置「${row.name}」的主机密钥指纹？仅应在服务器重装/更换主机密钥后使用。`,
+              h(
+                NButton,
+                { size: "tiny", circle: true, quaternary: true },
+                { icon: () => h(NIcon, null, { default: () => h(EllipsisVertical) }) }
+              ),
           }
         ),
       ]),
@@ -440,6 +485,7 @@ async function pickKeyFile() {
       :bordered="false"
       size="small"
       :row-key="rowKey"
+      :scroll-x="820"
     />
 
     <n-modal

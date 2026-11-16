@@ -78,6 +78,7 @@ onUnmounted(() => {
     style="height: 100%"
   >
     <n-message-provider>
+      <n-dialog-provider>
       <!-- 保险库锁屏门 -->
       <LockGate
         v-if="booted && vault && !vault.unlocked"
@@ -110,6 +111,7 @@ onUnmounted(() => {
           <SettingsView v-else-if="page === 'settings'" />
         </n-layout-content>
       </n-layout>
+      </n-dialog-provider>
     </n-message-provider>
   </n-config-provider>
 </template>
