@@ -4,6 +4,8 @@ import {
   NButton,
   NCard,
   NDataTable,
+  NInput,
+  NModal,
   NSelect,
   NTag,
   useMessage,
@@ -30,6 +32,16 @@ function fmtTs(iso: string): string {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
+/** 列表里只展示内容摘要（折叠空白并截断） */
+const DETAIL_PREVIEW_LEN = 42;
+function preview(text: string): string {
+  if (!text) return "—";
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > DETAIL_PREVIEW_LEN
+    ? oneLine.slice(0, DETAIL_PREVIEW_LEN) + "…"
+    : oneLine;
+}
+
 function outcomeTag(outcome: string) {
   const lower = outcome.toLowerCase();
   const type = lower.startsWith("ok")
@@ -44,12 +56,40 @@ function outcomeTag(outcome: string) {
   );
 }
 
+// ---------- 详情弹窗 ----------
+const detailModal = ref(false);
+const detailEntry = ref<AuditEntry | null>(null);
+
+function openDetail(row: AuditEntry) {
+  detailEntry.value = row;
+  detailModal.value = true;
+}
+
+async function copyDetail() {
+  if (!detailEntry.value) return;
+  const e = detailEntry.value;
+  const text = [
+    `时间: ${fmtTs(e.ts)}`,
+    `来源: ${e.source}`,
+    `操作: ${e.action}`,
+    `服务器: ${e.serverId ?? "—"}`,
+    `结果: ${e.outcome}`,
+    `内容:\n${e.detail || "—"}`,
+  ].join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    message.success("已复制详情");
+  } catch {
+    message.warning("复制失败，请手动选择文本复制");
+  }
+}
+
 const columns = computed<DataTableColumns<AuditEntry>>(() => [
-  { title: "时间", key: "ts", width: 165, render: (r) => fmtTs(r.ts) },
+  { title: "时间", key: "ts", width: 160, render: (r) => fmtTs(r.ts) },
   {
     title: "来源",
     key: "source",
-    width: 90,
+    width: 88,
     render: (r) =>
       h(
         NTag,
@@ -61,16 +101,34 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
         { default: () => r.source }
       ),
   },
-  { title: "操作", key: "action", width: 180 },
-  { title: "服务器", key: "serverId", width: 200, render: (r) => r.serverId ?? "—" },
+  { title: "操作", key: "action", width: 170 },
+  { title: "服务器", key: "serverId", width: 190, render: (r) => r.serverId ?? "—" },
   {
     title: "内容",
     key: "detail",
-    minWidth: 260,
+    minWidth: 240,
     render: (r) =>
-      h("span", { style: "font-size:12px;white-space:pre-wrap;word-break:break-all" }, r.detail || "—"),
+      h(
+        "span",
+        {
+          style:
+            "font-size:12px;opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block",
+        },
+        preview(r.detail)
+      ),
   },
-  { title: "结果", key: "outcome", width: 190, render: (r) => outcomeTag(r.outcome) },
+  { title: "结果", key: "outcome", width: 170, render: (r) => outcomeTag(r.outcome) },
+  {
+    title: "",
+    key: "actions",
+    width: 76,
+    render: (r) =>
+      h(
+        NButton,
+        { size: "tiny", onClick: () => openDetail(r) },
+        { default: () => "详情" }
+      ),
+  },
 ]);
 
 async function refresh() {
@@ -110,10 +168,63 @@ onMounted(refresh);
         size="small"
         :row-key="rowKey"
         :max-height="520"
+        :scroll-x="900"
       />
       <p class="hint" style="margin-top: 10px">
-        所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；内容已自动脱敏。
+        所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；列表仅显示内容摘要，点「详情」查看全文。内容已自动脱敏。
       </p>
     </n-card>
+
+    <n-modal
+      v-model:show="detailModal"
+      preset="card"
+      title="审计详情"
+      style="width: 640px"
+    >
+      <div v-if="detailEntry">
+        <div class="detail-grid">
+          <span class="k">时间</span><span>{{ fmtTs(detailEntry.ts) }}</span>
+          <span class="k">来源</span>
+          <span>
+            <n-tag
+              size="small"
+              :bordered="false"
+              :type="detailEntry.source === 'ai' ? 'warning' : detailEntry.source === 'user' ? 'info' : 'default'"
+            >
+              {{ detailEntry.source }}
+            </n-tag>
+          </span>
+          <span class="k">操作</span><span>{{ detailEntry.action }}</span>
+          <span class="k">服务器</span><span>{{ detailEntry.serverId ?? "—" }}</span>
+          <span class="k">结果</span><span>{{ detailEntry.outcome }}</span>
+        </div>
+        <div class="k" style="margin: 14px 0 6px">内容</div>
+        <n-input
+          :value="detailEntry.detail || '—'"
+          type="textarea"
+          :rows="10"
+          readonly
+          style="font-family: ui-monospace, Menlo, monospace; font-size: 12px"
+        />
+      </div>
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end">
+          <n-button size="small" @click="copyDetail">复制详情</n-button>
+        </div>
+      </template>
+    </n-modal>
   </div>
 </template>
+
+<style scoped>
+.detail-grid {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  row-gap: 10px;
+  font-size: 13px;
+}
+.k {
+  opacity: 0.55;
+  font-size: 13px;
+}
+</style>
