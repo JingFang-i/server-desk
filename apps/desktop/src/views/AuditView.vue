@@ -27,6 +27,20 @@ const sourceOptions = [
 
 const rowKey = (r: AuditEntry) => r.id;
 
+/** 会话筛选（前端过滤）：全部 / 各会话 id */
+const sessionFilter = ref<string>("all");
+const sessionOptions = computed(() => {
+  const set = new Set(rows.value.filter((r) => r.session).map((r) => r.session));
+  return [{ label: "全部会话", value: "all" }].concat(
+    [...set].map((s) => ({ label: s, value: s }))
+  );
+});
+const displayRows = computed(() =>
+  sessionFilter.value === "all"
+    ? rows.value
+    : rows.value.filter((r) => r.session === sessionFilter.value)
+);
+
 function fmtTs(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleString("zh-CN", { hour12: false });
@@ -119,6 +133,15 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
   },
   { title: "结果", key: "outcome", width: 170, render: (r) => outcomeTag(r.outcome) },
   {
+    title: "会话",
+    key: "session",
+    width: 110,
+    render: (r) =>
+      r.session
+        ? h("span", { style: "font-size:11px;font-family:ui-monospace,Menlo,monospace;opacity:.7" }, r.session)
+        : "—",
+  },
+  {
     title: "",
     key: "actions",
     width: 76,
@@ -157,18 +180,26 @@ onMounted(refresh);
             size="small"
             @update:value="refresh"
           />
+          <n-select
+            v-if="sourceFilter === 'ai'"
+            v-model:value="sessionFilter"
+            :options="sessionOptions"
+            size="small"
+            style="width: 180px"
+            placeholder="按会话筛选"
+          />
           <n-button size="small" :loading="loading" @click="refresh">刷新</n-button>
         </div>
       </template>
       <n-data-table
         :columns="columns"
-        :data="rows"
+        :data="displayRows"
         :loading="loading"
         :bordered="false"
         size="small"
         :row-key="rowKey"
         :max-height="520"
-        :scroll-x="900"
+        :scroll-x="1010"
       />
       <p class="hint" style="margin-top: 10px">
         所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；列表仅显示内容摘要，点「详情」查看全文。内容已自动脱敏。
@@ -197,6 +228,10 @@ onMounted(refresh);
           <span class="k">操作</span><span>{{ detailEntry.action }}</span>
           <span class="k">服务器</span><span>{{ detailEntry.serverId ?? "—" }}</span>
           <span class="k">结果</span><span>{{ detailEntry.outcome }}</span>
+          <template v-if="detailEntry.session">
+            <span class="k">会话</span>
+            <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px">{{ detailEntry.session }}</span>
+          </template>
         </div>
         <div class="k" style="margin: 14px 0 6px">内容</div>
         <n-input

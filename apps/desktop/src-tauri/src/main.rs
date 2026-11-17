@@ -184,6 +184,9 @@ fn main() {
             // SFTP 文件传输
             commands::sftp_upload,
             commands::sftp_download,
+            // 变更记录
+            commands::file_backups_list,
+            commands::file_backup_restore,
             // 私钥文件导入
             commands::read_key_file
         ])

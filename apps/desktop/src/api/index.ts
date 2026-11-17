@@ -85,6 +85,15 @@ export interface AuditEntry {
   action: string;
   detail: string;
   outcome: string;
+  session: string;
+}
+
+export interface FileBackupMeta {
+  id: string;
+  serverId: string;
+  path: string;
+  sizeBytes: number;
+  ts: string;
 }
 
 export interface GuardInfo {
@@ -199,6 +208,11 @@ export const api = {
   autoBackupDelete: (name: string) => invoke<void>("auto_backup_delete", { name }),
   // 私钥文件导入
   readKeyFile: (path: string) => invoke<string>("read_key_file", { path }),
+  // 变更记录
+  fileBackupsList: (server?: string) =>
+    invoke<FileBackupMeta[]>("file_backups_list", { server }),
+  fileBackupRestore: (serverId: string, backupId: string) =>
+    invoke<number>("file_backup_restore", { serverId, backupId }),
   // SFTP 文件传输（返回字节数）
   sftpUpload: (serverId: string, localPath: string, remotePath: string) =>
     invoke<number>("sftp_upload", { serverId, localPath, remotePath }),

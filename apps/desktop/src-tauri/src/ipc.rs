@@ -126,7 +126,8 @@ async fn handle_conn(
 
     let req: IpcRequest =
         serde_json::from_slice(&body).map_err(|e| format!("请求体解析失败: {e}"))?;
-    let resp = match handle_tool(&state, &req.tool, req.args).await {
+    ops::set_session(&req.session);
+    let resp = match handle_tool(&state, &req.session, &req.tool, req.args).await {
         Ok(data) => IpcResponse::ok(data),
         Err(e) => IpcResponse::err(e),
     };
@@ -149,6 +150,7 @@ fn tool_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, Strin
 /// MCP 工具实现：全部经主应用安全管线（guard + 审批 + 审计 + 脱敏）。
 async fn handle_tool(
     state: &Arc<AppState>,
+    session: &str,
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {

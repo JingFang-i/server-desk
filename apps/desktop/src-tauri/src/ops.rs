@@ -62,6 +62,13 @@ pub fn conn_params(cfg: &ServerConfig) -> ConnParams {
     }
 }
 
+static CUR_SESSION: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// IPC 请求入口设置当前 AI 会话（audit 仅对 source=ai 行归因）。
+pub fn set_session(s: &str) {
+    *CUR_SESSION.lock().unwrap_or_else(|p| p.into_inner()) = s.to_string();
+}
+
 pub fn audit(
     state: &AppState,
     source: &str,
@@ -70,9 +77,15 @@ pub fn audit(
     detail: &str,
     outcome: &str,
 ) {
+    let session = if source == "ai" {
+        CUR_SESSION.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    } else {
+        String::new()
+    };
     let sanitized = state.guard.sanitize(detail);
     let _ = state.store.insert_audit(
         &chrono::Utc::now().to_rfc3339(),
+        &session,
         source,
         server_id,
         action,

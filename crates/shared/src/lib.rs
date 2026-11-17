@@ -70,6 +70,9 @@ pub struct IpcRequest {
     pub tool: String,
     #[serde(default)]
     pub args: serde_json::Value,
+    /// sidecar 进程级会话 id（同一次 MCP 客户端会话聚合审计用）
+    #[serde(default)]
+    pub session: String,
 }
 
 /// 主应用 → sidecar 的统一应答。

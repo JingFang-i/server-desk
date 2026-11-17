@@ -18,6 +18,12 @@ use tokio::time::Duration;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(150); // 覆盖主应用 120s 审批窗口
 
+/// 进程级会话 id：同一次 MCP 客户端会话的调用在审计中聚合
+static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn session_id() -> String {
+    SESSION.get().cloned().unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() {
     let dir = match shared::data_dir() {
@@ -27,6 +33,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let _ = SESSION.set(format!(
+        "s-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
     eprintln!(
         "serverdesk-mcp v{} 就绪（等待 MCP 客户端初始化）",
         env!("CARGO_PKG_VERSION")
@@ -326,6 +336,7 @@ async fn call_app(dir: &PathBuf, tool: &str, args: &Value) -> Result<Value, Stri
     let body = serde_json::to_vec(&IpcRequest {
         tool: tool.to_string(),
         args: args.clone(),
+        session: session_id(),
     })
     .map_err(|e| e.to_string())?;
 

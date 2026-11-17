@@ -67,6 +67,7 @@ pub struct AuditEntry {
     pub action: String,
     pub detail: String,
     pub outcome: String,
+    pub session: String,
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServerRow> {
@@ -103,6 +104,22 @@ impl Store {
             [],
         )
         .map_err(|e| format!("写入 schema 版本失败: {e}"))?;
+
+        // R5 迁移：audit_log 增加 session 列（旧库自动升级）
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(audit_log)")
+                .map_err(|e| format!("检查审计表失败: {e}"))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("检查审计表失败: {e}"))?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|e| format!("检查审计表失败: {e}"))?;
+            if !cols.iter().any(|c| c == "session") {
+                conn.execute_batch("ALTER TABLE audit_log ADD COLUMN session TEXT NOT NULL DEFAULT '';")
+                    .map_err(|e| format!("迁移审计表失败: {e}"))?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -352,6 +369,7 @@ impl Store {
     pub fn insert_audit(
         &self,
         ts: &str,
+        session: &str,
         source: &str,
         server_id: Option<&str>,
         action: &str,
@@ -360,9 +378,9 @@ impl Store {
     ) -> Result<(), String> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO audit_log(ts, source, server_id, action, detail, outcome) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![ts, source, server_id, action, detail, outcome],
+            "INSERT INTO audit_log(ts, source, server_id, action, detail, outcome, session) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![ts, source, server_id, action, detail, outcome, session],
         )
         .map_err(|e| format!("写审计失败: {e}"))?;
         Ok(())
@@ -380,13 +398,14 @@ impl Store {
                 action: r.get(4)?,
                 detail: r.get(5)?,
                 outcome: r.get(6)?,
+                session: r.get(7)?,
             })
         };
         let mut entries = Vec::new();
         match source {
             Some(s) if s != "all" => {
                 let mut stmt = conn
-                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome FROM audit_log WHERE source=?1 ORDER BY id DESC LIMIT ?2")
+                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome,session FROM audit_log WHERE source=?1 ORDER BY id DESC LIMIT ?2")
                     .map_err(|e| format!("查询审计失败: {e}"))?;
                 let rows = stmt
                     .query_map(params![s, limit], map_row)
@@ -397,7 +416,7 @@ impl Store {
             }
             _ => {
                 let mut stmt = conn
-                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome FROM audit_log ORDER BY id DESC LIMIT ?1")
+                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome,session FROM audit_log ORDER BY id DESC LIMIT ?1")
                     .map_err(|e| format!("查询审计失败: {e}"))?;
                 let rows = stmt
                     .query_map(params![limit], map_row)
@@ -447,7 +466,7 @@ mod tests {
             (recent, "ai", "mcp_list_servers"),
             (recent, "user", "vault_unlock"),
         ] {
-            store.insert_audit(ts, source, None, action, "d", "ok").unwrap();
+            store.insert_audit(ts, "", source, None, action, "d", "ok").unwrap();
         }
         // 清理 7 天前的 AI 记录
         let n = store

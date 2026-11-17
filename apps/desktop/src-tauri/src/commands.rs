@@ -534,6 +534,42 @@ pub async fn sftp_download(
     ops::sftp_download_manual(&state, &server_id, &remote_path, &save_path).await
 }
 
+// ---------- R5：变更记录（写前备份列表 + 手动回滚） ----------
+
+#[tauri::command]
+pub fn file_backups_list(
+    state: State<'_, Arc<AppState>>,
+    server: Option<String>,
+) -> Result<Vec<crate::fbackups::BackupMeta>, String> {
+    Ok(crate::fbackups::list(&state.dir, server.as_deref()))
+}
+
+#[tauri::command]
+pub async fn file_backup_restore(
+    state: State<'_, Arc<AppState>>,
+    server_id: String,
+    backup_id: String,
+) -> Result<u64, String> {
+    if !state.vault.is_unlocked() {
+        return Err("保险库已锁定，请先解锁".into());
+    }
+    let (meta, content) =
+        crate::fbackups::load(&state.dir, &backup_id).map_err(|e| e.to_string())?;
+    if meta.server_id != server_id {
+        return Err("备份不属于该服务器".into());
+    }
+    let cfg = ops::load_server_config(&state, &server_id)?;
+    let res = state
+        .ssh
+        .sftp_write_file(&state.store, &cfg.id, &ops::conn_params(&cfg), &meta.path, &content)
+        .await;
+    match &res {
+        Ok(n) => ops::audit(&state, "user", Some(&server_id), "file_backup_restore", &meta.path, &format!("backup={backup_id} bytes={n}")),
+        Err(e) => ops::audit(&state, "user", Some(&server_id), "file_backup_restore", &meta.path, &truncate(e, 200)),
+    }
+    res
+}
+
 // ---------- 备份与恢复 ----------
 
 /// 读取用户通过文件对话框选择的私钥文件内容（仅明文 PEM/openssh 格式回填表单）。

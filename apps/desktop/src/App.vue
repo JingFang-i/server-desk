@@ -21,9 +21,10 @@ import SettingsView from "./views/SettingsView.vue";
 import ApprovalsView from "./views/ApprovalsView.vue";
 import AuditView from "./views/AuditView.vue";
 import BackupView from "./views/BackupView.vue";
+import ChangeLogView from "./views/ChangeLogView.vue";
 import LockGate from "./views/LockGate.vue";
 
-type PageKey = "servers" | "approvals" | "audit" | "backup" | "settings";
+type PageKey = "servers" | "approvals" | "audit" | "changes" | "backup" | "settings";
 const page = ref<PageKey>("servers");
 const vault = ref<VaultStatus | null>(null);
 const booted = ref(false);
@@ -32,12 +33,13 @@ const menuOptions: MenuOption[] = [
   { label: "🖥 服务器", key: "servers" },
   { label: "✅ 审批中心", key: "approvals" },
   { label: "📜 审计日志", key: "audit" },
+  { label: "🔄 变更记录", key: "changes" },
   { label: "💾 备份恢复", key: "backup" },
   { label: "⚙️ 设置", key: "settings" },
 ];
 
 function onMenu(key: string) {
-  if (["servers", "approvals", "audit", "backup", "settings"].includes(key)) {
+  if (["servers", "approvals", "audit", "changes", "backup", "settings"].includes(key)) {
     page.value = key as PageKey;
   }
 }
@@ -118,6 +120,7 @@ onUnmounted(() => {
           <ServersView v-if="page === 'servers'" />
           <ApprovalsView v-else-if="page === 'approvals'" />
           <AuditView v-else-if="page === 'audit'" />
+          <ChangeLogView v-else-if="page === 'changes'" />
           <BackupView v-else-if="page === 'backup'" />
           <SettingsView v-else-if="page === 'settings'" />
         </n-layout-content>
