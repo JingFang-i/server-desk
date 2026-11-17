@@ -2,6 +2,8 @@
 //! 命令执行（超时 + 输出截断）、TOFU 主机密钥校验（known_hosts 指纹比对）。
 
 use crate::store::Store;
+use tokio::io::{AsyncReadExt as FuturesRead, AsyncWriteExt as FuturesWrite};
+use russh_sftp::client::SftpSession;
 use russh::client::Handle;
 use russh::Disconnect;
 use shared::AuthMethod;
@@ -217,6 +219,198 @@ impl SshPool {
                 status: ConnStatus::Connected,
             })
             .collect()
+    }
+
+    // ---------- SFTP ----------
+
+    /// 取会话：优先复用连接池，否则新建（一次性，用完归还/丢弃）。
+    async fn acquire_session(
+        &self,
+        store: &Arc<Store>,
+        server_id: &str,
+        p: &ConnParams,
+    ) -> Result<Handle<HostKeyVerifier>, String> {
+        {
+            let mut pool = self.pool.lock().await;
+            if let Some(s) = pool.sessions.remove(server_id) {
+                return Ok(s);
+            }
+        }
+        self.establish(store, server_id, p).await
+    }
+
+    async fn release_session(&self, server_id: &str, s: Handle<HostKeyVerifier>) {
+        self.pool
+            .lock()
+            .await
+            .sessions
+            .insert(server_id.to_string(), s);
+    }
+
+    async fn open_sftp(session: &mut Handle<HostKeyVerifier>) -> Result<SftpSession, String> {
+        let channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("打开 SFTP 通道失败：{e}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| format!("请求 sftp 子系统失败：{e}"))?;
+        SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| format!("SFTP 初始化失败：{e}"))
+    }
+
+    async fn sftp_write_bytes(
+        session: &mut Handle<HostKeyVerifier>,
+        remote_path: &str,
+        data: &[u8],
+    ) -> Result<u64, String> {
+        let sftp = Self::open_sftp(session).await?;
+        let mut file = sftp
+            .create(remote_path)
+            .await
+            .map_err(|e| format!("创建远程文件失败（路径不存在或无权限）：{e}"))?;
+        let mut off = 0usize;
+        while off < data.len() {
+            let end = (off + 32768).min(data.len());
+            FuturesWrite::write_all(&mut file, &data[off..end])
+                .await
+                .map_err(|e| format!("写入远程文件失败：{e}"))?;
+            off = end;
+        }
+        FuturesWrite::flush(&mut file)
+            .await
+            .map_err(|e| format!("刷新远程文件失败：{e}"))?;
+        Ok(data.len() as u64)
+    }
+
+    /// 上传本地文件（≤512MB）。失败时会话丢弃，下次操作自动重建。
+    pub async fn sftp_upload(
+        &self,
+        store: &Arc<Store>,
+        server_id: &str,
+        p: &ConnParams,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<u64, String> {
+        let meta = tokio::fs::metadata(local_path)
+            .await
+            .map_err(|e| format!("读取本地文件失败：{e}"))?;
+        if meta.len() > 512 * 1024 * 1024 {
+            return Err("文件超过 512MB 上限".into());
+        }
+        let data = tokio::fs::read(local_path)
+            .await
+            .map_err(|e| format!("读取本地文件失败：{e}"))?;
+        let mut session = self.acquire_session(store, server_id, p).await?;
+        match Self::sftp_write_bytes(&mut session, remote_path, &data).await {
+            Ok(n) => {
+                self.release_session(server_id, session).await;
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 从内存写入远程文件（AI write_file 用）。
+    pub async fn sftp_write_file(
+        &self,
+        store: &Arc<Store>,
+        server_id: &str,
+        p: &ConnParams,
+        remote_path: &str,
+        content: &[u8],
+    ) -> Result<u64, String> {
+        let mut session = self.acquire_session(store, server_id, p).await?;
+        match Self::sftp_write_bytes(&mut session, remote_path, content).await {
+            Ok(n) => {
+                self.release_session(server_id, session).await;
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 读远程文件到内存，cap 为大小上限；返回 (数据, 完整大小, 是否截断)。
+    async fn sftp_read_bytes(
+        session: &mut Handle<HostKeyVerifier>,
+        remote_path: &str,
+        cap: u64,
+    ) -> Result<(Vec<u8>, u64, bool), String> {
+        let sftp = Self::open_sftp(session).await?;
+        let mut file = sftp
+            .open(remote_path)
+            .await
+            .map_err(|_| "远程文件不存在或无法读取".to_string())?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 32768];
+        loop {
+            let n = FuturesRead::read(&mut file, &mut chunk)
+                .await
+                .map_err(|e| format!("读取远程文件失败：{e}"))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let full = buf.len() as u64;
+        let truncated = full > cap;
+        if truncated {
+            buf.truncate(cap as usize);
+        }
+        Ok((buf, full, truncated))
+    }
+
+    /// 下载远程文件到本地路径。
+    pub async fn sftp_download(
+        &self,
+        store: &Arc<Store>,
+        server_id: &str,
+        p: &ConnParams,
+        remote_path: &str,
+        save_path: &str,
+        max: u64,
+    ) -> Result<u64, String> {
+        let mut session = self.acquire_session(store, server_id, p).await?;
+        let res = Self::sftp_read_bytes(&mut session, remote_path, max).await;
+        match res {
+            Ok((data, _full, truncated)) => {
+                if truncated {
+                    Err(format!("文件超过 {}MB 上限", max / 1024 / 1024))
+                } else {
+                    let n = data.len() as u64;
+                    match tokio::fs::write(save_path, &data).await {
+                        Ok(()) => {
+                            self.release_session(server_id, session).await;
+                            Ok(n)
+                        }
+                        Err(e) => Err(format!("写入本地文件失败：{e}")),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// AI read_file：读取远程文件内容（cap 截断）。
+    pub async fn sftp_read_file(
+        &self,
+        store: &Arc<Store>,
+        server_id: &str,
+        p: &ConnParams,
+        remote_path: &str,
+        cap: u64,
+    ) -> Result<(Vec<u8>, u64, bool), String> {
+        let mut session = self.acquire_session(store, server_id, p).await?;
+        let res = Self::sftp_read_bytes(&mut session, remote_path, cap).await;
+        match res {
+            Ok(v) => {
+                self.release_session(server_id, session).await;
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// 在已连接（必要时自动重连）的会话上执行命令。

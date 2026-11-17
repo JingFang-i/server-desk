@@ -178,6 +178,9 @@ fn main() {
             commands::auto_backup_save_settings,
             commands::auto_backup_restore,
             commands::auto_backup_delete,
+            // SFTP 文件传输
+            commands::sftp_upload,
+            commands::sftp_download,
             // 私钥文件导入
             commands::read_key_file
         ])

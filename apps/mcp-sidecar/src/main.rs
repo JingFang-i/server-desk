@@ -119,6 +119,31 @@ async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
                         },
                         "required": ["server"]
                     }
+                },
+                {
+                    "name": "read_file",
+                    "description": "读取远程服务器上的文本文件（上限 512KB，内容自动脱敏）。含凭据/敏感信息的路径（私钥、/etc/shadow、.env 等）会被直接拒绝。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远程文件绝对路径" }
+                        },
+                        "required": ["server", "path"]
+                    }
+                },
+                {
+                    "name": "write_file",
+                    "description": "写入远程服务器上的文本文件（上限 1MB，整文件覆盖）。需要用户在 ServerDesk 应用内人工批准（120 秒超时自动拒绝）；系统安全相关路径（sshd_config、authorized_keys、shell 配置等）直接拒绝。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远程文件绝对路径" },
+                            "content": { "type": "string", "description": "要写入的完整文本内容（覆盖原文件）" }
+                        },
+                        "required": ["server", "path", "content"]
+                    }
                 }
             ]
         }))),

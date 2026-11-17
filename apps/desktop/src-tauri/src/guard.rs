@@ -151,6 +151,50 @@ pub enum Decision {
     NeedsApproval(String),
 }
 
+/// AI 读取远程文件的路径黑名单（防绕过命令拦截、借道泄露服务器凭据）。
+const READ_PATH_DENY: &[&str] = &[
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    ".pem",
+    "/etc/shadow",
+    "authorized_keys",
+    ".env",
+    "credential",
+    "secret",
+    ".gnupg",
+    ".kube/config",
+    ".aws/",
+    ".netrc",
+    ".git-credentials",
+    ".docker/config.json",
+];
+
+/// AI 写入远程文件的路径黑名单（写入会破坏系统安全基线的位置）。
+const WRITE_PATH_DENY: &[&str] = &[
+    "/etc/shadow",
+    "authorized_keys",
+    "sshd_config",
+    "crontab",
+    "/etc/systemd",
+    "/etc/init.d",
+    "/etc/profile",
+    "/etc/profile.d",
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    "/etc/environment",
+    ".ssh/",
+    "/bin/",
+    "/sbin/",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    ".pem",
+];
+
 struct GuardInner {
     rules: GuardRules,
     leak: LeakGuard,
@@ -249,6 +293,32 @@ impl Guard {
         Decision::Allow
     }
 
+    /// AI 读取远程路径的判定：命中泄露黑名单即拒绝，否则放行。
+    pub fn evaluate_read_path(&self, path: &str) -> Decision {
+        let lower = path.to_lowercase();
+        for p in READ_PATH_DENY {
+            if lower.contains(p) {
+                return Decision::Blocked(format!(
+                    "路径命中凭据/敏感文件保护规则「{p}」——AI 不得读取该文件"
+                ));
+            }
+        }
+        Decision::Allow
+    }
+
+    /// AI 写入远程路径的判定：命中禁写黑名单即拒绝；其余一律需人工审批。
+    pub fn evaluate_write_path(&self, path: &str) -> Decision {
+        let lower = path.to_lowercase();
+        for p in WRITE_PATH_DENY {
+            if lower.contains(p) {
+                return Decision::Blocked(format!(
+                    "路径命中系统安全禁写规则「{p}」——AI 不得写入该文件"
+                ));
+            }
+        }
+        Decision::NeedsApproval("AI 文件写入需人工审批".to_string())
+    }
+
     /// 输出/审计文本脱敏（对 AI 与人工一视同仁）。
     pub fn sanitize(&self, text: &str) -> String {
         let g = self.read();
@@ -298,6 +368,46 @@ mod tests {
         assert!(matches!(
             guard().evaluate("dd if=/dev/zero of=/dev/sda"),
             Decision::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn read_path_protection() {
+        assert!(matches!(
+            guard().evaluate_read_path("/root/.ssh/id_ed25519"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_read_path("/etc/shadow"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_read_path("/home/u/app/.env"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_read_path("/var/log/app.log"),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn write_path_protection() {
+        assert!(matches!(
+            guard().evaluate_write_path("/etc/ssh/sshd_config"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_write_path("/root/.bashrc"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_write_path("/etc/nginx/conf.d/app.conf"),
+            Decision::NeedsApproval(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_write_path("/tmp/notes.txt"),
+            Decision::NeedsApproval(_)
         ));
     }
 

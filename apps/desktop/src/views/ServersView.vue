@@ -26,7 +26,7 @@ import {
 } from "naive-ui";
 import { EllipsisVertical, LinkOutline, TerminalOutline } from "@vicons/ionicons5";
 import { api, type SaveServerInput, type ServerConfig } from "../api";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save as save$ } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
 
 const store = useServersStore();
@@ -37,6 +37,7 @@ const dialog = useDialog();
 const actionOptions: DropdownOption[] = [
   { label: "SSH 测试", key: "test" },
   { label: "编辑", key: "edit" },
+  { label: "文件传输", key: "files" },
   { label: "重置指纹", key: "reset" },
   { type: "divider", key: "d1" },
   { label: "删除", key: "delete", props: { style: { color: "#e88080" } } },
@@ -49,6 +50,9 @@ function handleAction(key: string, row: ServerConfig) {
       break;
     case "edit":
       openEdit(row);
+      break;
+    case "files":
+      openFiles(row);
       break;
     case "reset":
       confirmResetHostkey(row);
@@ -457,6 +461,67 @@ async function pickKeyFile() {
     importingKey.value = false;
   }
 }
+
+// ---------- 文件传输（SFTP） ----------
+const filesModal = ref(false);
+const filesTarget = ref<ServerConfig | null>(null);
+const uploadRemoteDir = ref("/root/");
+const uploading = ref(false);
+const downloadRemotePath = ref("");
+const downloading = ref(false);
+
+function openFiles(row: ServerConfig) {
+  filesTarget.value = row;
+  uploadRemoteDir.value = "/root/";
+  downloadRemotePath.value = "";
+  filesModal.value = true;
+}
+
+function joinRemotePath(dir: string, filename: string): string {
+  const d = dir.trim();
+  const sep = d.endsWith("/") ? "" : "/";
+  return `${d}${sep}${filename}`;
+}
+
+async function doUpload() {
+  if (!filesTarget.value) return;
+  const picked = await open({ title: "选择要上传的本地文件", multiple: false });
+  if (typeof picked !== "string") return;
+  const filename = picked.split("/").pop() ?? "file";
+  const remote = joinRemotePath(uploadRemoteDir.value, filename);
+  uploading.value = true;
+  try {
+    const bytes = await api.sftpUpload(filesTarget.value.id, picked, remote);
+    message.success(`已上传 ${filename} → ${remote}（${bytes} 字节）`);
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    uploading.value = false;
+  }
+}
+
+async function doDownload() {
+  if (!filesTarget.value || !downloadRemotePath.value.trim()) {
+    message.error("请输入要下载的远程文件路径");
+    return;
+  }
+  const remote = downloadRemotePath.value.trim();
+  const suggested = remote.split("/").pop() ?? "download";
+  const save = await save$({
+    title: "选择保存位置",
+    defaultPath: suggested,
+  });
+  if (typeof save !== "string") return;
+  downloading.value = true;
+  try {
+    const bytes = await api.sftpDownload(filesTarget.value.id, remote, save);
+    message.success(`已下载 ${remote} → ${save}（${bytes} 字节）`);
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    downloading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -636,6 +701,42 @@ async function pickKeyFile() {
         <pre v-if="execOutput.stderr" class="pre preerr">stderr：
 {{ execOutput.stderr }}</pre>
       </div>
+    </n-modal>
+
+    <n-modal
+      v-model:show="filesModal"
+      preset="card"
+      :title="filesTarget ? `文件传输（SFTP） · ${filesTarget.name}` : '文件传输'"
+      style="width: 640px"
+    >
+      <n-card size="small" title="上传：本地 → 服务器" style="margin-bottom: 14px">
+        <div style="display: flex; gap: 8px; align-items: center">
+          <span style="flex-shrink: 0; font-size: 13px; opacity: 0.8">远端目录</span>
+          <n-input v-model:value="uploadRemoteDir" placeholder="/root/" />
+          <n-button type="primary" :loading="uploading" @click="doUpload">
+            选择文件并上传
+          </n-button>
+        </div>
+        <p class="hint" style="margin: 8px 0 0">
+          文件将以原文件名传到远端目录；同名文件会被覆盖。上限 512MB。
+        </p>
+      </n-card>
+      <n-card size="small" title="下载：服务器 → 本地">
+        <div style="display: flex; gap: 8px; align-items: center">
+          <span style="flex-shrink: 0; font-size: 13px; opacity: 0.8">远端文件</span>
+          <n-input
+            v-model:value="downloadRemotePath"
+            placeholder="如 /var/log/nginx/access.log"
+            @keyup.enter="doDownload"
+          />
+          <n-button type="primary" :loading="downloading" @click="doDownload">
+            保存到本地…
+          </n-button>
+        </div>
+        <p class="hint" style="margin: 8px 0 0">
+          上限 1GB。所有传输都会写入审计日志。
+        </p>
+      </n-card>
     </n-modal>
   </div>
 </template>

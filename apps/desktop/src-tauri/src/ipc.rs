@@ -203,6 +203,45 @@ async fn handle_tool(
             ops::audit(state, "ai", Some(server), "mcp_server_status", "状态探查", "ok");
             Ok(serde_json::json!({ "server": server, "report": r.stdout, "exitCode": r.exit_code }))
         }
-        other => Err(format!("未知工具: {other}（可用: list_servers / exec_command / server_status）")),
+        "read_file" => {
+            let server = args
+                .get("server")
+                .and_then(|v| v.as_str())
+                .ok_or("缺少参数 server（服务器 id 或名称）")?;
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("缺少参数 path（远程文件绝对路径）")?;
+            let (content, size, truncated) =
+                ops::remote_read_file(state, server, path, "ai").await?;
+            Ok(serde_json::json!({
+                "server": server, "path": path,
+                "size": size, "truncated": truncated,
+                "content": content,
+                "note": "内容已脱敏；命中敏感文件保护规则的路径会被直接拒绝"
+            }))
+        }
+        "write_file" => {
+            let server = args
+                .get("server")
+                .and_then(|v| v.as_str())
+                .ok_or("缺少参数 server（服务器 id 或名称）")?;
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("缺少参数 path（远程文件绝对路径）")?;
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("缺少参数 content（要写入的文本内容）")?;
+            let bytes = ops::remote_write_file(state, server, path, content, "ai").await?;
+            Ok(serde_json::json!({
+                "server": server, "path": path, "bytesWritten": bytes,
+                "note": "写入需用户在 ServerDesk 应用内人工批准（120 秒超时）；系统安全相关路径直接拒绝"
+            }))
+        }
+        other => Err(format!(
+            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file）"
+        )),
     }
 }

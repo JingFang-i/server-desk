@@ -184,4 +184,9 @@ export const api = {
   autoBackupDelete: (name: string) => invoke<void>("auto_backup_delete", { name }),
   // 私钥文件导入
   readKeyFile: (path: string) => invoke<string>("read_key_file", { path }),
+  // SFTP 文件传输（返回字节数）
+  sftpUpload: (serverId: string, localPath: string, remotePath: string) =>
+    invoke<number>("sftp_upload", { serverId, localPath, remotePath }),
+  sftpDownload: (serverId: string, remotePath: string, savePath: string) =>
+    invoke<number>("sftp_download", { serverId, remotePath, savePath }),
 };

@@ -507,6 +507,34 @@ pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
     Ok(McpInfo { port, token, sidecar_path, config_json })
 }
 
+// ---------- SFTP：界面文件传输 ----------
+
+#[tauri::command]
+pub async fn sftp_upload(
+    state: State<'_, Arc<AppState>>,
+    server_id: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<u64, String> {
+    if !state.vault.is_unlocked() {
+        return Err("保险库已锁定，请先解锁".into());
+    }
+    ops::sftp_upload_manual(&state, &server_id, &local_path, &remote_path).await
+}
+
+#[tauri::command]
+pub async fn sftp_download(
+    state: State<'_, Arc<AppState>>,
+    server_id: String,
+    remote_path: String,
+    save_path: String,
+) -> Result<u64, String> {
+    if !state.vault.is_unlocked() {
+        return Err("保险库已锁定，请先解锁".into());
+    }
+    ops::sftp_download_manual(&state, &server_id, &remote_path, &save_path).await
+}
+
 // ---------- 备份与恢复 ----------
 
 /// 读取用户通过文件对话框选择的私钥文件内容（仅明文 PEM/openssh 格式回填表单）。

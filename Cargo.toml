@@ -19,6 +19,7 @@ zeroize = "1"
 base64 = "0.22"
 regex = "1"
 tauri-plugin-dialog = "2"
+russh-sftp = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 aes-gcm = "0.10"
