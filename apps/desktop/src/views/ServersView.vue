@@ -3,6 +3,7 @@ import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   NAlert,
   NButton,
+  NCard,
   NDataTable,
   NDropdown,
   NForm,

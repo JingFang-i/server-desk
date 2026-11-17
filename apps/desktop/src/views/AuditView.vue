@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from "vue";
-import { NButton, NCard, NSelect, NTag, useMessage, type DataTableColumns } from "naive-ui";
+import {
+  NButton,
+  NCard,
+  NDataTable,
+  NSelect,
+  NTag,
+  useMessage,
+  type DataTableColumns,
+} from "naive-ui";
 import { api, type AuditEntry } from "../api";
 
 const message = useMessage();
