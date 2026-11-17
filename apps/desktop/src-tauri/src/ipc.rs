@@ -140,6 +140,12 @@ async fn handle_conn(
     Ok(())
 }
 
+fn tool_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("缺少参数 {key}"))
+}
+
 /// MCP 工具实现：全部经主应用安全管线（guard + 审批 + 审计 + 脱敏）。
 async fn handle_tool(
     state: &AppState,
@@ -240,8 +246,45 @@ async fn handle_tool(
                 "note": "写入需用户在 ServerDesk 应用内人工批准（120 秒超时）；系统安全相关路径直接拒绝"
             }))
         }
+        "list_files" => {
+            let server = tool_arg(&args, "server")?;
+            let path = tool_arg(&args, "path")?;
+            let r = crate::observe::list_files(state, server, path).await?;
+            Ok(serde_json::to_value(&r).map_err(|e| e.to_string())?)
+        }
+        "tail_log" => {
+            let server = tool_arg(&args, "server")?;
+            let path = tool_arg(&args, "path")?;
+            let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as u32;
+            let r = crate::observe::tail_log(state, server, path, lines).await?;
+            Ok(serde_json::to_value(&r).map_err(|e| e.to_string())?)
+        }
+        "log_search" => {
+            let server = tool_arg(&args, "server")?;
+            let path = tool_arg(&args, "path")?;
+            let pattern = tool_arg(&args, "pattern")?;
+            let ignore_case = args.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
+            let max = args.get("max_matches").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+            let ctx = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let r = crate::observe::log_search(state, server, path, pattern, ignore_case, max, ctx).await?;
+            Ok(serde_json::to_value(&r).map_err(|e| e.to_string())?)
+        }
+        "list_services" => {
+            let server = tool_arg(&args, "server")?;
+            let r = crate::observe::list_services(state, server).await?;
+            Ok(serde_json::to_value(&r).map_err(|e| e.to_string())?)
+        }
+        "port_check" => {
+            let server = tool_arg(&args, "server")?;
+            let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            if port == 0 {
+                return Err("缺少参数 port（1-65535）".into());
+            }
+            let r = crate::observe::port_check(state, server, port).await?;
+            Ok(serde_json::to_value(&r).map_err(|e| e.to_string())?)
+        }
         other => Err(format!(
-            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file）"
+            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file / list_files / tail_log / log_search / list_services / port_check）"
         )),
     }
 }

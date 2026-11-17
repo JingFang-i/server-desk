@@ -5,6 +5,7 @@ mod commands;
 mod crypto;
 mod guard;
 mod ipc;
+mod observe;
 mod ops;
 mod ssh;
 mod state;

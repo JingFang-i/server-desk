@@ -179,7 +179,7 @@ const AI_READ_FILE_CAP: u64 = 512 * 1024; // AI 读文件上限 512KB
 const AI_WRITE_FILE_CAP: usize = 1024 * 1024; // AI 写文件上限 1MB
 const UI_DOWNLOAD_CAP: u64 = 1024 * 1024 * 1024; // 界面下载上限 1GB
 
-fn ai_gate(state: &AppState, cfg: &ServerConfig, action: &str, detail: &str) -> Result<(), String> {
+pub fn ai_gate(state: &AppState, cfg: &ServerConfig, action: &str, detail: &str) -> Result<(), String> {
     if !cfg.allow_ai {
         audit(state, "ai", Some(&cfg.id), action, detail, "blocked:not_allow_ai");
         return Err(format!("服务器「{}」未开放 AI 操作（allowAi=false）", cfg.name));

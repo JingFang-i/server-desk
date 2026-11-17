@@ -121,6 +121,70 @@ async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
                     }
                 },
                 {
+                    "name": "list_files",
+                    "description": "列出远程目录内容（ls -lah，最多 200 条）。命中敏感路径保护规则的目录会被拒绝。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远程目录绝对路径" }
+                        },
+                        "required": ["server", "path"]
+                    }
+                },
+                {
+                    "name": "tail_log",
+                    "description": "读取远程日志文件尾部（1-2000 行，默认 200），适合排查服务故障而不撑爆上下文。敏感路径保护生效。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远程日志文件绝对路径" },
+                            "lines": { "type": "number", "description": "尾部行数（默认 200，上限 2000）" }
+                        },
+                        "required": ["server", "path"]
+                    }
+                },
+                {
+                    "name": "log_search",
+                    "description": "在远程日志中检索（grep，最多 200 个匹配、上下文 0-5 行）。敏感路径保护生效。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远程日志文件绝对路径" },
+                            "pattern": { "type": "string", "description": "检索文本（字面量，非正则）" },
+                            "ignore_case": { "type": "boolean", "description": "忽略大小写（默认 false）" },
+                            "max_matches": { "type": "number", "description": "最大匹配数（默认 50，上限 200）" },
+                            "context": { "type": "number", "description": "上下文行数（默认 0，上限 5）" }
+                        },
+                        "required": ["server", "path", "pattern"]
+                    }
+                },
+                {
+                    "name": "list_services",
+                    "description": "列出远程服务器的服务状态表（systemd/service），只读。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" }
+                        },
+                        "required": ["server"]
+                    }
+                },
+                {
+                    "name": "port_check",
+                    "description": "检查远程服务器指定端口的监听状态（ss/netstat），只读。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "port": { "type": "number", "description": "端口号（1-65535）" }
+                        },
+                        "required": ["server", "port"]
+                    }
+                },
+                {
                     "name": "read_file",
                     "description": "读取远程服务器上的文本文件（上限 512KB，内容自动脱敏）。含凭据/敏感信息的路径（私钥、/etc/shadow、.env 等）会被直接拒绝。",
                     "inputSchema": {
