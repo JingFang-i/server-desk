@@ -246,6 +246,20 @@ async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
                     }
                 },
                 {
+                    "name": "exec_batch",
+                    "description": "在多台服务器上批量执行同一条命令（最多 20 台，并发 5）。命令经安全管线一次判定/一次人工批准；每台独立检查 allow_ai 并逐台审计；输出已脱敏（每台截断至 4KB）。用 group（分组名）或 servers（id/名称数组）选目标。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "group": { "type": "string", "description": "按分组选目标（如 prod）" },
+                            "servers": { "type": "array", "items": { "type": "string" }, "description": "或按服务器 id/名称列表选目标" },
+                            "command": { "type": "string", "description": "要在每台服务器执行的命令" },
+                            "timeout_secs": { "type": "number", "description": "单台超时秒数（默认 30）" }
+                        },
+                        "required": ["command"]
+                    }
+                },
+                {
                     "name": "read_file",
                     "description": "读取远程服务器上的文本文件（上限 512KB，内容自动脱敏）。含凭据/敏感信息的路径（私钥、/etc/shadow、.env 等）会被直接拒绝。",
                     "inputSchema": {

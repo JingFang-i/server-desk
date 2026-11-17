@@ -5,7 +5,9 @@
 use crate::guard::Decision;
 use crate::ssh::{ConnParams, ExecResult};
 use crate::state::AppState;
+use crate::store::Store;
 use shared::{AuthMethod, ServerConfig};
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::Emitter;
 
@@ -564,4 +566,223 @@ pub async fn ai_restore_file(
         Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_restore_file", &meta.path, &truncate(e, 200)),
     }
     res
+}
+
+// ---------- R3：多服务器批量执行 ----------
+
+pub const BATCH_MAX: usize = 20;
+
+/// 解析批量目标：group 或显式 servers 列表；去重、上限 20。
+/// 返回 (服务器行列表, 未找到的引用名)。
+pub fn resolve_batch_targets(
+    store: &Store,
+    servers: Option<&[String]>,
+    group: Option<&str>,
+) -> Result<(Vec<crate::store::ServerRow>, Vec<String>), String> {
+    let mut rows: Vec<crate::store::ServerRow> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut missing: Vec<String> = Vec::new();
+    if let Some(g) = group.map(|g| g.trim()).filter(|g| !g.is_empty()) {
+        for r in store.list_by_group(g)? {
+            if seen.insert(r.id.clone()) {
+                rows.push(r);
+            }
+        }
+    }
+    if let Some(list) = servers {
+        for t in list {
+            let t = t.trim();
+            if t.is_empty() || seen.contains(t) {
+                continue;
+            }
+            match store.get(t)?.or_else(|| store.find_by_name(t).ok().flatten()) {
+                Some(r) => {
+                    if seen.insert(r.id.clone()) {
+                        rows.push(r);
+                    }
+                }
+                None => missing.push(t.to_string()),
+            }
+        }
+    }
+    if rows.is_empty() && missing.is_empty() {
+        return Err("批量目标为空：请提供 group 或 servers".into());
+    }
+    if rows.len() > BATCH_MAX {
+        return Err(format!("批量目标超过上限 {BATCH_MAX} 台（当前 {} 台）", rows.len()));
+    }
+    Ok((rows, missing))
+}
+
+/// 批量执行：命令经 guard 一次判定/一次审批；并发 5 路；每台独立 allow_ai、脱敏、审计。
+pub async fn exec_batch(
+    state: &Arc<AppState>,
+    servers: Option<&[String]>,
+    group: Option<&str>,
+    command: &str,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        return Err("命令不能为空".into());
+    }
+    let (rows, missing) = resolve_batch_targets(&state.store, servers, group)?;
+    let timeout = Duration::from_secs(timeout_secs.clamp(5, 120));
+
+    // 命令安全判定一次（泄露防护/黑名单/审批）
+    match state.guard.evaluate(&command) {
+        Decision::Blocked(reason) => {
+            audit(state, "ai", None, "mcp_exec_batch", &command, &format!("blocked:{reason}"));
+            return Err(format!("已拦截：{reason}"));
+        }
+        Decision::NeedsApproval(reason) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _pending = state.approvals.create("", &format!("批量 ×{} 台", rows.len()), &command, tx);
+            let _ = state.handle.emit("approvals-updated", ());
+            audit(state, "ai", None, "mcp_approval_requested", &command, &format!("batch:{reason}"));
+            let decided = tokio::time::timeout(
+                Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),
+                rx,
+            )
+            .await;
+            if !matches!(decided, Ok(Ok(true))) {
+                audit(state, "ai", None, "mcp_exec_batch", &command, "approval_denied_or_timeout");
+                return Err("审批被拒绝或已超时（120 秒），批量命令未执行".into());
+            }
+            audit(state, "ai", None, "mcp_approval_granted", &command, "batch");
+        }
+        Decision::Allow => {}
+    }
+
+    // 并发执行（信号量限流 5）
+    let sem = Arc::new(tokio::sync::Semaphore::new(5));
+    let mut handles = Vec::new();
+    for r in rows {
+        let st = state.clone();
+        let sem = sem.clone();
+        let cmd = command.clone();
+        handles.push(tokio::spawn(async move {
+            let mut entry = serde_json::json!({
+                "serverId": r.id, "name": r.name, "host": r.host,
+            });
+            if !r.allow_ai {
+                entry["ok"] = serde_json::json!(false);
+                entry["error"] = serde_json::json!("未开放 AI 操作（allowAi=false）");
+                audit(&st, "ai", Some(&r.id), "mcp_exec_batch", &cmd, "blocked:not_allow_ai");
+                return entry;
+            }
+            let params = ConnParams {
+                host: r.host.clone(), port: r.port, username: r.username.clone(),
+                auth: {
+                    let dek = match st.vault.dek() { Ok(d) => d, Err(e) => {
+                        entry["ok"] = serde_json::json!(false);
+                        entry["error"] = serde_json::json!(e.to_string());
+                        return entry;
+                    }};
+                    match crate::crypto::decrypt(&dek, &r.secret_blob).and_then(|p| serde_json::from_slice::<AuthMethod>(&p).map_err(|e| e.to_string())) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            entry["ok"] = serde_json::json!(false);
+                            entry["error"] = serde_json::json!(e.to_string());
+                            return entry;
+                        }
+                    }
+                },
+            };
+            let res = st.ssh.exec(&st.store, &r.id, &params, &cmd, timeout).await;
+            match res {
+                Ok(x) => {
+                    let out = st.guard.sanitize(&truncate(&x.stdout, 4096));
+                    let errout = st.guard.sanitize(&truncate(&x.stderr, 2048));
+                    audit(&st, "ai", Some(&r.id), "mcp_exec_batch", &cmd, &format!("exit={:?} bytes={}", x.exit_code, out.len()));
+                    entry["ok"] = serde_json::json!(true);
+                    entry["exitCode"] = serde_json::json!(x.exit_code);
+                    entry["stdout"] = serde_json::json!(out);
+                    entry["stderr"] = serde_json::json!(errout);
+                    entry["truncated"] = serde_json::json!(x.truncated);
+                }
+                Err(e) => {
+                    audit(&st, "ai", Some(&r.id), "mcp_exec_batch", &cmd, &truncate(&e, 200));
+                    entry["ok"] = serde_json::json!(false);
+                    entry["error"] = serde_json::json!(truncate(&e, 300));
+                }
+            }
+            entry
+        }));
+    }
+
+    let mut results = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok(v) => results.push(v),
+            Err(e) => results.push(serde_json::json!({ "ok": false, "error": format!("任务异常: {e}") })),
+        }
+    }
+    for m in &missing {
+        results.push(serde_json::json!({ "ok": false, "error": format!("找不到服务器「{m}」") }));
+    }
+
+    let ok_count = results.iter().filter(|r| r["ok"] == serde_json::json!(true)).count();
+    audit(
+        state, "ai", None, "mcp_exec_batch", &command,
+        &format!("done ok={ok_count}/{}", results.len()),
+    );
+    Ok(serde_json::json!({ "count": results.len(), "ok": ok_count, "results": results }))
+}
+
+#[cfg(test)]
+mod r3_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn row(id: &str, name: &str, group: Option<&str>) -> crate::store::ServerRow {
+        crate::store::ServerRow {
+            id: id.into(), name: name.into(), host: "10.0.0.1".into(), port: 22,
+            username: "root".into(), auth_type: "password".into(), secret_blob: vec![0u8; 8],
+            group_name: group.map(String::from), tags: "[]".into(), notes: None,
+            allow_ai: true, created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn batch_target_resolution() {
+        let db = std::env::temp_dir().join(format!("sd-batch-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+        for (id, name, g) in [
+            ("a", "srv-a", Some("prod")),
+            ("b", "srv-b", Some("prod")),
+            ("c", "srv-c", None),
+        ] {
+            store.insert(&row(id, name, g)).unwrap();
+        }
+
+        // 按分组
+        let (rows, missing) = resolve_batch_targets(&store, None, Some("prod")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(missing.is_empty());
+
+        // 按显式列表（含一个不存在的）
+        let (rows, missing) = resolve_batch_targets(&store, Some(&["a".into(), "srv-c".into(), "ghost".into()]), None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(missing, vec!["ghost"]);
+
+        // 去重
+        let (rows, _) = resolve_batch_targets(&store, Some(&["a".into(), "a".into()]), None).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // 空目标
+        assert!(resolve_batch_targets(&store, None, None).is_err());
+        { let (rows, missing) = resolve_batch_targets(&store, Some(&["ghost".into()]), None).unwrap(); assert!(rows.is_empty() && missing == vec!["ghost"]); }
+
+        // 上限 20
+        for i in 0..25 {
+            store.insert(&row(&format!("m{i}"), &format!("m{i}"), None)).unwrap();
+        }
+        let many: Vec<String> = (0..25).map(|i| format!("m{i}")).collect();
+        assert!(resolve_batch_targets(&store, Some(&many), None).is_err());
+
+        let _ = std::fs::remove_file(&db);
+    }
 }

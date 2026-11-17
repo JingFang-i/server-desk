@@ -148,7 +148,7 @@ fn tool_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, Strin
 
 /// MCP 工具实现：全部经主应用安全管线（guard + 审批 + 审计 + 脱敏）。
 async fn handle_tool(
-    state: &AppState,
+    state: &Arc<AppState>,
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -323,8 +323,20 @@ async fn handle_tool(
             let items = crate::fbackups::list(&state.dir, server);
             Ok(serde_json::to_value(&items).map_err(|e| e.to_string())?)
         }
+        "exec_batch" => {
+            let command = tool_arg(&args, "command")?;
+            let servers: Option<Vec<String>> = args.get("servers").and_then(|v| v.as_array()).map(|a| {
+                a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+            });
+            let group = args.get("group").and_then(|v| v.as_str()).map(String::from);
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(30);
+            if servers.is_none() && group.is_none() {
+                return Err("缺少参数 servers（数组）或 group（分组名）".into());
+            }
+            ops::exec_batch(state, servers.as_deref(), group.as_deref(), command, timeout_secs).await
+        }
         other => Err(format!(
-            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file / list_files / tail_log / log_search / list_services / port_check / upload_file / download_file / append_file / restore_file / list_file_backups）"
+            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file / list_files / tail_log / log_search / list_services / port_check / upload_file / download_file / append_file / restore_file / list_file_backups / exec_batch）"
         )),
     }
 }

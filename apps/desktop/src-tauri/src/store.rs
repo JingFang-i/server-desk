@@ -132,6 +132,18 @@ impl Store {
             .map_err(|e| format!("查询失败: {e}"))
     }
 
+    pub fn list_by_group(&self, group: &str) -> Result<Vec<ServerRow>, String> {
+        let conn = self.lock()?;
+        let sql = format!("SELECT {COLS} FROM servers WHERE group_name = ?1 ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![group], map_row)
+            .map_err(|e| format!("查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("读取行失败: {e}"))?;
+        Ok(rows)
+    }
+
     pub fn find_by_name(&self, name: &str) -> Result<Option<ServerRow>, String> {
         let conn = self.lock()?;
         let sql = format!("SELECT {COLS} FROM servers WHERE name = ?1");
