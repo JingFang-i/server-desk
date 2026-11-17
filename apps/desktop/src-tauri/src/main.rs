@@ -52,6 +52,14 @@ fn main() {
     #[cfg(all(windows, not(debug_assertions)))]
     win_stdio::redirect_to_nul();
 
+    // Linux（deepin/UOS 等国产系统常见）：WebKitGTK 的 DMABUF 渲染器在部分
+    // GPU/驱动组合（含虚拟机）下渲染黑屏。禁用后走备用合成路径，界面恢复正常，
+    // 代价仅为少量合成性能，对管理工具界面无感知。用户已显式设置时不覆盖。
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
