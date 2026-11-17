@@ -397,4 +397,61 @@ impl Store {
         }
         Ok(entries)
     }
+
+    /// 按 RFC3339 时间戳清理审计记录（ts 为字典序可比的 UTC 字符串）。
+    /// source 传 Some 仅清理指定来源（如 AI），None 清理全部。
+    pub fn purge_audit_before(&self, ts: &str, source: Option<&str>) -> Result<usize, String> {
+        let conn = self.lock()?;
+        let n = match source {
+            Some(s) => conn
+                .execute(
+                    "DELETE FROM audit_log WHERE ts < ?1 AND source = ?2",
+                    params![ts, s],
+                )
+                .map_err(|e| format!("清理审计失败: {e}"))?,
+            None => conn
+                .execute("DELETE FROM audit_log WHERE ts < ?1", params![ts])
+                .map_err(|e| format!("清理审计失败: {e}"))?,
+        };
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_audit_respects_cutoff_and_source() {
+        let db = std::env::temp_dir().join(format!("sd-audit-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+
+        let old = "2026-11-01T00:00:00.000000+00:00";
+        let recent = "2026-11-16T00:00:00.000000+00:00";
+        for (ts, source, action) in [
+            (old, "ai", "mcp_exec_command"),
+            (old, "manual", "ssh_exec"),
+            (recent, "ai", "mcp_list_servers"),
+            (recent, "user", "vault_unlock"),
+        ] {
+            store.insert_audit(ts, source, None, action, "d", "ok").unwrap();
+        }
+        // 清理 7 天前的 AI 记录
+        let n = store
+            .purge_audit_before("2026-11-10T00:00:00.000000+00:00", Some("ai"))
+            .unwrap();
+        assert_eq!(n, 1);
+        // 旧的 manual 仍在；新的 ai 仍在
+        assert_eq!(store.audit_list(100, Some("manual")).unwrap().len(), 1);
+        assert_eq!(store.audit_list(100, Some("ai")).unwrap().len(), 1);
+        // 全量清理剩余旧行（cutoff 覆盖 recent 前）
+        let n = store
+            .purge_audit_before("2026-11-15T00:00:00.000000+00:00", None)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.audit_list(100, None).unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&db);
+    }
 }

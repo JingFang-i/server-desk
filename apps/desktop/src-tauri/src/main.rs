@@ -47,6 +47,27 @@ fn main() {
                 }
             });
 
+            // AI 调用日志保留策略：启动时清理一次，之后每 6 小时巡检
+            // （audit_log 中 source=ai 的记录仅保留最近 7 天）
+            let store_for_audit = store.clone();
+            tauri::async_runtime::spawn(async move {
+                const RETENTION_DAYS: i64 = 7;
+                let purge = |store: &store::Store| {
+                    let cutoff = (chrono::Utc::now() - chrono::Duration::days(RETENTION_DAYS))
+                        .to_rfc3339();
+                    match store.purge_audit_before(&cutoff, Some("ai")) {
+                        Ok(0) => {}
+                        Ok(n) => eprintln!("审计清理：已删除 {n} 条超过 {RETENTION_DAYS} 天的 AI 调用记录"),
+                        Err(e) => eprintln!("审计清理失败: {e}"),
+                    }
+                };
+                purge(&store_for_audit);
+                loop {
+                    tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+                    purge(&store_for_audit);
+                }
+            });
+
             // 自动备份巡检：每 10 分钟检查是否到期（到期且保险库解锁才执行）
             let store_for_bk = store.clone();
             let vault_for_bk = vault.clone();
