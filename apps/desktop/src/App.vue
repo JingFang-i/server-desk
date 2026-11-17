@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import {
+  NButton,
   NConfigProvider,
   NDialogProvider,
   NLayout,
@@ -53,6 +54,15 @@ function onUnlocked() {
   refreshVault();
 }
 
+async function lockVault() {
+  try {
+    await api.vaultLock();
+    refreshVault();
+  } catch {
+    /* ignore */
+  }
+}
+
 let unlisten: UnlistenFn | undefined;
 let pollTimer: number | undefined;
 
@@ -97,6 +107,10 @@ onUnmounted(() => {
             本地服务器管理
           </div>
           <n-menu :value="page" :options="menuOptions" @update:value="onMenu" />
+          <div style="flex: 1" />
+          <n-button size="small" block quaternary style="margin-top: 12px" @click="lockVault">
+            🔒 锁定保险库
+          </n-button>
         </n-layout-sider>
         <n-layout-content
           content-style="padding: 20px 24px; height: 100vh; overflow: auto"
