@@ -6,7 +6,7 @@
 并通过标准 **MCP 协议**向 AI Agent 暴露**受限的**运维能力 —— AI 能做日常运维，
 但拿不到凭据、执行不了高危操作。
 
-`macOS 14+ (Apple Silicon)` · `Windows 10/11 (amd64)` · `Tauri 2 (Rust)` · `Vue 3 / TypeScript` · `SQLite` · `AES-256-GCM`
+`macOS 14+ (Apple Silicon)` · `Windows 10/11 (amd64)` · `Debian 12 / Ubuntu 22.04+ (amd64)` · `Tauri 2 (Rust)` · `Vue 3 / TypeScript` · `SQLite` · `AES-256-GCM`
 
 ---
 
@@ -17,7 +17,7 @@
 - 🔌 **稳定 SSH 连接** — 连接保活、断线自动重连、远程命令执行
 - 🤖 **AI 安全执行管线** — 泄露防护 / 黑白名单 / 高危审批 / 全量审计 / 输出脱敏，七层防护
 - 📦 **加密备份** — 手动导出/恢复（合并 / 覆盖两种模式）+ 定时自动备份（保留 N 份）
-- 🖥️ **双平台** — macOS 与 Windows 原生打包
+- 🖥️ **多平台** — macOS / Windows / Linux 原生打包（Linux 提供 .deb / .rpm / AppImage）
 
 ## 🏗️ 架构
 

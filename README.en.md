@@ -7,7 +7,7 @@ assets (credentials / SSH keys), keep stable SSH connections, and expose **restr
 ops capabilities to AI Agents via the standard **MCP protocol** — AI can handle day-to-day
 operations, but it can never see credentials or run dangerous commands.
 
-`macOS 14+ (Apple Silicon)` · `Windows 10/11 (amd64)` · `Tauri 2 (Rust)` · `Vue 3 / TypeScript` · `SQLite` · `AES-256-GCM`
+`macOS 14+ (Apple Silicon)` · `Windows 10/11 (amd64)` · `Debian 12 / Ubuntu 22.04+ (amd64)` · `Tauri 2 (Rust)` · `Vue 3 / TypeScript` · `SQLite` · `AES-256-GCM`
 
 ---
 
@@ -18,7 +18,7 @@ operations, but it can never see credentials or run dangerous commands.
 - 🔌 **Stable SSH connections** — keep-alive, automatic reconnect, remote command execution
 - 🤖 **AI safety pipeline** — leak protection / black & white lists / approval for dangerous commands / full audit / output redaction, seven layers of defense
 - 📦 **Encrypted backups** — manual export & restore (merge / overwrite) + scheduled automatic backups (keep N copies)
-- 🖥️ **Dual platform** — native builds for macOS and Windows
+- 🖥️ **Multi-platform** — native builds for macOS / Windows / Linux (Linux ships .deb / .rpm / AppImage)
 
 ## 🏗️ Architecture
 
