@@ -283,8 +283,48 @@ async fn handle_tool(
             let r = crate::observe::port_check(state, server, port).await?;
             Ok(serde_json::to_value(&r).map_err(|e| e.to_string())?)
         }
+        "upload_file" => {
+            let server = tool_arg(&args, "server")?;
+            let local_path = tool_arg(&args, "local_path")?;
+            let remote_path = tool_arg(&args, "remote_path")?;
+            let bytes = ops::ai_upload_file(state, server, local_path, remote_path).await?;
+            Ok(serde_json::json!({
+                "bytesUploaded": bytes,
+                "note": "本地敏感路径（私钥/.pem/.env 等）直接拒绝；远端禁写路径拒绝；其余需人工批准"
+            }))
+        }
+        "download_file" => {
+            let server = tool_arg(&args, "server")?;
+            let remote_path = tool_arg(&args, "path")?;
+            let saved = ops::ai_download_file(state, server, remote_path).await?;
+            Ok(serde_json::json!({ "savedTo": saved }))
+        }
+        "append_file" => {
+            let server = tool_arg(&args, "server")?;
+            let path = tool_arg(&args, "path")?;
+            let content = tool_arg(&args, "content")?;
+            let bytes = ops::ai_append_file(state, server, path, content).await?;
+            Ok(serde_json::json!({
+                "bytesAfterAppend": bytes,
+                "note": "仅限已有文件（追加语义）；远端禁写路径拒绝；需人工批准"
+            }))
+        }
+        "restore_file" => {
+            let server = tool_arg(&args, "server")?;
+            let backup_id = tool_arg(&args, "backup_id")?;
+            let bytes = ops::ai_restore_file(state, server, backup_id).await?;
+            Ok(serde_json::json!({
+                "bytesRestored": bytes,
+                "note": "已回滚到写前备份状态（需人工批准）"
+            }))
+        }
+        "list_file_backups" => {
+            let server = args.get("server").and_then(|v| v.as_str());
+            let items = crate::fbackups::list(&state.dir, server);
+            Ok(serde_json::to_value(&items).map_err(|e| e.to_string())?)
+        }
         other => Err(format!(
-            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file / list_files / tail_log / log_search / list_services / port_check）"
+            "未知工具: {other}（可用: list_servers / exec_command / server_status / read_file / write_file / list_files / tail_log / log_search / list_services / port_check / upload_file / download_file / append_file / restore_file / list_file_backups）"
         )),
     }
 }

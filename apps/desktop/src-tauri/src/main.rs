@@ -3,6 +3,7 @@ mod approvals;
 mod backup;
 mod commands;
 mod crypto;
+mod fbackups;
 mod guard;
 mod ipc;
 mod observe;

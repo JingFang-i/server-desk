@@ -292,6 +292,21 @@ pub async fn remote_write_file(
             Decision::Allow => {}
         }
     }
+    // 写前自动备份：原文件存在且 ≤1MB 时保存一份，供 restore_file 回滚
+    let mut backup_note = String::new();
+    if source == "ai" {
+        if let Ok((orig, orig_size, false)) = state
+            .ssh
+            .sftp_read_file(&state.store, &cfg.id, &conn_params(&cfg), path, 1024 * 1024)
+            .await
+        {
+            if orig_size <= 1024 * 1024 {
+                if let Ok(meta) = crate::fbackups::save(&state.dir, &cfg.id, path, &orig) {
+                    backup_note = format!(" backup={}", meta.id);
+                }
+            }
+        }
+    }
     let res = state
         .ssh
         .sftp_write_file(&state.store, &cfg.id, &conn_params(&cfg), path, content.as_bytes())
@@ -303,7 +318,7 @@ pub async fn remote_write_file(
             Some(&cfg.id),
             if source == "ai" { "mcp_write_file" } else { "sftp_write" },
             path,
-            &format!("bytes={n}"),
+            &format!("bytes={n}{backup_note}"),
         ),
         Err(e) => audit(
             state,
@@ -386,6 +401,167 @@ pub async fn sftp_download_manual(
             &format!("{remote_path} → {save_path}"),
             &truncate(e, 200),
         ),
+    }
+    res
+}
+
+// ---------- R2：AI 文件能力（上传/下载/追加/回滚） ----------
+
+/// 本地（ServerDesk 所在机器）读取防护：防止 AI 把本机敏感文件推到服务器。
+fn gate_local_read(state: &AppState, cfg: &ServerConfig, action: &str, local_path: &str) -> Result<(), String> {
+    ai_gate(state, cfg, action, local_path)?;
+    if let Decision::Blocked(reason) = state.guard.evaluate_read_path(local_path) {
+        audit(state, "ai", Some(&cfg.id), action, local_path, "blocked:local_read");
+        return Err(format!("已拦截：{reason}（本地路径）"));
+    }
+    Ok(())
+}
+
+fn remote_write_rules(state: &AppState, cfg: &ServerConfig, action: &str, path: &str) -> Result<(), String> {
+    match state.guard.evaluate_write_path(path) {
+        Decision::Blocked(reason) => {
+            audit(state, "ai", Some(&cfg.id), action, path, "blocked");
+            Err(format!("已拦截：{reason}"))
+        }
+        Decision::NeedsApproval(reason) => {
+            audit(state, "ai", Some(&cfg.id), action, path, &reason);
+            Ok(())
+        }
+        Decision::Allow => Ok(()),
+    }
+}
+
+/// AI 上传本地文件到服务器（本地与远端双重防护 + 审批）。
+pub async fn ai_upload_file(
+    state: &AppState,
+    server_ref: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<u64, String> {
+    let cfg = load_server_config(state, server_ref)?;
+    gate_local_read(state, &cfg, "mcp_upload_file", local_path)?;
+    remote_write_rules(state, &cfg, "mcp_upload_file", remote_path)?;
+    let summary = format!(
+        "上传文件 {} → {}:{}",
+        local_path, cfg.host, remote_path
+    );
+    wait_file_approval(state, &cfg, &summary).await?;
+    let res = state
+        .ssh
+        .sftp_upload(&state.store, &cfg.id, &conn_params(&cfg), local_path, remote_path)
+        .await;
+    match &res {
+        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_upload_file", &format!("{local_path} → {remote_path}"), &format!("bytes={n}")),
+        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_upload_file", &format!("{local_path} → {remote_path}"), &truncate(e, 200)),
+    }
+    res
+}
+
+/// AI 从服务器下载文件到应用受管目录（ai_downloads/），不允许写任意本地路径。
+pub async fn ai_download_file(
+    state: &AppState,
+    server_ref: &str,
+    remote_path: &str,
+) -> Result<String, String> {
+    let cfg = load_server_config(state, server_ref)?;
+    ai_gate(state, &cfg, "mcp_download_file", remote_path)?;
+    if let Decision::Blocked(reason) = state.guard.evaluate_read_path(remote_path) {
+        audit(state, "ai", Some(&cfg.id), "mcp_download_file", remote_path, "blocked");
+        return Err(format!("已拦截：{reason}"));
+    }
+    let downloads = state.dir.join("ai_downloads");
+    std::fs::create_dir_all(&downloads).map_err(|e| format!("创建下载目录失败: {e}"))?;
+    let base = remote_path.rsplit('/').next().unwrap_or("download");
+    let safe_base: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || ".-_".contains(c) { c } else { '_' })
+        .collect();
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let save_path = downloads.join(format!("{ts}-{safe_base}"));
+    let res = state
+        .ssh
+        .sftp_download(
+            &state.store,
+            &cfg.id,
+            &conn_params(&cfg),
+            remote_path,
+            &save_path.display().to_string(),
+            100 * 1024 * 1024,
+        )
+        .await;
+    match &res {
+        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_download_file", remote_path, &format!("bytes={n} → {}", save_path.display())),
+        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_download_file", remote_path, &truncate(e, 200)),
+    }
+    res?;
+    Ok(save_path.display().to_string())
+}
+
+/// AI 追加内容到远程已有文件（不存在则拒绝，新建用 write_file）。需审批。
+pub async fn ai_append_file(
+    state: &AppState,
+    server_ref: &str,
+    path: &str,
+    content: &str,
+) -> Result<u64, String> {
+    let cfg = load_server_config(state, server_ref)?;
+    ai_gate(state, &cfg, "mcp_append_file", path)?;
+    if content.len() > 512 * 1024 {
+        return Err("追加内容超过 512KB 上限".into());
+    }
+    remote_write_rules(state, &cfg, "mcp_append_file", path)?;
+    // append 语义：文件必须已存在
+    let existing = state
+        .ssh
+        .sftp_read_file(&state.store, &cfg.id, &conn_params(&cfg), path, 1024 * 1024)
+        .await
+        .map_err(|_| "远程文件不存在或不可读：append 仅限已有文件，新建请用 write_file".to_string())?;
+    let mut merged = existing.0;
+    if !merged.ends_with(b"\n") && !merged.is_empty() {
+        merged.push(b'\n');
+    }
+    merged.extend_from_slice(content.as_bytes());
+    if merged.len() > 1024 * 1024 {
+        return Err("追加后超过 1MB 上限".into());
+    }
+    let summary = format!("追加内容到 {}（{} 字节）", path, content.len());
+    wait_file_approval(state, &cfg, &summary).await?;
+    let res = state
+        .ssh
+        .sftp_write_file(&state.store, &cfg.id, &conn_params(&cfg), path, &merged)
+        .await;
+    match &res {
+        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_append_file", path, &format!("bytes={n}")),
+        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_append_file", path, &truncate(e, 200)),
+    }
+    res
+}
+
+/// AI 回滚远程文件到某份写前备份（需审批；不做禁写名单拦截——回滚目标为人工批准过的原始状态）。
+pub async fn ai_restore_file(
+    state: &AppState,
+    server_ref: &str,
+    backup_id: &str,
+) -> Result<u64, String> {
+    let cfg = load_server_config(state, server_ref)?;
+    ai_gate(state, &cfg, "mcp_restore_file", backup_id)?;
+    let (meta, content) =
+        crate::fbackups::load(&state.dir, backup_id).map_err(|e| e.to_string())?;
+    if meta.server_id != cfg.id {
+        return Err("备份不属于该服务器".into());
+    }
+    let summary = format!(
+        "回滚文件 {} 至备份 {}（{} 字节，备份于 {}）",
+        meta.path, meta.id, meta.size, meta.ts
+    );
+    wait_file_approval(state, &cfg, &summary).await?;
+    let res = state
+        .ssh
+        .sftp_write_file(&state.store, &cfg.id, &conn_params(&cfg), &meta.path, &content)
+        .await;
+    match &res {
+        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_restore_file", &meta.path, &format!("backup={} bytes={n}", meta.id)),
+        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_restore_file", &meta.path, &truncate(e, 200)),
     }
     res
 }

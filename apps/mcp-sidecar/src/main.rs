@@ -185,6 +185,67 @@ async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
                     }
                 },
                 {
+                    "name": "upload_file",
+                    "description": "把本机（ServerDesk 所在电脑）文件上传到服务器。本地敏感路径（私钥/.pem/.env 等）直接拒绝；远端禁写路径直接拒绝；其余需用户人工批准（120 秒超时）。上限 512MB。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "local_path": { "type": "string", "description": "本机文件绝对路径" },
+                            "remote_path": { "type": "string", "description": "远端目标文件绝对路径（覆盖写）" }
+                        },
+                        "required": ["server", "local_path", "remote_path"]
+                    }
+                },
+                {
+                    "name": "download_file",
+                    "description": "把服务器文件下载到本机受管下载目录（ai_downloads/，不能写任意本地路径），上限 100MB。远端敏感路径直接拒绝。返回 savedTo 本地路径。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远端文件绝对路径" }
+                        },
+                        "required": ["server", "path"]
+                    }
+                },
+                {
+                    "name": "append_file",
+                    "description": "向远程已有文件追加文本内容（不存在则拒绝，新建用 write_file；自动补换行）。远端禁写路径直接拒绝；其余需人工批准。上限 512KB。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "path": { "type": "string", "description": "远端文件绝对路径" },
+                            "content": { "type": "string", "description": "要追加的文本" }
+                        },
+                        "required": ["server", "path", "content"]
+                    }
+                },
+                {
+                    "name": "restore_file",
+                    "description": "把远程文件回滚到某份写前备份（write_file 会自动备份原文件）。需人工批准。先用 list_file_backups 查 backup_id。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "服务器 id 或精确名称" },
+                            "backup_id": { "type": "string", "description": "备份 id（来自 list_file_backups）" }
+                        },
+                        "required": ["server", "backup_id"]
+                    }
+                },
+                {
+                    "name": "list_file_backups",
+                    "description": "列出 AI 写文件操作自动生成的写前备份（新→旧），可按服务器过滤。返回 id/path/size/ts。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string", "description": "可选：按服务器 id 过滤" }
+                        },
+                        "required": []
+                    }
+                },
+                {
                     "name": "read_file",
                     "description": "读取远程服务器上的文本文件（上限 512KB，内容自动脱敏）。含凭据/敏感信息的路径（私钥、/etc/shadow、.env 等）会被直接拒绝。",
                     "inputSchema": {
