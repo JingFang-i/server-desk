@@ -1,4 +1,8 @@
 // ServerDesk 桌面应用 Rust 后端入口。
+// Windows release 构建使用 GUI 子系统，避免启动时弹出控制台窗口；
+// debug（tauri dev）下保留控制台以便查看日志输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod approvals;
 mod backup;
 mod commands;
@@ -18,7 +22,36 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
+/// Windows release（GUI 子系统）下 stdout/stderr 句柄为 NULL，
+/// 任何 println!/eprintln! 都会因写失败而 panic 导致应用崩溃。
+/// 启动时把标准输出/错误重定向到 NUL 设备，日志安全丢弃。
+#[cfg(all(windows, not(debug_assertions)))]
+mod win_stdio {
+    const STD_OUTPUT_HANDLE: u32 = 1;
+    const STD_ERROR_HANDLE: u32 = 2;
+
+    extern "system" {
+        fn SetStdHandle(nStdHandle: u32, hHandle: *mut core::ffi::c_void) -> i32;
+    }
+
+    pub fn redirect_to_nul() {
+        use std::os::windows::io::IntoRawHandle;
+        let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") else {
+            return;
+        };
+        // 句柄所有权移交给系统：进程生命周期内保持有效
+        let handle = nul.into_raw_handle();
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            SetStdHandle(STD_ERROR_HANDLE, handle);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    win_stdio::redirect_to_nul();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
