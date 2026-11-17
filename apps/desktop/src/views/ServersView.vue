@@ -653,7 +653,7 @@ async function doDownload() {
         </n-form-item>
         <n-form-item label="允许 AI">
           <n-switch v-model:value="model.allowAi" />
-          <span class="hint">关闭后 MCP 工具不可操作此服务器（M3 生效）</span>
+          <span class="hint">关闭后 AI 工具不可操作此服务器</span>
         </n-form-item>
         <n-form-item label="备注">
           <n-input v-model:value="model.notes" type="textarea" :rows="2" />
@@ -685,7 +685,7 @@ async function doDownload() {
         </n-button>
       </div>
       <p class="hint" style="margin: 8px 0 0">
-        手动执行记录会写入审计日志。M3 起 AI Agent 调用将经过高危命令拦截与审批管线。
+        手动执行记录会写入审计日志；AI Agent 调用会经过高危命令拦截与审批管线。
       </p>
       <div v-if="execOutput" class="execout">
         <div class="execline">

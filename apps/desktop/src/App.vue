@@ -94,13 +94,9 @@ onUnmounted(() => {
         >
           <div class="brand-title">ServerDesk</div>
           <div class="brand-sub" style="margin-bottom: 14px">
-            本地服务器管理 · M4
+            本地服务器管理
           </div>
           <n-menu :value="page" :options="menuOptions" @update:value="onMenu" />
-          <div class="sider-note">
-            备份恢复将于 M4 提供<br />
-            MCP 工具：list_servers / exec_command / server_status
-          </div>
         </n-layout-sider>
         <n-layout-content
           content-style="padding: 20px 24px; height: 100vh; overflow: auto"

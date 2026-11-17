@@ -179,8 +179,7 @@ async function copy(text: string, label: string) {
       </div>
     </n-card>
 
-    <n-card title="命令安全规则（可自定义）" size="small" style="max-width: 720px; margin-top: 16px">
-      <div class="rules-grid">
+    <n-card title="命令安全规则（可自定义）" size="small" style="max-width: 720px; margin-top: 16px">      <div class="rules-grid">
         <div>
           <div class="rule-title">
             <n-tag size="small" type="error" :bordered="false">硬拦截</n-tag>
@@ -202,13 +201,6 @@ async function copy(text: string, label: string) {
       <template #footer>
         <n-button type="primary" :loading="savingRules" @click="saveRules">保存规则</n-button>
       </template>
-    </n-card>
-
-    <n-card title="路线图" size="small" style="max-width: 720px; margin-top: 16px">
-      <ul class="roadmap">
-        <li>M4：服务器信息加密备份与恢复、定时自动备份</li>
-        <li>M5：macOS（Apple Silicon）与 Windows（amd64）安装包</li>
-      </ul>
     </n-card>
   </div>
 </template>
