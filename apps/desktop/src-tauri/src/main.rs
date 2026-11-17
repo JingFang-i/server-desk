@@ -125,6 +125,7 @@ fn main() {
                 ssh: ssh::SshPool::new(),
                 guard,
                 approvals: approvals::Approvals::default(),
+                ai_rate: guard::AiRate::new(),
                 handle: app.handle().clone(),
                 dir: dir.clone(),
             });

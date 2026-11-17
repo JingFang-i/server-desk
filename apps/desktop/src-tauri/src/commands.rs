@@ -396,12 +396,11 @@ pub fn guard_info(state: State<'_, Arc<AppState>>) -> crate::guard::GuardInfo {
 #[tauri::command]
 pub fn guard_set_rules(
     state: State<'_, Arc<AppState>>,
-    deny: Vec<String>,
-    approval: Vec<String>,
+    rules: GuardRules,
 ) -> Result<crate::guard::GuardInfo, String> {
     state
         .guard
-        .set_rules(&state.store, GuardRules { deny, approval })
+        .set_rules(&state.store, rules)
         .map_err(|e| e.to_string())?;
     ops::audit(&state, "user", None, "guard_set_rules", "更新安全规则", "ok");
     Ok(state.guard.info())

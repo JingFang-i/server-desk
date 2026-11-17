@@ -10,6 +10,7 @@ pub struct AppState {
     pub ssh: SshPool,
     pub guard: Guard,
     pub approvals: Approvals,
+    pub ai_rate: crate::guard::AiRate,
     pub handle: tauri::AppHandle,
     pub dir: PathBuf,
 }

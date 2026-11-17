@@ -109,7 +109,15 @@ pub async fn run_command(
             );
             return Err(format!("服务器「{}」未开放 AI 操作（allowAi=false）", cfg.name));
         }
-        match state.guard.evaluate(&command) {
+        let mut decision = state.guard.evaluate(&command);
+        // 严格分组：命中分组的服务器，Allow 也强制审批
+        if matches!(decision, Decision::Allow) && state.guard.is_strict_group(cfg.group.as_deref()) {
+            decision = Decision::NeedsApproval(format!(
+                "严格分组「{}」：所有命令需人工审批",
+                cfg.group.as_deref().unwrap_or("")
+            ));
+        }
+        match decision {
             Decision::Blocked(reason) => {
                 audit(state, source, Some(&cfg.id), "mcp_exec_command", &command, "blocked");
                 return Err(format!("已拦截：{reason}"));
@@ -273,6 +281,10 @@ pub async fn remote_write_file(
     source: &str,
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
+    if state.guard.is_readonly() {
+        audit(state, "ai", Some(&cfg.id), "mcp_write_file", path, "blocked:readonly");
+        return Err("只读模式已开启：AI 不得写入文件".into());
+    }
     if content.len() > AI_WRITE_FILE_CAP {
         return Err(format!("内容超过 {}MB 上限", AI_WRITE_FILE_CAP / 1024 / 1024));
     }
@@ -441,6 +453,10 @@ pub async fn ai_upload_file(
     remote_path: &str,
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
+    if state.guard.is_readonly() {
+        audit(state, "ai", Some(&cfg.id), "mcp_upload_file", local_path, "blocked:readonly");
+        return Err("只读模式已开启：AI 不得上传文件".into());
+    }
     gate_local_read(state, &cfg, "mcp_upload_file", local_path)?;
     remote_write_rules(state, &cfg, "mcp_upload_file", remote_path)?;
     let summary = format!(
@@ -507,6 +523,10 @@ pub async fn ai_append_file(
     content: &str,
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
+    if state.guard.is_readonly() {
+        audit(state, "ai", Some(&cfg.id), "mcp_append_file", path, "blocked:readonly");
+        return Err("只读模式已开启：AI 不得追加文件".into());
+    }
     ai_gate(state, &cfg, "mcp_append_file", path)?;
     if content.len() > 512 * 1024 {
         return Err("追加内容超过 512KB 上限".into());
@@ -546,6 +566,10 @@ pub async fn ai_restore_file(
     backup_id: &str,
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
+    if state.guard.is_readonly() {
+        audit(state, "ai", Some(&cfg.id), "mcp_restore_file", backup_id, "blocked:readonly");
+        return Err("只读模式已开启：AI 不得回滚文件".into());
+    }
     ai_gate(state, &cfg, "mcp_restore_file", backup_id)?;
     let (meta, content) =
         crate::fbackups::load(&state.dir, backup_id).map_err(|e| e.to_string())?;
@@ -629,8 +653,18 @@ pub async fn exec_batch(
     let (rows, missing) = resolve_batch_targets(&state.store, servers, group)?;
     let timeout = Duration::from_secs(timeout_secs.clamp(5, 120));
 
-    // 命令安全判定一次（泄露防护/黑名单/审批）
-    match state.guard.evaluate(&command) {
+    // 命令安全判定一次（泄露防护/黑名单/审批）；严格分组目标存在则整批强制审批
+    let mut decision = state.guard.evaluate(&command);
+    if matches!(decision, Decision::Allow)
+        && rows
+            .iter()
+            .any(|r| state.guard.is_strict_group(r.group_name.as_deref()))
+    {
+        decision = Decision::NeedsApproval(
+            "批量目标包含严格分组服务器：整批需人工审批".to_string(),
+        );
+    }
+    match decision {
         Decision::Blocked(reason) => {
             audit(state, "ai", None, "mcp_exec_batch", &command, &format!("blocked:{reason}"));
             return Err(format!("已拦截：{reason}"));

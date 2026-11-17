@@ -5,7 +5,8 @@
 use crate::store::Store;
 use regex::Regex;
 use serde::Serialize;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 const META_GUARD_CONFIG: &str = "guard_config";
 const META_MCP_ENABLED: &str = "mcp_enabled";
@@ -19,6 +20,16 @@ pub struct GuardRules {
     pub deny: Vec<String>,
     /// 需人工审批（AI 提交 → 应用弹窗 → 用户批准后执行；超时自动拒绝）
     pub approval: Vec<String>,
+    /// 白名单模式：true 时 AI 命令必须命中 whitelist 才放行
+    pub whitelist_mode: bool,
+    /// 白名单条目（子串匹配）
+    pub whitelist: Vec<String>,
+    /// 只读模式：拦截 AI 的一切写入类命令
+    pub readonly: bool,
+    /// AI 调用速率限制（次/分钟，0 = 不限）
+    pub rate_per_min: u32,
+    /// 严格分组：这些分组的服务器上，AI 的一切 exec 都需审批
+    pub strict_groups: Vec<String>,
 }
 
 impl Default for GuardRules {
@@ -86,14 +97,23 @@ impl Default for GuardRules {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        whitelist_mode: false,
+        whitelist: Vec::new(),
+        readonly: false,
+        rate_per_min: 30,
+        strict_groups: Vec::new(),
         }
     }
 }
+
+/// 只读模式下被拦截的写入类命令特征（合并正则，(?i) 由构造处添加）。
+const WRITEISH_RE: &str = r"(>|>>|\btee\b|\bsed\b[^|;]*-i|\brm\b|\bmv\b|\bchmod\b|\bchown\b|\bdd\b|\bmkfs\b|\btruncate\b|\bshutdown\b|\breboot\b|\bkill\b|\bkillall\b|\buseradd\b|\buserdel\b|\bcrontab\b|\bapt\b|\byum\b|\bdnf\b|\bpip\b|\bnpm\b|\btouch\b|\bmkdir\b|\brsync\b|\bscp\b|\bsystemctl\s+(start|restart|stop|try-restart|reload-or-restart|disable|enable)\b)";
 
 /// 凭据泄露防护（固定规则，不开放编辑）：AI 命令包含即硬拒绝，输出命中即脱敏。
 struct LeakGuard {
     cmd_blockers: Vec<Regex>,
     out_scrubbers: Vec<(Regex, &'static str)>,
+    writeish: Regex,
 }
 
 impl LeakGuard {
@@ -131,7 +151,8 @@ impl LeakGuard {
                 "$1 [REDACTED]",
             ),
         ];
-        Self { cmd_blockers, out_scrubbers }
+        let writeish = Regex::new(&format!("(?i){WRITEISH_RE}")).expect("writeish regex");
+        Self { cmd_blockers, out_scrubbers, writeish }
     }
 }
 
@@ -141,6 +162,45 @@ pub struct GuardInfo {
     pub deny: Vec<String>,
     pub approval: Vec<String>,
     pub ai_enabled: bool,
+    pub whitelist_mode: bool,
+    pub whitelist: Vec<String>,
+    pub readonly: bool,
+    pub rate_per_min: u32,
+    pub strict_groups: Vec<String>,
+}
+
+/// AI 调用速率限制：60 秒滑动窗口。
+pub struct AiRate {
+    hits: Mutex<Vec<Instant>>,
+}
+
+impl AiRate {
+    pub fn new() -> Self {
+        Self { hits: Mutex::new(Vec::new()) }
+    }
+
+    /// 返回 Ok(()) 表示放行；Err 为被限流（附提示）。
+    pub fn check(&self, limit_per_min: u32) -> Result<(), String> {
+        if limit_per_min == 0 {
+            return Ok(()); // 0 = 不限
+        }
+        let mut v = self.hits.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        v.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        if v.len() >= limit_per_min as usize {
+            return Err(format!(
+                "AI 调用触发速率限制（{limit_per_min} 次/分钟），请稍后再试"
+            ));
+        }
+        v.push(now);
+        Ok(())
+    }
+}
+
+impl Default for AiRate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub enum Decision {
@@ -241,6 +301,32 @@ impl Guard {
             deny: g.rules.deny.clone(),
             approval: g.rules.approval.clone(),
             ai_enabled: g.ai_enabled,
+            whitelist_mode: g.rules.whitelist_mode,
+            whitelist: g.rules.whitelist.clone(),
+            readonly: g.rules.readonly,
+            rate_per_min: g.rules.rate_per_min,
+            strict_groups: g.rules.strict_groups.clone(),
+        }
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.read().rules.readonly
+    }
+
+    pub fn rate_per_min(&self) -> u32 {
+        self.read().rules.rate_per_min
+    }
+
+    /// 服务器分组是否命中严格分组（需全部审批）。
+    pub fn is_strict_group(&self, group: Option<&str>) -> bool {
+        let g = self.read();
+        match group.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(gname) => g
+                .rules
+                .strict_groups
+                .iter()
+                .any(|s| s.trim().eq_ignore_ascii_case(gname)),
+            None => false,
         }
     }
 
@@ -268,7 +354,7 @@ impl Guard {
         store.set_meta(META_MCP_ENABLED, if enabled { "1" } else { "0" })
     }
 
-    /// 对 AI 命令做安全判定：泄露防护 → 硬黑名单 → 审批名单 → 放行。
+    /// 对 AI 命令做安全判定：泄露防护 → 只读模式 → 硬黑名单 → 白名单模式 → 审批名单 → 放行。
     pub fn evaluate(&self, command: &str) -> Decision {
         let g = self.read();
         let lower = command.to_lowercase();
@@ -280,9 +366,29 @@ impl Guard {
                 ));
             }
         }
+        // 只读模式：写入类命令直接拒（不提供审批逃生口）
+        if g.rules.readonly && g.leak.writeish.is_match(command) {
+            return Decision::Blocked(
+                "只读模式已开启：AI 不得执行写入类命令".to_string(),
+            );
+        }
         for p in &g.rules.deny {
             if !p.trim().is_empty() && lower.contains(&p.trim().to_lowercase()) {
                 return Decision::Blocked(format!("命中高危命令黑名单「{p}」"));
+            }
+        }
+        // 白名单模式：未命中任何白名单条目 → 硬拒绝（无审批逃生口）
+        if g.rules.whitelist_mode {
+            let listed = g
+                .rules
+                .whitelist
+                .iter()
+                .filter(|w| !w.trim().is_empty())
+                .any(|w| lower.contains(&w.trim().to_lowercase()));
+            if !listed {
+                return Decision::Blocked(
+                    "白名单模式已开启：命令不在允许清单内".to_string(),
+                );
             }
         }
         for p in &g.rules.approval {
@@ -464,5 +570,68 @@ mod tests {
     async fn approval_unknown_id_fails() {
         let q = Approvals::default();
         assert!(!q.decide("nonexistent", true));
+    }
+}
+
+#[cfg(test)]
+mod r4_tests {
+    use super::*;
+
+    fn guard_with(rules: GuardRules) -> Guard {
+        Guard {
+            inner: Arc::new(RwLock::new(GuardInner {
+                rules,
+                leak: LeakGuard::build(),
+                ai_enabled: true,
+            })),
+        }
+    }
+
+    #[test]
+    fn whitelist_mode_gate() {
+        let mut r = GuardRules::default();
+        r.whitelist_mode = true;
+        r.whitelist = vec!["uptime".into(), "df ".into(), "free".into()];
+        let g = guard_with(r);
+        assert!(matches!(g.evaluate("uptime && df -h /"), Decision::Allow));
+        assert!(matches!(g.evaluate("free -m"), Decision::Allow));
+        assert!(matches!(g.evaluate("systemctl status nginx"), Decision::Blocked(_)));
+    }
+
+    #[test]
+    fn readonly_blocks_writes_allows_reads() {
+        let mut r = GuardRules::default();
+        r.readonly = true;
+        let g = guard_with(r);
+        assert!(matches!(g.evaluate("touch /tmp/x"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("rm -rf /tmp/x"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("systemctl restart nginx"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("uptime && df -h"), Decision::Allow));
+        assert!(matches!(g.evaluate("tail -n 5 /var/log/syslog"), Decision::Allow));
+    }
+
+    #[test]
+    fn rate_window_cap() {
+        let rate = AiRate::new();
+        assert!(rate.check(2).is_ok());
+        assert!(rate.check(2).is_ok());
+        assert!(rate.check(2).is_err(), "第三次应被限流");
+        // 0 = 不限
+        let unlimited = AiRate::new();
+        for _ in 0..5 {
+            assert!(unlimited.check(0).is_ok());
+        }
+    }
+
+    #[test]
+    fn strict_group_match_case_insensitive() {
+        let mut r = GuardRules::default();
+        r.strict_groups = vec!["prod".into()];
+        let g = guard_with(r);
+        assert!(g.is_strict_group(Some("prod")));
+        assert!(g.is_strict_group(Some("Prod")));
+        assert!(g.is_strict_group(Some(" PROD ")));
+        assert!(!g.is_strict_group(Some("dev")));
+        assert!(!g.is_strict_group(None));
     }
 }

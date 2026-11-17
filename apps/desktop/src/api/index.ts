@@ -91,6 +91,21 @@ export interface GuardInfo {
   deny: string[];
   approval: string[];
   aiEnabled: boolean;
+  whitelistMode: boolean;
+  whitelist: string[];
+  readonly: boolean;
+  ratePerMin: number;
+  strictGroups: string[];
+}
+
+export interface GuardRules {
+  deny: string[];
+  approval: string[];
+  whitelistMode: boolean;
+  whitelist: string[];
+  readonly: boolean;
+  ratePerMin: number;
+  strictGroups: string[];
 }
 
 export interface McpInfo {
@@ -161,8 +176,8 @@ export const api = {
   sshResetHostkey: (serverId: string) => invoke<void>("ssh_reset_hostkey", { serverId }),
   // AI 安全管线 / 审批 / 审计 / MCP
   guardInfo: () => invoke<GuardInfo>("guard_info"),
-  guardSetRules: (deny: string[], approval: string[]) =>
-    invoke<GuardInfo>("guard_set_rules", { deny, approval }),
+  guardSetRules: (rules: GuardRules) =>
+    invoke<GuardInfo>("guard_set_rules", { rules }),
   mcpSetEnabled: (enabled: boolean) => invoke<GuardInfo>("mcp_set_enabled", { enabled }),
   approvalsPending: () => invoke<PendingApproval[]>("approvals_pending"),
   approvalDecide: (id: string, approve: boolean) =>

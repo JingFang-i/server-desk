@@ -155,6 +155,13 @@ async fn handle_tool(
     if !state.guard.ai_enabled() {
         return Err("MCP 工具已被禁用：请在应用「设置」中开启 AI 接入".into());
     }
+    state
+        .ai_rate
+        .check(state.guard.rate_per_min())
+        .map_err(|e| {
+            ops::audit(state, "ai", None, "rate_limited", tool, "blocked");
+            e
+        })?;
     if !state.vault.is_unlocked() {
         return Err("保险库已锁定：请在应用中解锁后再使用 MCP 工具".into());
     }
