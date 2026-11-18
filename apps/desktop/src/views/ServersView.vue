@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
@@ -89,23 +89,74 @@ onUnmounted(() => {
   if (statusTimer) window.clearInterval(statusTimer);
 });
 
-// ---------- 列表过滤 ----------
+// ---------- 列表过滤（按分组树形展示，无分组归入「默认分组」） ----------
 const keyword = ref("");
-const groupFilter = ref<string | null>(null);
-const filtered = computed(() =>
+const DEFAULT_GROUP = "默认分组";
+
+interface GroupRow extends ServerConfig {
+  isGroup: true;
+  groupKey: string;
+  children: ServerConfig[];
+}
+
+const filteredServers = computed(() =>
   store.servers.filter((s) => {
     const kw = keyword.value.trim().toLowerCase();
-    const kwOk =
+    return (
       !kw ||
-      [s.name, s.host, s.username, ...(s.tags ?? [])]
+      [s.name, s.host, s.username, s.group ?? "", ...(s.tags ?? [])]
         .join(" ")
         .toLowerCase()
-        .includes(kw);
-    const gOk = !groupFilter.value || s.group === groupFilter.value;
-    return kwOk && gOk;
+        .includes(kw)
+    );
   })
 );
+
+const tableData = computed(() => {
+  const groups = new Map<string, ServerConfig[]>();
+  for (const s of filteredServers.value) {
+    const g = (s.group ?? "").trim() || DEFAULT_GROUP;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g)!.push(s);
+  }
+  const out: GroupRow[] = [];
+  // 分组按名称排序，默认分组固定排最后
+  const names = [...groups.keys()].sort((a, b) =>
+    a === DEFAULT_GROUP ? 1 : b === DEFAULT_GROUP ? -1 : a.localeCompare(b, "zh-CN")
+  );
+  for (const g of names) {
+    const children = groups.get(g)!;
+    out.push({
+      isGroup: true,
+      groupKey: `g:${g}`,
+      id: `g:${g}`,
+      name: g,
+      host: "",
+      port: 0,
+      username: "",
+      auth: { type: "password", password: "" },
+      group: null,
+      tags: [],
+      notes: null,
+      allowAi: true,
+      createdAt: "",
+      updatedAt: "",
+      children,
+    });
+  }
+  return out;
+});
+
 const groupOptions = computed(() => store.groups.map((g) => ({ label: g, value: g })));
+
+const expandedKeys = ref<string[]>([]);
+watch(
+  tableData,
+  (d) => {
+    expandedKeys.value = d.filter((r) => r.isGroup).map((r) => r.groupKey);
+  },
+  { immediate: true }
+);
 
 // ---------- 连接 / 测试 / 执行 ----------
 async function connectRow(row: ServerConfig) {
@@ -197,17 +248,23 @@ async function runExec() {
 }
 
 // ---------- 表格 ----------
-const rowKey = (r: ServerConfig) => r.id;
-const columns = computed<DataTableColumns<ServerConfig>>(() => [
+const rowKey = (r: any) => (r.isGroup ? r.groupKey : r.id);
+const columns = computed<DataTableColumns<any>>(() => [
   {
     title: "名称",
     key: "name",
     width: 190,
     render: (row) =>
-      h("div", null, [
-        h("div", { style: "font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, row.name),
-        h("div", { style: "font-size:12px;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, `${row.host}:${row.port}`),
-      ]),
+      row.isGroup
+        ? h(
+            "div",
+            { style: "font-weight:700" },
+            `📁 ${row.name}（${row.children.length} 台）`
+          )
+        : h("div", null, [
+            h("div", { style: "font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, row.name),
+            h("div", { style: "font-size:12px;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, `${row.host}:${row.port}`),
+          ]),
   },
   { title: "用户名", key: "username", width: 84 },
   {
@@ -215,7 +272,9 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
     key: "auth",
     width: 70,
     render: (row) =>
-      row.auth.type === "password"
+      row.isGroup
+        ? "—"
+        : row.auth.type === "password"
         ? h(NTag, { size: "small", type: "info", bordered: false }, { default: () => "密码" })
         : h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "私钥" }),
   },
@@ -225,11 +284,13 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
     key: "tags",
     width: 130,
     render: (row) =>
-      row.tags.length
+      row.isGroup
+        ? "—"
+        : row.tags.length
         ? h(
             "div",
             { style: "display:flex;gap:4px;flex-wrap:wrap" },
-            row.tags.map((t) =>
+            row.tags.map((t: string) =>
               h(NTag, { size: "tiny", bordered: false }, { default: () => t })
             )
           )
@@ -240,7 +301,9 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
     key: "conn",
     width: 76,
     render: (row) =>
-      connMap.value[row.id]
+      row.isGroup
+        ? "—"
+        : connMap.value[row.id]
         ? h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "已连接" })
         : h(NTag, { size: "small", bordered: false }, { default: () => "未连接" }),
   },
@@ -249,7 +312,9 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
     key: "allowAi",
     width: 56,
     render: (row) =>
-      row.allowAi
+      row.isGroup
+        ? "—"
+        : row.allowAi
         ? h(NTag, { size: "small", type: "warning", bordered: false }, { default: () => "允许" })
         : h(NTag, { size: "small", bordered: false }, { default: () => "禁止" }),
   },
@@ -258,7 +323,9 @@ const columns = computed<DataTableColumns<ServerConfig>>(() => [
     key: "actions",
     width: 104,
     render: (row) =>
-      h("div", { style: "display:flex;gap:6px;align-items:center" }, [
+      row.isGroup
+        ? "—"
+        : h("div", { style: "display:flex;gap:6px;align-items:center" }, [
         h(NTooltip, null, {
           trigger: () =>
             h(
@@ -534,13 +601,6 @@ async function doDownload() {
         clearable
         style="width: 300px"
       />
-      <n-select
-        v-model:value="groupFilter"
-        :options="groupOptions"
-        placeholder="全部分组"
-        clearable
-        style="width: 170px"
-      />
       <div style="flex: 1" />
       <n-button :loading="store.loading" @click="store.load()">刷新</n-button>
       <n-button type="primary" @click="openCreate">＋ 新增服务器</n-button>
@@ -554,12 +614,14 @@ async function doDownload() {
 
     <n-data-table
       :columns="columns"
-      :data="filtered"
+      :data="tableData"
       :loading="store.loading"
       :bordered="false"
       size="small"
       :row-key="rowKey"
       :scroll-x="820"
+      :expanded-row-keys="expandedKeys"
+      @update:expanded-row-keys="(k: any) => (expandedKeys = k)"
     />
 
     <n-modal
