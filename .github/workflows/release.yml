@@ -76,6 +76,25 @@ jobs:
         run: node scripts/stage-sidecar.mjs
         working-directory: apps/desktop
 
+      - name: Setup macOS signing keychain
+        if: runner.os == 'macOS'
+        run: bash scripts/setup-macos-keychain.sh
+        working-directory: apps/desktop
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+      - name: Codesign MCP sidecar (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$GITHUB_WORKSPACE/target/release/serverdesk-mcp"
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+      - name: Drop temp signing keychain from search list
+        if: runner.os == 'macOS'
+        run: security list-keychains -s ~/Library/Keychains/login.keychain-db
+
       - name: Run tests
         run: cargo test --workspace
 

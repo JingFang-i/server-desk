@@ -29,18 +29,7 @@ mkdirSync(destDir, { recursive: true });
 const dest = join(destDir, binName);
 copyFileSync(src, dest);
 if (!isWindows) chmodSync(dest, 0o755);
-
-// macOS 发版：sidecar 必须与主应用一样用 Developer ID 签名（含 hardened runtime
-// 与安全时间戳），否则公证判定 Invalid、下载后报「已损坏」。
-// tauri-action 会在执行 beforeBuildCommand 之前把 APPLE_CERTIFICATE 导入临时钥匙串，
-// 因此这里可以直接引用 APPLE_SIGNING_IDENTITY。
-if (process.platform === "darwin" && process.env.APPLE_SIGNING_IDENTITY) {
-  const { execFileSync } = await import("node:child_process");
-  execFileSync(
-    "codesign",
-    ["--force", "--options", "runtime", "--timestamp", "--sign", process.env.APPLE_SIGNING_IDENTITY, dest],
-    { stdio: "inherit" }
-  );
-  console.log("sidecar 已用 Developer ID 签名");
-}
+// macOS 发版：签名由 workflow 的 setup-macos-keychain.sh + codesign 步骤完成
+// （对 target/release/serverdesk-mcp 原件签名，本脚本只做复制——
+//  tauri-action 的钥匙串初始化晚于 beforeBuildCommand，这里拿不到证书）。
 console.log(`sidecar 已暂存：${dest}`);
