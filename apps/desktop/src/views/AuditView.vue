@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from "vue";
+import { computed, h, onMounted, reactive, ref } from "vue";
 import {
   NAlert,
   NButton,
@@ -28,7 +28,7 @@ const sourceOptions = [
 
 const rowKey = (r: AuditEntry) => r.id;
 
-/** 会话筛选在 SQL 层完成（不再只筛前端已加载的最近 300 行） */
+/** 会话筛选在 SQL 层完成；分页也在 SQL 层（LIMIT/OFFSET + COUNT），前端只渲染当前页 */
 const sessionFilter = ref<string>("all");
 const sessionList = ref<string[]>([]);
 const sessionOptions = computed(() =>
@@ -178,10 +178,42 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
   },
 ]);
 
+/** 服务端分页：翻页/改每页条数都会重新查询 */
+const pagination = reactive({
+  page: 1,
+  pageSize: 50,
+  itemCount: 0,
+  showSizePicker: true,
+  pageSizes: [20, 50, 100, 200],
+  prefix: ({ itemCount }: { itemCount?: number }) => `共 ${itemCount ?? 0} 条`,
+  onChange: (p: number) => {
+    pagination.page = p;
+    void refresh();
+  },
+  onUpdatePageSize: (ps: number) => {
+    pagination.pageSize = ps;
+    pagination.page = 1;
+    void refresh();
+  },
+});
+
+/** 筛选条件变化回到第 1 页再查 */
+function onFilterChange() {
+  pagination.page = 1;
+  void refresh();
+}
+
 async function refresh() {
   loading.value = true;
   try {
-    rows.value = await api.auditList(300, sourceFilter.value, sessionFilter.value);
+    const res = await api.auditPage(
+      pagination.page,
+      pagination.pageSize,
+      sourceFilter.value,
+      sessionFilter.value
+    );
+    rows.value = res.entries;
+    pagination.itemCount = res.total;
     auditFailures.value = await api.auditFailures();
     sessionList.value = await api.auditSessions();
   } catch (e) {
@@ -204,7 +236,7 @@ onMounted(refresh);
             :options="sourceOptions"
             style="width: 160px"
             size="small"
-            @update:value="refresh"
+            @update:value="onFilterChange"
           />
           <n-select
             v-model:value="sessionFilter"
@@ -212,7 +244,7 @@ onMounted(refresh);
             size="small"
             style="width: 200px"
             placeholder="按会话筛选"
-            @update:value="refresh"
+            @update:value="onFilterChange"
           />
           <n-button size="small" :loading="loading" @click="refresh">刷新</n-button>
         </div>
@@ -228,6 +260,7 @@ onMounted(refresh);
         请检查数据目录权限与剩余空间。
       </n-alert>
       <n-data-table
+        remote
         :columns="columns"
         :data="rows"
         :loading="loading"
@@ -236,6 +269,7 @@ onMounted(refresh);
         :row-key="rowKey"
         :max-height="520"
         :scroll-x="1080"
+        :pagination="pagination"
       />
       <p class="hint" style="margin-top: 10px">
         所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；列表仅显示内容摘要，点「详情」查看全文。服务器列显示操作发生时的名称快照（服务器改名或删除后仍可追溯）。内容已自动脱敏。

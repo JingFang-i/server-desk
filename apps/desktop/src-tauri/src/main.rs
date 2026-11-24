@@ -223,6 +223,7 @@ fn main() {
             commands::approval_decide,
             // 审计
             commands::audit_list,
+            commands::audit_page,
             commands::audit_sessions,
             commands::audit_failures,
             // MCP 接入信息

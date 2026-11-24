@@ -503,6 +503,23 @@ pub fn audit_list(
         .audit_list(limit.unwrap_or(200), source.as_deref(), session.as_deref())
 }
 
+/// 审计页服务端分页：SQL 层 LIMIT/OFFSET，几百上千条不再一次拉全。
+#[tauri::command]
+pub fn audit_page(
+    state: State<'_, Arc<AppState>>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    source: Option<String>,
+    session: Option<String>,
+) -> Result<crate::store::AuditPage, String> {
+    state.store.audit_page(
+        page.unwrap_or(1),
+        page_size.unwrap_or(50),
+        source.as_deref(),
+        session.as_deref(),
+    )
+}
+
 /// 审计页「会话」筛选的下拉数据（按最近活动倒序）。
 #[tauri::command]
 pub fn audit_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {

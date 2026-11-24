@@ -58,6 +58,16 @@ pub struct ServerRow {
 
 const COLS: &str = "id,name,host,port,username,auth_type,secret_blob,group_name,tags,notes,allow_ai,created_at,updated_at";
 
+/// 审计分页查询结果：total 供前端渲染分页器。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPage {
+    pub entries: Vec<AuditEntry>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEntry {
@@ -402,14 +412,30 @@ impl Store {
 
     /// 查询审计记录。`source` / `session` 传空或 "all" 表示不过滤；
     /// 会话过滤在 SQL 层完成，不再只筛前端最近 200 行。
+    /// 兼容入口：取最新 limit 条（第一页），变更记录页等仍在用。
     pub fn audit_list(
         &self,
         limit: i64,
         source: Option<&str>,
         session: Option<&str>,
     ) -> Result<Vec<AuditEntry>, String> {
+        Ok(self
+            .audit_page(1, limit.min(1000), source, session)?
+            .entries)
+    }
+
+    /// 服务端分页查询审计：SQL 层 LIMIT/OFFSET + COUNT(*)，
+    /// 几百上千条也不再一次性塞进前端。
+    pub fn audit_page(
+        &self,
+        page: i64,
+        page_size: i64,
+        source: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<AuditPage, String> {
         let conn = self.lock()?;
-        let limit = limit.clamp(1, 1000);
+        let page = page.max(1);
+        let page_size = page_size.clamp(10, 500);
         let source = source.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
         let session = session.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<AuditEntry> {
@@ -426,7 +452,6 @@ impl Store {
                 ok: r.get::<_, i64>(9)? != 0,
             })
         };
-        let mut entries = Vec::new();
         // server_name 为空的历史记录：按 server_id 关联当前服务器名补全（改名/删除后可读性最好）
         const SELECT: &str = "SELECT a.id,a.ts,a.source,a.server_id,\
              COALESCE(NULLIF(a.server_name,''), s.name, ''),\
@@ -438,19 +463,28 @@ impl Store {
                         AND lower(a.outcome) NOT LIKE '%timed_out%') \
                   THEN 1 ELSE 0 END \
              FROM audit_log a LEFT JOIN servers s ON s.id = a.server_id";
+        const WHERE: &str = "WHERE (?1 = '' OR a.source = ?1) AND (?2 = '' OR a.session = ?2)";
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM audit_log a LEFT JOIN servers s ON s.id = a.server_id {WHERE}"),
+                params![source, session],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("查询审计失败: {e}"))?;
+        let offset = (page - 1) * page_size;
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT} WHERE (?1 = '' OR a.source = ?1) AND (?2 = '' OR a.session = ?2) \
-                 ORDER BY a.id DESC LIMIT ?3"
+                "{SELECT} {WHERE} ORDER BY a.id DESC LIMIT ?3 OFFSET ?4"
             ))
             .map_err(|e| format!("查询审计失败: {e}"))?;
         let rows = stmt
-            .query_map(params![source, session, limit], map_row)
+            .query_map(params![source, session, page_size, offset], map_row)
             .map_err(|e| format!("查询审计失败: {e}"))?;
+        let mut entries = Vec::new();
         for r in rows {
             entries.push(r.map_err(|e| e.to_string())?);
         }
-        Ok(entries)
+        Ok(AuditPage { entries, total, page, page_size })
     }
 
     /// 出现过的 AI 会话 id（按最近活动排序），供审计页做会话筛选。
@@ -563,6 +597,32 @@ mod tests {
         // 按最近活动倒序：s-bbb 最后一次活动更晚
         assert_eq!(sessions, vec!["s-bbb".to_string(), "s-aaa".to_string()]);
 
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn audit_page_pagination_and_total() {
+        let db = std::env::temp_dir().join(format!("sd-audit-page-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+        // page_size 下限是 10，这里插 25 条、每页 10 条：3 页（10/10/5）
+        for i in 0..25u32 {
+            let ts = format!("2026-11-23T00:{:02}:{:02}.000000+00:00", i / 60, i % 60);
+            store
+                .insert_audit(&ts, "s-p", "ai", None, "", "mcp_exec_command", "d", "ok")
+                .unwrap();
+        }
+        let p1 = store.audit_page(1, 10, Some("ai"), Some("s-p")).unwrap();
+        assert_eq!(p1.total, 25);
+        assert_eq!(p1.entries.len(), 10);
+        let p3 = store.audit_page(3, 10, Some("ai"), Some("s-p")).unwrap();
+        assert_eq!(p3.entries.len(), 5);
+        let empty = store.audit_page(9, 10, Some("ai"), Some("s-p")).unwrap();
+        assert!(empty.entries.is_empty());
+        assert_eq!(empty.total, 25);
+        // session 筛选影响 total
+        let none = store.audit_page(1, 10, Some("ai"), Some("other")).unwrap();
+        assert_eq!(none.total, 0);
         let _ = std::fs::remove_file(&db);
     }
 

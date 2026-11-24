@@ -114,6 +114,13 @@ export type AuditAction =
   | "rate_limited"
   | "ssh_test";
 
+export interface AuditPage {
+  entries: AuditEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface AuditEntry {
   id: number;
   ts: string;
@@ -236,6 +243,8 @@ export const api = {
     invoke<void>("approval_decide", { id, approve }),
   auditList: (limit?: number, source?: string, session?: string) =>
     invoke<AuditEntry[]>("audit_list", { limit, source, session }),
+  auditPage: (page: number, pageSize: number, source?: string, session?: string) =>
+    invoke<AuditPage>("audit_page", { page, pageSize, source, session }),
   auditSessions: () => invoke<string[]>("audit_sessions"),
   auditFailures: () => invoke<number>("audit_failures"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
