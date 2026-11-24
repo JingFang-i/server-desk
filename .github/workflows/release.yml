@@ -72,10 +72,9 @@ jobs:
       - name: Build MCP sidecar (bundled as app resource)
         run: cargo build --release -p serverdesk-mcp
 
-      - name: Stage sidecar into bundle resources
-        run: node scripts/stage-sidecar.mjs
-        working-directory: apps/desktop
-
+      # macOS 顺序敏感：先建钥匙串 → 签 target 里的 sidecar 原件 → 再复制进
+      # src-tauri/resources（bundler 随后整包签名+公证；保留钥匙串在 search list
+      # 供 bundler 的 APPLE_SIGNING_IDENTITY 使用）
       - name: Setup macOS signing keychain
         if: runner.os == 'macOS'
         run: bash scripts/setup-macos-keychain.sh
@@ -91,9 +90,9 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
-      - name: Drop temp signing keychain from search list
-        if: runner.os == 'macOS'
-        run: security list-keychains -s ~/Library/Keychains/login.keychain-db
+      - name: Stage sidecar into bundle resources
+        run: node scripts/stage-sidecar.mjs
+        working-directory: apps/desktop
 
       - name: Run tests
         run: cargo test --workspace
