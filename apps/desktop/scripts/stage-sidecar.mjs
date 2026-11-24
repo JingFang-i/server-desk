@@ -6,6 +6,7 @@
 // 公证还会因缺 hardened runtime 而 Invalid）。
 // 路径按脚本自身位置解析，与调用方 CWD 无关。
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -15,15 +16,19 @@ const workspace = resolve(appDir, "..", ".."); // 仓库根
 const isWindows = process.platform === "win32";
 const ext = isWindows ? ".exe" : "";
 
-// 目标三元组：优先用 tauri CLI 导出的环境变量，否则取宿主机原生三元组
+// 目标三元组：优先用 tauri CLI 导出的环境变量，否则取宿主机原生三元组。
+// 注意：本文件是 ESM（.mjs），不能用 require()——之前在 Linux runner 上
+// require 未定义被 catch 吞掉，回退成硬编码的 aarch64-apple-darwin，
+// 导致 externalBin 文件名与目标 triple 不符、cargo test 的 build.rs 报缺失。
 let triple = process.env.TAURI_ENV_TARGET_TRIPLE || "";
 if (!triple) {
   try {
-    triple = require("node:child_process")
-      .execSync("rustc -vV", { encoding: "utf8" })
-      .match(/host:\s*(\S+)/)[1];
+    triple = execSync("rustc -vV", { encoding: "utf8" }).match(/host:\s*(\S+)/)[1];
   } catch {
-    triple = isWindows ? "x86_64-pc-windows-msvc" : "aarch64-apple-darwin";
+    const arm = process.arch === "arm64";
+    if (isWindows) triple = arm ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+    else if (process.platform === "darwin") triple = arm ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
+    else triple = arm ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu";
   }
 }
 
