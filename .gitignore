@@ -12,6 +12,7 @@ apps/desktop/src-tauri/gen/
 
 # 打包时暂存的 MCP sidecar（由 scripts/stage-sidecar.mjs 复制）
 apps/desktop/src-tauri/resources/
+apps/desktop/src-tauri/binaries/
 
 # 移动端图标（桌面应用用不到，由 pnpm tauri icon 随时可再生成）
 apps/desktop/src-tauri/icons/ios/

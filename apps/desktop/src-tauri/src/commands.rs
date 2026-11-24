@@ -563,16 +563,24 @@ pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
             // 开发：target/debug 同目录；macOS .app：Contents/Resources；Windows：安装目录
             // 顺序：开发（target/[debug|release] 同目录）→ 打包（资源子目录 resources/，
             // Windows/Linux 安装目录与 macOS Contents/Resources 同构）→ macOS 旧布局（资源根）
-            let candidates = [
-                dir.join("serverdesk-mcp"),
-                dir.join("serverdesk-mcp.exe"),
-                dir.join("resources/serverdesk-mcp"),
-                dir.join("resources/serverdesk-mcp.exe"),
-                dir.join("../Resources/resources/serverdesk-mcp"),
-                dir.join("../Resources/serverdesk-mcp"),
-                dir.join("../Resources/resources/serverdesk-mcp.exe"),
-                dir.join("../Resources/serverdesk-mcp.exe"),
-            ];
+            // sidecar 以 bundle.externalBin 一等公民方式分发：
+            // 安装后与主程序同目录，文件名带 target triple 后缀
+            // （serverdesk-mcp-aarch64-apple-darwin / -x86_64-pc-windows-msvc.exe 等）。
+            // 扫描主程序同目录下 serverdesk-mcp* 开头的文件，兼容带/不带 triple、.exe。
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("serverdesk-mcp") {
+                        candidates.push(e.path());
+                    }
+                }
+            }
+            candidates.sort();
+            if candidates.is_empty() {
+                candidates.push(dir.join("serverdesk-mcp"));
+            }
             candidates
                 .iter()
                 .find(|p| p.exists())
