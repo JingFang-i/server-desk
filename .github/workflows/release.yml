@@ -72,6 +72,10 @@ jobs:
       - name: Build MCP sidecar (bundled as app resource)
         run: cargo build --release -p serverdesk-mcp
 
+      - name: Stage sidecar into bundle resources
+        run: node scripts/stage-sidecar.mjs
+        working-directory: apps/desktop
+
       - name: Run tests
         run: cargo test --workspace
 

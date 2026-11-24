@@ -121,3 +121,73 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
         })
     }
 }
+
+/// MCP 工具名清单（顺序即 sidecar `tools/list` 的返回顺序）。
+///
+/// AGENTS.md 要求「新增工具时同步更新 sidecar → 共享契约 → guard 管线」；
+/// 把清单放在这里，sidecar 的单测会逐一比对，漏改一处就会失败。
+pub const MCP_TOOL_NAMES: &[&str] = &[
+    "list_servers",
+    "exec_command",
+    "server_status",
+    "list_files",
+    "tail_log",
+    "log_search",
+    "list_services",
+    "port_check",
+    "upload_file",
+    "download_file",
+    "append_file",
+    "restore_file",
+    "list_file_backups",
+    "exec_batch",
+    "read_file",
+    "write_file",
+];
+
+/// 审计动作名（单一来源）。Rust 写入、`api/index.ts` 的 `AuditAction`、前端筛选共用这一套。
+/// 新增动作时必须同时更新：本清单 → TS 类型 → 前端按动作筛选的地方。
+pub mod action {
+    pub const MCP_EXEC_COMMAND: &str = "mcp_exec_command";
+    pub const MCP_EXEC_BATCH: &str = "mcp_exec_batch";
+    pub const MCP_READ_FILE: &str = "mcp_read_file";
+    pub const MCP_WRITE_FILE: &str = "mcp_write_file";
+    pub const MCP_APPEND_FILE: &str = "mcp_append_file";
+    pub const MCP_UPLOAD_FILE: &str = "mcp_upload_file";
+    pub const MCP_DOWNLOAD_FILE: &str = "mcp_download_file";
+    pub const MCP_RESTORE_FILE: &str = "mcp_restore_file";
+    pub const MCP_LIST_FILE_BACKUPS: &str = "mcp_list_file_backups";
+    pub const MCP_LIST_FILES: &str = "mcp_list_files";
+    pub const MCP_TAIL_LOG: &str = "mcp_tail_log";
+    pub const MCP_LOG_SEARCH: &str = "mcp_log_search";
+    pub const MCP_LIST_SERVICES: &str = "mcp_list_services";
+    pub const MCP_PORT_CHECK: &str = "mcp_port_check";
+    pub const MCP_SERVER_STATUS: &str = "mcp_server_status";
+    pub const MCP_LIST_SERVERS: &str = "mcp_list_servers";
+    pub const MCP_APPROVAL_REQUESTED: &str = "mcp_approval_requested";
+    pub const MCP_APPROVAL_GRANTED: &str = "mcp_approval_granted";
+    pub const MCP_SET_ENABLED: &str = "mcp_set_enabled";
+
+    /// 全部已登记动作（可用于校验/导出）
+    pub const ALL: &[&str] = &[
+        MCP_EXEC_COMMAND,
+        MCP_EXEC_BATCH,
+        MCP_READ_FILE,
+        MCP_WRITE_FILE,
+        MCP_APPEND_FILE,
+        MCP_UPLOAD_FILE,
+        MCP_DOWNLOAD_FILE,
+        MCP_RESTORE_FILE,
+        MCP_LIST_FILE_BACKUPS,
+        MCP_LIST_FILES,
+        MCP_TAIL_LOG,
+        MCP_LOG_SEARCH,
+        MCP_LIST_SERVICES,
+        MCP_PORT_CHECK,
+        MCP_SERVER_STATUS,
+        MCP_LIST_SERVERS,
+        MCP_APPROVAL_REQUESTED,
+        MCP_APPROVAL_GRANTED,
+        MCP_SET_ENABLED,
+    ];
+}

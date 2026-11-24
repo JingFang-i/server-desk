@@ -17,6 +17,7 @@ operations, but it can never see credentials or run dangerous commands.
 - 🔐 **Master-password vault** — Argon2-derived keys + OS Keychain + auto-lock; credentials encrypted at rest with AES-256-GCM, never stored in plaintext
 - 🔌 **Stable SSH connections** — keep-alive, automatic reconnect, remote command execution
 - 🤖 **AI safety pipeline** — leak protection / black & white lists / approval for dangerous commands / full audit / output redaction, seven layers of defense
+- 🔔 **Approval alerts** — system notification + chime + sidebar badge when a dangerous command needs human approval; auto-rejected after 120s
 - 📦 **Encrypted backups** — manual export & restore (merge / overwrite) + scheduled automatic backups (keep N copies)
 - 🖥️ **Multi-platform** — native builds for macOS / Windows / Linux (Linux ships .deb / .rpm / AppImage)
 
@@ -89,7 +90,7 @@ apps/desktop/             # Tauri main app
   │                       #   approvals / ssh / observe / ops / backup / commands
   └─ scripts/             # check_vue_imports.py
 apps/mcp-sidecar/         # stdio MCP server (AI tool entry point)
-docs/                     # Design & acceptance docs (plan.md, m1~m5, r1-r5, release.md)
+docs/                     # Design & acceptance docs (plan.md, m1~m5, r1-r6, release.md)
 .github/workflows/        # release.yml (release CI)
 ```
 
@@ -121,6 +122,7 @@ docs/                     # Design & acceptance docs (plan.md, m1~m5, r1-r5, rel
 - Full design: [docs/plan.md](docs/plan.md) (Chinese)
 - Milestone acceptance: [docs/m1-acceptance.md](docs/m1-acceptance.md) ~ [docs/m4-acceptance.md](docs/m4-acceptance.md), [docs/acceptance-final.md](docs/acceptance-final.md)
 - AI extension acceptance: [docs/r1-r5-acceptance.md](docs/r1-r5-acceptance.md)
+- Approval alerts & audit server names: [docs/r6-acceptance.md](docs/r6-acceptance.md)
 - Release notes: [docs/release.md](docs/release.md)
 - AI agent guide: [AGENTS.md](AGENTS.md)
 

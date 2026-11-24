@@ -18,10 +18,10 @@ use zeroize::Zeroizing;
 
 const KEYCHAIN_SERVICE: &str = "com.qsmx.serverdesk";
 const KEYCHAIN_USER: &str = "vault-dek";
-/// 默认不自动锁：由用户手动锁定（设置页可改回定时自动锁）
-const DEFAULT_AUTOLOCK_MINUTES: u64 = 0;
-/// 旧版本默认值（10 分钟）——一次性迁移为不自动锁
-const LEGACY_DEFAULT_AUTOLOCK: &str = "10";
+/// 默认 10 分钟空闲自动锁（M2 验收口径：默认 10 分钟，设置页可调 5/10/30/60/从不）。
+/// 之前这里被改成 0，并把旧默认值 "10" 静默迁移成"从不"，
+/// 等于给没动过设置的用户单方面关掉了一项安全控制。
+const DEFAULT_AUTOLOCK_MINUTES: u64 = 10;
 const MIN_PASSWORD_LEN: usize = 8;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -147,17 +147,10 @@ impl Vault {
         };
         let salt_hex = get("vault_salt").unwrap_or_default();
         let wrapped = get("vault_wrapped_dek").and_then(|s| B64.decode(s.as_bytes()).ok());
-        let mut auto_lock_minutes = get("auto_lock_minutes")
+        // 未设置过 → 默认 10 分钟；用户显式选过 0（从不）则尊重用户选择
+        let auto_lock_minutes = get("auto_lock_minutes")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_AUTOLOCK_MINUTES);
-        // 旧版默认 10 分钟自动锁迁移为「从不」（用户明确选择手动锁定模式）
-        if get("auto_lock_minutes").as_deref() == Some(LEGACY_DEFAULT_AUTOLOCK) {
-            let _ = conn.execute(
-                "UPDATE meta SET value = '0' WHERE key = 'auto_lock_minutes'",
-                [],
-            );
-            auto_lock_minutes = 0;
-        }
         let keychain_auto_unlock = get("keychain_auto_unlock").is_some_and(|s| s == "1");
 
         Ok(Self {

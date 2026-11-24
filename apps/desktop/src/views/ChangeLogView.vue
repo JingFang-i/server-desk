@@ -11,21 +11,34 @@ import {
   useMessage,
   type DataTableColumns,
 } from "naive-ui";
-import { api, type AuditEntry, type FileBackupMeta } from "../api";
+import { api, type AuditEntry, type FileBackupMeta, type ServerConfig } from "../api";
 
 const message = useMessage();
 const dialog = useDialog();
 
 const backups = ref<FileBackupMeta[]>([]);
 const changes = ref<AuditEntry[]>([]);
+const servers = ref<ServerConfig[]>([]);
 const loading = ref(false);
 const serverFilter = ref<string | null>(null);
 
+/** id → 当前名称：服务器已删除时退回显示 id */
+const serverNames = computed(() => {
+  const m = new Map<string, string>();
+  for (const s of servers.value) m.set(s.id, s.name);
+  return m;
+});
+function nameOf(id: string | null | undefined): string {
+  if (!id) return "—";
+  return serverNames.value.get(id) ?? id;
+}
+
 const serverOptions = computed(() => {
-  const set = new Set<string>();
-  for (const b of backups.value) set.add(b.serverId);
-  for (const c of changes.value) if (c.serverId) set.add(c.serverId);
-  return [...set].map((s) => ({ label: s, value: s }));
+  const ids = new Set<string>();
+  for (const s of servers.value) ids.add(s.id);
+  for (const b of backups.value) ids.add(b.serverId);
+  for (const c of changes.value) if (c.serverId) ids.add(c.serverId);
+  return [...ids].map((id) => ({ label: nameOf(id), value: id }));
 });
 
 const displayBackups = computed(() =>
@@ -50,7 +63,34 @@ function fmtTs(ts: string): string {
 
 const backupColumns: DataTableColumns<FileBackupMeta> = [
   { title: "备份时间", key: "ts", width: 165, render: (r) => fmtTs(r.ts) },
-  { title: "服务器", key: "serverId", width: 200 },
+  {
+    title: "服务器",
+    key: "serverId",
+    width: 200,
+    render: (r) =>
+      h("div", null, [
+        h("div", { style: "font-size:13px;font-weight:600" }, nameOf(r.serverId)),
+        h(
+          "div",
+          {
+            style:
+              "font-size:11px;opacity:.5;font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap",
+          },
+          r.serverId
+        ),
+      ]),
+  },
+  {
+    title: "内容",
+    key: "encrypted",
+    width: 90,
+    render: (r) =>
+      h(
+        NTag,
+        { size: "tiny", bordered: false, type: r.encrypted ? "success" : "warning" },
+        { default: () => (r.encrypted ? "已加密" : "旧明文") }
+      ),
+  },
   {
     title: "原文件路径",
     key: "path",
@@ -86,6 +126,12 @@ const changeColumns: DataTableColumns<AuditEntry> = [
   },
   { title: "操作", key: "action", width: 150 },
   {
+    title: "服务器",
+    key: "serverName",
+    width: 170,
+    render: (r) => r.serverName || nameOf(r.serverId),
+  },
+  {
     title: "内容",
     key: "detail",
     minWidth: 260,
@@ -104,6 +150,7 @@ async function refresh() {
   try {
     backups.value = await api.fileBackupsList();
     changes.value = await api.auditList(200);
+    servers.value = (await api.listServers()).servers;
   } catch (e) {
     message.error(String(e));
   } finally {

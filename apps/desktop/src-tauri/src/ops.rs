@@ -6,18 +6,11 @@ use crate::guard::Decision;
 use crate::ssh::{ConnParams, ExecResult};
 use crate::state::AppState;
 use crate::store::Store;
+use crate::text::{truncate, APPROVAL_DETAIL_MAX, AUDIT_DETAIL_MAX, SERVER_NAME_MAX};
 use shared::{AuthMethod, ServerConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Emitter;
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
 
 /// 解密并加载单台服务器配置（按 id 或精确名称解析）。
 pub fn load_server_config(state: &AppState, id_or_name: &str) -> Result<ServerConfig, String> {
@@ -62,11 +55,43 @@ pub fn conn_params(cfg: &ServerConfig) -> ConnParams {
     }
 }
 
-static CUR_SESSION: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// 由服务器行直接组装连接参数：批量执行路径用，避免再抄一遍凭据解密逻辑。
+fn conn_params_from_row(
+    vault: &crate::vault::Vault,
+    row: &crate::store::ServerRow,
+) -> Result<ConnParams, String> {
+    let dek = vault.dek().map_err(|e| e.to_string())?;
+    let plain = crate::crypto::decrypt(&dek, &row.secret_blob)?;
+    let auth: AuthMethod =
+        serde_json::from_slice(&plain).map_err(|e| format!("凭据数据损坏: {e}"))?;
+    Ok(ConnParams {
+        host: row.host.clone(),
+        port: row.port,
+        username: row.username.clone(),
+        auth,
+    })
+}
 
-/// IPC 请求入口设置当前 AI 会话（audit 仅对 source=ai 行归因）。
-pub fn set_session(s: &str) {
-    *CUR_SESSION.lock().unwrap_or_else(|p| p.into_inner()) = s.to_string();
+tokio::task_local! {
+    /// 当前 IPC 请求的 AI 会话 id。
+    ///
+    /// 之前是进程级单变量：一个请求等 SSH/审批时，另一个客户端可以把它覆盖掉，
+    /// 完成记录就记到别人的会话上。改成 task-local 后按请求隔离；
+    /// 批量执行里 spawn 的子任务用 [`with_session`] 显式继承。
+    static AI_SESSION: String;
+}
+
+/// 在指定会话作用域内执行异步逻辑（IPC 请求入口 / 批量子任务）。
+pub async fn with_session<F>(session: String, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    AI_SESSION.scope(session, fut).await
+}
+
+/// 当前作用域的会话 id；不在作用域内（手动操作、后台任务）返回空串。
+pub fn current_session() -> String {
+    AI_SESSION.try_with(|s| s.clone()).unwrap_or_default()
 }
 
 pub fn audit(
@@ -77,21 +102,191 @@ pub fn audit(
     detail: &str,
     outcome: &str,
 ) {
+    write_audit(state, source, server_id, None, action, detail, outcome);
+}
+
+/// 已知服务器名时的审计写入（例如刚删除服务器、批量操作等拿不到 id 的场景）。
+pub fn audit_named(
+    state: &AppState,
+    source: &str,
+    server_id: Option<&str>,
+    server_name: &str,
+    action: &str,
+    detail: &str,
+    outcome: &str,
+) {
+    write_audit(state, source, server_id, Some(server_name), action, detail, outcome);
+}
+
+/// 把审计里的服务器引用解析为「规范 id + 名称快照」。
+/// 引用既可能是 id 也可能是名称（MCP 工具允许传名称）；解析不到时原样保留引用。
+fn resolve_audit_server(
+    store: &Store,
+    server_ref: Option<&str>,
+    server_name_hint: Option<&str>,
+) -> (Option<String>, String) {
+    let hint = server_name_hint.map(str::trim).unwrap_or_default();
+    let Some(reference) = server_ref.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, hint.to_string());
+    };
+    let found = store
+        .get(reference)
+        .ok()
+        .flatten()
+        .or_else(|| store.find_by_name(reference).ok().flatten());
+    match found {
+        Some(row) => {
+            let name = if hint.is_empty() { row.name } else { hint.to_string() };
+            (Some(row.id), name)
+        }
+        None => (Some(reference.to_string()), hint.to_string()),
+    }
+}
+
+fn write_audit(
+    state: &AppState,
+    source: &str,
+    server_id: Option<&str>,
+    server_name: Option<&str>,
+    action: &str,
+    detail: &str,
+    outcome: &str,
+) {
     let session = if source == "ai" {
-        CUR_SESSION.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        current_session()
     } else {
         String::new()
     };
     let sanitized = state.guard.sanitize(detail);
-    let _ = state.store.insert_audit(
+    let (resolved_id, resolved_name) = resolve_audit_server(&state.store, server_id, server_name);
+    let detail = truncate(&sanitized, AUDIT_DETAIL_MAX);
+    if let Err(e) = state.store.insert_audit(
         &chrono::Utc::now().to_rfc3339(),
         &session,
         source,
-        server_id,
+        resolved_id.as_deref(),
+        &resolved_name,
         action,
-        &crate::commands::truncate(&sanitized, 500),
+        &detail,
         outcome,
+    ) {
+        // 审计写不进去必须留下痕迹：计数 + stderr，供设置页/日志发现，不再静默。
+        let n = state
+            .audit_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        eprintln!("审计写入失败（累计 {n} 次）: {e} | {action} {outcome}");
+    }
+}
+
+/// 登记一条待审批操作：入队 → 广播刷新事件 → 审批提醒（系统通知 + 声音）→ 返回等待端。
+///
+/// `summary` 在入队前统一**脱敏 + 限长**：审批卡、系统通知、应用内提醒、事件广播
+/// 共用这一份摘要，保证任何一条外发路径都看不到明文凭据（AGENTS.md 红线 1）。
+fn register_approval(
+    state: &AppState,
+    server_id: &str,
+    server_name: &str,
+    summary: &str,
+) -> tokio::sync::oneshot::Receiver<bool> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let safe_command = truncate(
+        &state.guard.sanitize(summary.trim()),
+        APPROVAL_DETAIL_MAX,
     );
+    let safe_name = truncate(&state.guard.sanitize(server_name), SERVER_NAME_MAX);
+    let pending = state
+        .approvals
+        .create(server_id, &safe_name, &safe_command, tx);
+    let _ = state.handle.emit("approvals-updated", ());
+    let _ = state.handle.emit("approval-requested", pending.clone());
+    crate::notify::approval_requested(&state.handle, &pending);
+    rx
+}
+
+/// 执行一条**应用固定模板**命令（观测五件套 / 状态探查）。
+///
+/// 与 [`run_command`] 的区别：命令不是 AI 自由输入的，参数只经 `sh_quote` 注入，
+/// 因此只过泄露防护 / 硬黑名单 / 只读写入检查，不套用白名单与审批表。
+/// 严格分组仍然生效（分组策略与命令来源无关）。
+pub async fn run_fixed_template(
+    state: &AppState,
+    server_ref: &str,
+    action: &str,
+    command: &str,
+    timeout_secs: u64,
+) -> Result<ExecResult, String> {
+    let cfg = load_server_config(state, server_ref)?;
+    if !cfg.allow_ai {
+        audit(
+            state,
+            "ai",
+            Some(&cfg.id),
+            action,
+            "模板命令",
+            "blocked:not_allow_ai",
+        );
+        return Err(format!("服务器「{}」未开放 AI 操作（allowAi=false）", cfg.name));
+    }
+    match state.guard.evaluate_fixed_template(command) {
+        Decision::Blocked(reason) => {
+            audit(
+                state,
+                "ai",
+                Some(&cfg.id),
+                action,
+                "模板命令",
+                "blocked",
+            );
+            return Err(format!("已拦截：{reason}"));
+        }
+        Decision::NeedsApproval(_) | Decision::Allow => {}
+    }
+    if state.guard.is_strict_group(cfg.group.as_deref()) {
+        wait_file_approval(state, &cfg, command).await?;
+    }
+    let res = state
+        .ssh
+        .exec(
+            &state.store,
+            &cfg.id,
+            &conn_params(&cfg),
+            command,
+            Duration::from_secs(timeout_secs.clamp(1, 300)),
+        )
+        .await;
+    match &res {
+        Ok(r) => {
+            let out = state.guard.sanitize(&r.stdout);
+            let err = state.guard.sanitize(&r.stderr);
+            audit(
+                state,
+                "ai",
+                Some(&cfg.id),
+                action,
+                &truncate(command, crate::text::COMMAND_DIGEST_MAX),
+                &format!("exit={:?} bytes={}", r.exit_code, out.len() + err.len()),
+            );
+            Ok(ExecResult {
+                stdout: out,
+                stderr: err,
+                exit_code: r.exit_code,
+                truncated: r.truncated,
+                timed_out: r.timed_out,
+            })
+        }
+        Err(e) => {
+            audit(
+                state,
+                "ai",
+                Some(&cfg.id),
+                action,
+                &truncate(command, crate::text::COMMAND_DIGEST_MAX),
+                &truncate(&e, crate::text::ERROR_MAX),
+            );
+            Err(e.clone())
+        }
+    }
 }
 
 /// 执行一条命令。source: "manual"（用户）或 "ai"（MCP 管线）。
@@ -116,7 +311,7 @@ pub async fn run_command(
                 state,
                 source,
                 Some(&cfg.id),
-                "mcp_exec_command",
+                shared::action::MCP_EXEC_COMMAND,
                 &command,
                 "blocked:not_allow_ai",
             );
@@ -132,18 +327,16 @@ pub async fn run_command(
         }
         match decision {
             Decision::Blocked(reason) => {
-                audit(state, source, Some(&cfg.id), "mcp_exec_command", &command, "blocked");
+                audit(state, source, Some(&cfg.id), shared::action::MCP_EXEC_COMMAND, &command, "blocked");
                 return Err(format!("已拦截：{reason}"));
             }
             Decision::NeedsApproval(reason) => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let _pending = state.approvals.create(&cfg.id, &cfg.name, &command, tx);
-                let _ = state.handle.emit("approvals-updated", ());
+                let rx = register_approval(state, &cfg.id, &cfg.name, &command);
                 audit(
                     state,
                     source,
                     Some(&cfg.id),
-                    "mcp_approval_requested",
+                    shared::action::MCP_APPROVAL_REQUESTED,
                     &command,
                     &reason,
                 );
@@ -155,13 +348,13 @@ pub async fn run_command(
                         state,
                         source,
                         Some(&cfg.id),
-                        "mcp_exec_command",
+                        shared::action::MCP_EXEC_COMMAND,
                         &command,
                         "approval_denied_or_timeout",
                     );
                     return Err("审批被拒绝或已超时（120 秒），命令未执行".into());
                 }
-                audit(state, source, Some(&cfg.id), "mcp_approval_granted", &command, "ok");
+                audit(state, source, Some(&cfg.id), shared::action::MCP_APPROVAL_GRANTED, &command, "ok");
             }
             Decision::Allow => {}
         }
@@ -179,6 +372,7 @@ pub async fn run_command(
             stderr: state.guard.sanitize(&r.stderr),
             exit_code: r.exit_code,
             truncated: r.truncated,
+            timed_out: r.timed_out,
         },
         other => other?,
     };
@@ -187,10 +381,14 @@ pub async fn run_command(
         state,
         source,
         Some(&cfg.id),
-        if source == "ai" { "mcp_exec_command" } else { "ssh_exec" },
+        if source == "ai" { shared::action::MCP_EXEC_COMMAND } else { "ssh_exec" },
         &command,
         &match &out {
-            ExecResult { exit_code, .. } => format!("exit={exit_code:?}"),
+            ExecResult { exit_code, timed_out, truncated, .. } => format!(
+                "exit={exit_code:?}{}{}",
+                if *timed_out { " timed_out" } else { "" },
+                if *truncated { " truncated" } else { "" }
+            ),
         },
     );
     Ok(out)
@@ -210,11 +408,23 @@ pub fn ai_gate(state: &AppState, cfg: &ServerConfig, action: &str, detail: &str)
     Ok(())
 }
 
-async fn wait_file_approval(state: &AppState, cfg: &ServerConfig, summary: &str) -> Result<(), String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let _pending = state.approvals.create(&cfg.id, &cfg.name, summary, tx);
-    let _ = state.handle.emit("approvals-updated", ());
-    audit(state, "ai", Some(&cfg.id), "mcp_approval_requested", summary, "file_write");
+/// 请求一次人工审批：单机命令、文件写入、固定模板共用一条路径。
+/// `summary` 由 [`register_approval`] 统一脱敏；`kind` 写入审计 outcome 便于区分来源。
+pub(crate) async fn request_approval(
+    state: &AppState,
+    cfg: &ServerConfig,
+    summary: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let rx = register_approval(state, &cfg.id, &cfg.name, summary);
+    audit(
+        state,
+        "ai",
+        Some(&cfg.id),
+        shared::action::MCP_APPROVAL_REQUESTED,
+        summary,
+        kind,
+    );
     let decided = tokio::time::timeout(
         Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),
         rx,
@@ -226,14 +436,85 @@ async fn wait_file_approval(state: &AppState, cfg: &ServerConfig, summary: &str)
             state,
             "ai",
             Some(&cfg.id),
-            "mcp_approval_requested",
+            shared::action::MCP_APPROVAL_REQUESTED,
             summary,
             "approval_denied_or_timeout",
         );
-        return Err("审批被拒绝或已超时（120 秒），写入未执行".into());
+        return Err("审批被拒绝或已超时（120 秒），操作未执行".into());
     }
-    audit(state, "ai", Some(&cfg.id), "mcp_approval_granted", summary, "ok");
+    audit(state, "ai", Some(&cfg.id), shared::action::MCP_APPROVAL_GRANTED, summary, "ok");
     Ok(())
+}
+
+async fn wait_file_approval(state: &AppState, cfg: &ServerConfig, summary: &str) -> Result<(), String> {
+    request_approval(state, cfg, summary, "file_write").await
+}
+
+// ---------- 远端路径真实化（符号链接防护） ----------
+
+/// 把远端路径解析成真实路径（跟随符号链接）。
+///
+/// 路径保护原先只校验调用方提交的文本，SFTP 随后按远端文件系统解析，
+/// `ln -s /etc/shadow /tmp/innocent` 这类别名即可绕过。这里先取 `readlink -f`
+/// （文件不存在时退回 GNU 的 `readlink -m`），再对**解析结果**做黑名单判定；
+/// 对端不支持这两个命令时原样返回，行为与之前一致。
+///
+/// 该命令由应用固定生成、路径经 `sh_quote` 注入，不是 AI 自由输入。
+async fn resolve_remote_path(state: &AppState, cfg: &ServerConfig, path: &str) -> String {
+    let q = crate::observe::sh_quote(path);
+    let cmd = format!(
+        "( readlink -f -- {q} 2>/dev/null || readlink -m -- {q} 2>/dev/null || printf '%s' {q} )"
+    );
+    match state
+        .ssh
+        .exec(
+            &state.store,
+            &cfg.id,
+            &conn_params(cfg),
+            &cmd,
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        Ok(r) => {
+            let p = r.stdout.trim();
+            if p.starts_with('/') && p != path {
+                p.to_string()
+            } else {
+                path.to_string()
+            }
+        }
+        Err(_) => path.to_string(),
+    }
+}
+
+/// AI 读取远端路径的完整判定：原路径与解析后的真实路径都必须过泄露黑名单。
+pub(crate) async fn evaluate_remote_read(state: &AppState, cfg: &ServerConfig, path: &str) -> Decision {
+    if let Decision::Blocked(reason) = state.guard.evaluate_read_path(path) {
+        return Decision::Blocked(reason);
+    }
+    let real = resolve_remote_path(state, cfg, path).await;
+    if real != path {
+        if let Decision::Blocked(reason) = state.guard.evaluate_read_path(&real) {
+            return Decision::Blocked(format!("{reason}（解析后真实路径：{real}）"));
+        }
+    }
+    Decision::Allow
+}
+
+/// AI 写入远端路径的完整判定：原路径与解析后的真实路径都必须过禁写名单。
+/// 未被拦截时统一返回「需人工审批」，由调用方走审批流。
+async fn evaluate_remote_write(state: &AppState, cfg: &ServerConfig, path: &str) -> Decision {
+    if let Decision::Blocked(reason) = state.guard.evaluate_write_path(path) {
+        return Decision::Blocked(reason);
+    }
+    let real = resolve_remote_path(state, cfg, path).await;
+    if real != path {
+        if let Decision::Blocked(reason) = state.guard.evaluate_write_path(&real) {
+            return Decision::Blocked(format!("{reason}（解析后真实路径：{real}）"));
+        }
+    }
+    Decision::NeedsApproval("AI 文件写入需人工审批".to_string())
 }
 
 /// 读取远程文件（source = "manual" 或 "ai"）。
@@ -245,9 +526,9 @@ pub async fn remote_read_file(
 ) -> Result<(String, u64, bool), String> {
     let cfg = load_server_config(state, server_ref)?;
     if source == "ai" {
-        ai_gate(state, &cfg, "mcp_read_file", path)?;
-        if let Decision::Blocked(reason) = state.guard.evaluate_read_path(path) {
-            audit(state, source, Some(&cfg.id), "mcp_read_file", path, "blocked");
+        ai_gate(state, &cfg, shared::action::MCP_READ_FILE, path)?;
+        if let Decision::Blocked(reason) = evaluate_remote_read(state, &cfg, path).await {
+            audit(state, source, Some(&cfg.id), shared::action::MCP_READ_FILE, path, "blocked");
             return Err(format!("已拦截：{reason}"));
         }
     }
@@ -272,14 +553,14 @@ pub async fn remote_read_file(
                 state,
                 source,
                 Some(&cfg.id),
-                if source == "ai" { "mcp_read_file" } else { "sftp_read" },
+                if source == "ai" { shared::action::MCP_READ_FILE } else { "sftp_read" },
                 path,
                 &format!("size={full} truncated={truncated}"),
             );
             Ok((content, full, truncated))
         }
         Err(e) => {
-            audit(state, source, Some(&cfg.id), "mcp_read_file", path, &truncate(&e, 200));
+            audit(state, source, Some(&cfg.id), shared::action::MCP_READ_FILE, path, &truncate(&e, 200));
             Err(e)
         }
     }
@@ -295,17 +576,17 @@ pub async fn remote_write_file(
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
     if state.guard.is_readonly() {
-        audit(state, "ai", Some(&cfg.id), "mcp_write_file", path, "blocked:readonly");
+        audit(state, "ai", Some(&cfg.id), shared::action::MCP_WRITE_FILE, path, "blocked:readonly");
         return Err("只读模式已开启：AI 不得写入文件".into());
     }
     if content.len() > AI_WRITE_FILE_CAP {
         return Err(format!("内容超过 {}MB 上限", AI_WRITE_FILE_CAP / 1024 / 1024));
     }
     if source == "ai" {
-        ai_gate(state, &cfg, "mcp_write_file", path)?;
-        match state.guard.evaluate_write_path(path) {
+        ai_gate(state, &cfg, shared::action::MCP_WRITE_FILE, path)?;
+        match evaluate_remote_write(state, &cfg, path).await {
             Decision::Blocked(reason) => {
-                audit(state, source, Some(&cfg.id), "mcp_write_file", path, "blocked");
+                audit(state, source, Some(&cfg.id), shared::action::MCP_WRITE_FILE, path, "blocked");
                 return Err(format!("已拦截：{reason}"));
             }
             Decision::NeedsApproval(_) => {
@@ -328,8 +609,16 @@ pub async fn remote_write_file(
             .await
         {
             if orig_size <= 1024 * 1024 {
-                if let Ok(meta) = crate::fbackups::save(&state.dir, &cfg.id, path, &orig) {
-                    backup_note = format!(" backup={}", meta.id);
+                // 备份内容含远程配置原文，可能带口令/令牌：用保险库 DEK 加密后落盘
+                match state.vault.dek() {
+                    Ok(dek) => {
+                        if let Ok(meta) =
+                            crate::fbackups::save_encrypted(&state.dir, &dek, &cfg.id, path, &orig)
+                        {
+                            backup_note = format!(" backup={}", meta.id);
+                        }
+                    }
+                    Err(e) => eprintln!("写前备份跳过（保险库不可用）: {e}"),
                 }
             }
         }
@@ -343,7 +632,7 @@ pub async fn remote_write_file(
             state,
             source,
             Some(&cfg.id),
-            if source == "ai" { "mcp_write_file" } else { "sftp_write" },
+            if source == "ai" { shared::action::MCP_WRITE_FILE } else { "sftp_write" },
             path,
             &format!("bytes={n}{backup_note}"),
         ),
@@ -351,7 +640,7 @@ pub async fn remote_write_file(
             state,
             source,
             Some(&cfg.id),
-            "mcp_write_file",
+            shared::action::MCP_WRITE_FILE,
             path,
             &truncate(e, 200),
         ),
@@ -444,16 +733,14 @@ fn gate_local_read(state: &AppState, cfg: &ServerConfig, action: &str, local_pat
     Ok(())
 }
 
-fn remote_write_rules(state: &AppState, cfg: &ServerConfig, action: &str, path: &str) -> Result<(), String> {
-    match state.guard.evaluate_write_path(path) {
+/// AI 写远端路径的前置校验：解析真实路径后判定；被拦截即 Err，其余交给调用方的审批流。
+async fn remote_write_rules(state: &AppState, cfg: &ServerConfig, action: &str, path: &str) -> Result<(), String> {
+    match evaluate_remote_write(state, cfg, path).await {
         Decision::Blocked(reason) => {
             audit(state, "ai", Some(&cfg.id), action, path, "blocked");
             Err(format!("已拦截：{reason}"))
         }
-        Decision::NeedsApproval(reason) => {
-            audit(state, "ai", Some(&cfg.id), action, path, &reason);
-            Ok(())
-        }
+        Decision::NeedsApproval(_) => Ok(()),
         Decision::Allow => Ok(()),
     }
 }
@@ -467,11 +754,11 @@ pub async fn ai_upload_file(
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
     if state.guard.is_readonly() {
-        audit(state, "ai", Some(&cfg.id), "mcp_upload_file", local_path, "blocked:readonly");
+        audit(state, "ai", Some(&cfg.id), shared::action::MCP_UPLOAD_FILE, local_path, "blocked:readonly");
         return Err("只读模式已开启：AI 不得上传文件".into());
     }
-    gate_local_read(state, &cfg, "mcp_upload_file", local_path)?;
-    remote_write_rules(state, &cfg, "mcp_upload_file", remote_path)?;
+    gate_local_read(state, &cfg, shared::action::MCP_UPLOAD_FILE, local_path)?;
+    remote_write_rules(state, &cfg, shared::action::MCP_UPLOAD_FILE, remote_path).await?;
     let summary = format!(
         "上传文件 {} → {}:{}",
         local_path, cfg.host, remote_path
@@ -482,8 +769,8 @@ pub async fn ai_upload_file(
         .sftp_upload(&state.store, &cfg.id, &conn_params(&cfg), local_path, remote_path)
         .await;
     match &res {
-        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_upload_file", &format!("{local_path} → {remote_path}"), &format!("bytes={n}")),
-        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_upload_file", &format!("{local_path} → {remote_path}"), &truncate(e, 200)),
+        Ok(n) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_UPLOAD_FILE, &format!("{local_path} → {remote_path}"), &format!("bytes={n}")),
+        Err(e) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_UPLOAD_FILE, &format!("{local_path} → {remote_path}"), &truncate(e, 200)),
     }
     res
 }
@@ -495,9 +782,9 @@ pub async fn ai_download_file(
     remote_path: &str,
 ) -> Result<String, String> {
     let cfg = load_server_config(state, server_ref)?;
-    ai_gate(state, &cfg, "mcp_download_file", remote_path)?;
-    if let Decision::Blocked(reason) = state.guard.evaluate_read_path(remote_path) {
-        audit(state, "ai", Some(&cfg.id), "mcp_download_file", remote_path, "blocked");
+    ai_gate(state, &cfg, shared::action::MCP_DOWNLOAD_FILE, remote_path)?;
+    if let Decision::Blocked(reason) = evaluate_remote_read(state, &cfg, remote_path).await {
+        audit(state, "ai", Some(&cfg.id), shared::action::MCP_DOWNLOAD_FILE, remote_path, "blocked");
         return Err(format!("已拦截：{reason}"));
     }
     let downloads = state.dir.join("ai_downloads");
@@ -521,11 +808,40 @@ pub async fn ai_download_file(
         )
         .await;
     match &res {
-        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_download_file", remote_path, &format!("bytes={n} → {}", save_path.display())),
-        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_download_file", remote_path, &truncate(e, 200)),
+        Ok(n) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_DOWNLOAD_FILE, remote_path, &format!("bytes={n} → {}", save_path.display())),
+        Err(e) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_DOWNLOAD_FILE, remote_path, &truncate(e, 200)),
     }
     res?;
+    // 明文留存控制：下载目录里的旧文件到期即清理（配置文件里常带口令/令牌）
+    cleanup_ai_downloads(&downloads, AI_DOWNLOAD_KEEP_DAYS);
     Ok(save_path.display().to_string())
+}
+
+/// 下载件明文留存天数：超过即清理，避免凭据随文件名长期躺在磁盘上。
+const AI_DOWNLOAD_KEEP_DAYS: u64 = 7;
+
+/// 启动时清理一次下载目录（与下载后的清理同策略）。
+pub fn cleanup_downloads_on_startup(data_dir: &std::path::Path) {
+    cleanup_ai_downloads(&data_dir.join("ai_downloads"), AI_DOWNLOAD_KEEP_DAYS);
+}
+
+/// 清理 `ai_downloads` 下超过保留期的文件；失败只记 stderr，不影响下载本身。
+pub fn cleanup_ai_downloads(dir: &std::path::Path, keep_days: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(keep_days.saturating_mul(24 * 60 * 60));
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let old = meta.modified().map(|m| m < cutoff).unwrap_or(false);
+        if old {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                eprintln!("清理旧下载件失败 {}: {e}", entry.path().display());
+            }
+        }
+    }
 }
 
 /// AI 追加内容到远程已有文件（不存在则拒绝，新建用 write_file）。需审批。
@@ -537,37 +853,36 @@ pub async fn ai_append_file(
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
     if state.guard.is_readonly() {
-        audit(state, "ai", Some(&cfg.id), "mcp_append_file", path, "blocked:readonly");
+        audit(state, "ai", Some(&cfg.id), shared::action::MCP_APPEND_FILE, path, "blocked:readonly");
         return Err("只读模式已开启：AI 不得追加文件".into());
     }
-    ai_gate(state, &cfg, "mcp_append_file", path)?;
+    ai_gate(state, &cfg, shared::action::MCP_APPEND_FILE, path)?;
     if content.len() > 512 * 1024 {
         return Err("追加内容超过 512KB 上限".into());
     }
-    remote_write_rules(state, &cfg, "mcp_append_file", path)?;
-    // append 语义：文件必须已存在
+    remote_write_rules(state, &cfg, shared::action::MCP_APPEND_FILE, path).await?;
+    // 只读取「是否以换行结尾」用于排版，不参与写回：真正的写入是远端 APPEND，
+    // 审批期间服务写入的新内容不会被整文件覆盖（原实现的丢失更新问题）。
     let existing = state
         .ssh
         .sftp_read_file(&state.store, &cfg.id, &conn_params(&cfg), path, 1024 * 1024)
         .await
         .map_err(|_| "远程文件不存在或不可读：append 仅限已有文件，新建请用 write_file".to_string())?;
-    let mut merged = existing.0;
-    if !merged.ends_with(b"\n") && !merged.is_empty() {
-        merged.push(b'\n');
+    let needs_newline = !existing.0.is_empty() && !existing.0.ends_with(b"\n");
+    let mut payload = Vec::with_capacity(content.len() + if needs_newline { 1 } else { 0 });
+    if needs_newline {
+        payload.push(b'\n');
     }
-    merged.extend_from_slice(content.as_bytes());
-    if merged.len() > 1024 * 1024 {
-        return Err("追加后超过 1MB 上限".into());
-    }
-    let summary = format!("追加内容到 {}（{} 字节）", path, content.len());
+    payload.extend_from_slice(content.as_bytes());
+    let summary = format!("追加内容到 {}（{} 字节）", path, payload.len());
     wait_file_approval(state, &cfg, &summary).await?;
     let res = state
         .ssh
-        .sftp_write_file(&state.store, &cfg.id, &conn_params(&cfg), path, &merged)
+        .sftp_append_file(&state.store, &cfg.id, &conn_params(&cfg), path, &payload)
         .await;
     match &res {
-        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_append_file", path, &format!("bytes={n}")),
-        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_append_file", path, &truncate(e, 200)),
+        Ok(n) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_APPEND_FILE, path, &format!("bytes={n}")),
+        Err(e) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_APPEND_FILE, path, &truncate(e, 200)),
     }
     res
 }
@@ -580,12 +895,13 @@ pub async fn ai_restore_file(
 ) -> Result<u64, String> {
     let cfg = load_server_config(state, server_ref)?;
     if state.guard.is_readonly() {
-        audit(state, "ai", Some(&cfg.id), "mcp_restore_file", backup_id, "blocked:readonly");
+        audit(state, "ai", Some(&cfg.id), shared::action::MCP_RESTORE_FILE, backup_id, "blocked:readonly");
         return Err("只读模式已开启：AI 不得回滚文件".into());
     }
-    ai_gate(state, &cfg, "mcp_restore_file", backup_id)?;
+    ai_gate(state, &cfg, shared::action::MCP_RESTORE_FILE, backup_id)?;
+    let dek = state.vault.dek().map_err(|e| e.to_string())?;
     let (meta, content) =
-        crate::fbackups::load(&state.dir, backup_id).map_err(|e| e.to_string())?;
+        crate::fbackups::load_encrypted(&state.dir, &dek, backup_id).map_err(|e| e.to_string())?;
     if meta.server_id != cfg.id {
         return Err("备份不属于该服务器".into());
     }
@@ -599,8 +915,8 @@ pub async fn ai_restore_file(
         .sftp_write_file(&state.store, &cfg.id, &conn_params(&cfg), &meta.path, &content)
         .await;
     match &res {
-        Ok(n) => audit(state, "ai", Some(&cfg.id), "mcp_restore_file", &meta.path, &format!("backup={} bytes={n}", meta.id)),
-        Err(e) => audit(state, "ai", Some(&cfg.id), "mcp_restore_file", &meta.path, &truncate(e, 200)),
+        Ok(n) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_RESTORE_FILE, &meta.path, &format!("backup={} bytes={n}", meta.id)),
+        Err(e) => audit(state, "ai", Some(&cfg.id), shared::action::MCP_RESTORE_FILE, &meta.path, &truncate(e, 200)),
     }
     res
 }
@@ -665,6 +981,8 @@ pub async fn exec_batch(
     }
     let (rows, missing) = resolve_batch_targets(&state.store, servers, group)?;
     let timeout = Duration::from_secs(timeout_secs.clamp(5, 120));
+    // 批量操作没有单一服务器：审计与审批卡都用「批量 ×N 台」作为服务器名快照
+    let batch_label = format!("批量 ×{} 台", rows.len());
 
     // 命令安全判定一次（泄露防护/黑名单/审批）；严格分组目标存在则整批强制审批
     let mut decision = state.guard.evaluate(&command);
@@ -679,83 +997,88 @@ pub async fn exec_batch(
     }
     match decision {
         Decision::Blocked(reason) => {
-            audit(state, "ai", None, "mcp_exec_batch", &command, &format!("blocked:{reason}"));
+            audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, &format!("blocked:{reason}"));
             return Err(format!("已拦截：{reason}"));
         }
         Decision::NeedsApproval(reason) => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _pending = state.approvals.create("", &format!("批量 ×{} 台", rows.len()), &command, tx);
-            let _ = state.handle.emit("approvals-updated", ());
-            audit(state, "ai", None, "mcp_approval_requested", &command, &format!("batch:{reason}"));
+            let rx = register_approval(state, "", &batch_label, &command);
+            audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_REQUESTED, &command, &format!("batch:{reason}"));
             let decided = tokio::time::timeout(
                 Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),
                 rx,
             )
             .await;
             if !matches!(decided, Ok(Ok(true))) {
-                audit(state, "ai", None, "mcp_exec_batch", &command, "approval_denied_or_timeout");
+                audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, "approval_denied_or_timeout");
                 return Err("审批被拒绝或已超时（120 秒），批量命令未执行".into());
             }
-            audit(state, "ai", None, "mcp_approval_granted", &command, "batch");
+            audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_GRANTED, &command, "batch");
         }
         Decision::Allow => {}
     }
 
     // 并发执行（信号量限流 5）
     let sem = Arc::new(tokio::sync::Semaphore::new(5));
+    let batch_session = current_session();
     let mut handles = Vec::new();
     for r in rows {
         let st = state.clone();
         let sem = sem.clone();
         let cmd = command.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::spawn(with_session(batch_session.clone(), async move {
+            // 真·并发上限：拿到许可才发起远程操作，并持有到该台服务器执行结束。
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    return serde_json::json!({
+                        "serverId": r.id, "name": r.name, "host": r.host,
+                        "ok": false, "error": format!("并发许可获取失败: {e}"),
+                    });
+                }
+            };
             let mut entry = serde_json::json!({
                 "serverId": r.id, "name": r.name, "host": r.host,
             });
             if !r.allow_ai {
                 entry["ok"] = serde_json::json!(false);
                 entry["error"] = serde_json::json!("未开放 AI 操作（allowAi=false）");
-                audit(&st, "ai", Some(&r.id), "mcp_exec_batch", &cmd, "blocked:not_allow_ai");
+                audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, "blocked:not_allow_ai");
                 return entry;
             }
-            let params = ConnParams {
-                host: r.host.clone(), port: r.port, username: r.username.clone(),
-                auth: {
-                    let dek = match st.vault.dek() { Ok(d) => d, Err(e) => {
-                        entry["ok"] = serde_json::json!(false);
-                        entry["error"] = serde_json::json!(e.to_string());
-                        return entry;
-                    }};
-                    match crate::crypto::decrypt(&dek, &r.secret_blob).and_then(|p| serde_json::from_slice::<AuthMethod>(&p).map_err(|e| e.to_string())) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            entry["ok"] = serde_json::json!(false);
-                            entry["error"] = serde_json::json!(e.to_string());
-                            return entry;
-                        }
-                    }
-                },
+            let params = match conn_params_from_row(&st.vault, &r) {
+                Ok(p) => p,
+                Err(e) => {
+                    entry["ok"] = serde_json::json!(false);
+                    entry["error"] = serde_json::json!(e);
+                    audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, "error:credential");
+                    return entry;
+                }
             };
             let res = st.ssh.exec(&st.store, &r.id, &params, &cmd, timeout).await;
             match res {
                 Ok(x) => {
                     let out = st.guard.sanitize(&truncate(&x.stdout, 4096));
                     let errout = st.guard.sanitize(&truncate(&x.stderr, 2048));
-                    audit(&st, "ai", Some(&r.id), "mcp_exec_batch", &cmd, &format!("exit={:?} bytes={}", x.exit_code, out.len()));
-                    entry["ok"] = serde_json::json!(true);
+                    audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, &format!("exit={:?} bytes={}{}", x.exit_code, out.len(), if x.timed_out { " timed_out" } else { "" }));
+                    // 读超时不等于执行成功：ok 为 false，但保留已收到的部分输出供排查
+                    entry["ok"] = serde_json::json!(!x.timed_out);
+                    entry["timedOut"] = serde_json::json!(x.timed_out);
                     entry["exitCode"] = serde_json::json!(x.exit_code);
                     entry["stdout"] = serde_json::json!(out);
                     entry["stderr"] = serde_json::json!(errout);
                     entry["truncated"] = serde_json::json!(x.truncated);
+                    if x.timed_out {
+                        entry["error"] = serde_json::json!("读取输出超时：远端可能仍在执行，结果为部分输出");
+                    }
                 }
                 Err(e) => {
-                    audit(&st, "ai", Some(&r.id), "mcp_exec_batch", &cmd, &truncate(&e, 200));
+                    audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, &truncate(&e, crate::text::ERROR_MAX));
                     entry["ok"] = serde_json::json!(false);
-                    entry["error"] = serde_json::json!(truncate(&e, 300));
+                    entry["error"] = serde_json::json!(truncate(&e, crate::text::ERROR_MAX));
                 }
             }
             entry
-        }));
+        })));
     }
 
     let mut results = Vec::new();
@@ -770,8 +1093,8 @@ pub async fn exec_batch(
     }
 
     let ok_count = results.iter().filter(|r| r["ok"] == serde_json::json!(true)).count();
-    audit(
-        state, "ai", None, "mcp_exec_batch", &command,
+    audit_named(
+        state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command,
         &format!("done ok={ok_count}/{}", results.len()),
     );
     Ok(serde_json::json!({ "count": results.len(), "ok": ok_count, "results": results }))
@@ -831,5 +1154,91 @@ mod r3_tests {
         assert!(resolve_batch_targets(&store, Some(&many), None).is_err());
 
         let _ = std::fs::remove_file(&db);
+    }
+}
+
+#[cfg(test)]
+mod r6_tests {
+    use super::*;
+    use crate::store::{ServerRow, Store};
+
+    fn row(id: &str, name: &str) -> ServerRow {
+        ServerRow {
+            id: id.into(),
+            name: name.into(),
+            host: "10.0.0.1".into(),
+            port: 22,
+            username: "root".into(),
+            auth_type: "password".into(),
+            secret_blob: vec![0u8; 8],
+            group_name: None,
+            tags: "[]".into(),
+            notes: None,
+            allow_ai: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn audit_server_reference_resolves_to_id_and_name() {
+        let db = std::env::temp_dir().join(format!("sd-audit-resolve-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+        store.insert(&row("id-a", "生产 A")).unwrap();
+        store.insert(&row("id-b", "测试 B")).unwrap();
+
+        // 按名称引用（MCP 工具允许传名称）→ 规范 id + 名称
+        let (id, name) = resolve_audit_server(&store, Some("生产 A"), None);
+        assert_eq!(id.as_deref(), Some("id-a"));
+        assert_eq!(name, "生产 A");
+
+        // 按 id 引用 → 回填名称
+        let (id, name) = resolve_audit_server(&store, Some("id-b"), None);
+        assert_eq!(id.as_deref(), Some("id-b"));
+        assert_eq!(name, "测试 B");
+
+        // 名称提示优先（删除服务器后仍保留名称快照）
+        let (id, name) = resolve_audit_server(&store, Some("id-a"), Some("删除前的名字"));
+        assert_eq!(id.as_deref(), Some("id-a"));
+        assert_eq!(name, "删除前的名字");
+
+        // 解析不到时原样保留引用
+        let (id, name) = resolve_audit_server(&store, Some("ghost"), None);
+        assert_eq!(id.as_deref(), Some("ghost"));
+        assert!(name.is_empty());
+
+        // 批量操作：无 id，只有描述性名称
+        let (id, name) = resolve_audit_server(&store, None, Some("批量 ×3 台"));
+        assert!(id.is_none());
+        assert_eq!(name, "批量 ×3 台");
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn download_cleanup_only_removes_old_files() {
+        let dir = std::env::temp_dir().join(format!("sd-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.txt");
+        let fresh = dir.join("fresh.txt");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&fresh, b"y").unwrap();
+        // 把 old 的 mtime 调到 30 天前
+        let thirty_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(thirty_days_ago)
+            .unwrap();
+
+        cleanup_ai_downloads(&dir, 7);
+        assert!(!old.exists(), "超过保留期的下载件应被删除");
+        assert!(fresh.exists(), "保留期内的下载件不得删除");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

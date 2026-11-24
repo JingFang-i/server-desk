@@ -4,7 +4,7 @@
 //! 全部安全策略（高危拦截/审批/审计/脱敏/凭据保密）由主应用执行。
 //! sidecar 不读取数据库、不持有凭据；应用未运行或保险库锁定时工具调用返回明确错误。
 //!
-//! 工具：list_servers / exec_command / server_status
+//! 工具：共 16 个（清单见 `tools_json()`，与 `shared::MCP_TOOL_NAMES` 保持一致）
 //!
 //! 接入示例（Claude Desktop / Cursor 等客户端配置）：
 //! { "mcpServers": { "serverdesk": { "command": "/path/to/serverdesk-mcp", "args": [] } } }
@@ -67,40 +67,10 @@ async fn main() {
     }
 }
 
-/// 处理一条 MCP 消息；返回需要回发的 JSON-RPC 应答（通知类返回 None）。
-async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
-    let method = msg.get("method").and_then(|m| m.as_str())?;
-    let id = msg.get("id").cloned();
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-    // 无 id 的消息按通知处理（不应答）
-    let reply = |result: Result<Value, (i64, String)>| -> Option<Value> {
-        let id = id.clone()?;
-        Some(match result {
-            Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": v }),
-            Err((code, message)) => json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": { "code": code, "message": message }
-            }),
-        })
-    };
-
-    match method {
-        "initialize" => {
-            let requested = params
-                .get("protocolVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05")
-                .to_string();
-            reply(Ok(json!({
-                "protocolVersion": requested,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "serverdesk", "version": env!("CARGO_PKG_VERSION") }
-            })))
-        }
-        "notifications/initialized" | "initialized" => None,
-        "tools/list" => reply(Ok(json!({
-            "tools": [
+/// MCP 工具清单。与 `shared::MCP_TOOL_NAMES` 必须一致（单测守护）。
+fn tools_json() -> Value {
+    json!(
+[
                 {
                     "name": "list_servers",
                     "description": "列出已录入的服务器（名称/地址/用户名等元信息；绝不包含密码或私钥）",
@@ -295,7 +265,42 @@ async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
                     }
                 }
             ]
-        }))),
+    )
+}
+
+/// 处理一条 MCP 消息；返回需要回发的 JSON-RPC 应答（通知类返回 None）。
+async fn handle_msg(dir: &PathBuf, msg: Value) -> Option<Value> {
+    let method = msg.get("method").and_then(|m| m.as_str())?;
+    let id = msg.get("id").cloned();
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+    // 无 id 的消息按通知处理（不应答）
+    let reply = |result: Result<Value, (i64, String)>| -> Option<Value> {
+        let id = id.clone()?;
+        Some(match result {
+            Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": v }),
+            Err((code, message)) => json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": code, "message": message }
+            }),
+        })
+    };
+
+    match method {
+        "initialize" => {
+            let requested = params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05")
+                .to_string();
+            reply(Ok(json!({
+                "protocolVersion": requested,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "serverdesk", "version": env!("CARGO_PKG_VERSION") }
+            })))
+        }
+        "notifications/initialized" | "initialized" => None,
+        "tools/list" => reply(Ok(json!({ "tools": tools_json() }))),
         "tools/call" => {
             if id.is_none() {
                 return None;
@@ -374,5 +379,24 @@ async fn call_app(dir: &PathBuf, tool: &str, args: &Value) -> Result<Value, Stri
         Err(resp
             .error
             .unwrap_or_else(|| "未知错误（主应用未返回错误信息）".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 工具清单必须与共享契约一致：新增/删除工具时两边一起改，否则这里会红。
+    #[test]
+    fn tools_match_shared_contract() {
+        let listed: Vec<String> = tools_json()
+            .as_array()
+            .expect("tools 数组")
+            .iter()
+            .map(|t| t["name"].as_str().expect("工具名").to_string())
+            .collect();
+        let expected: Vec<String> = shared::MCP_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(listed, expected, "sidecar 工具清单与 shared::MCP_TOOL_NAMES 不一致");
+        assert_eq!(listed.len(), 16, "README/AGENTS 承诺 16 个工具");
     }
 }

@@ -10,11 +10,13 @@ mod crypto;
 mod fbackups;
 mod guard;
 mod ipc;
+mod notify;
 mod observe;
 mod ops;
 mod ssh;
 mod state;
 mod store;
+mod text;
 mod vault;
 
 use state::AppState;
@@ -62,6 +64,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let dir = app
                 .path()
@@ -76,6 +79,11 @@ fn main() {
                 Err(e) => eprintln!("保险库：钥匙串自动解锁失败（{e}），需要手动解锁"),
             }
             let guard = guard::Guard::load(&store);
+            // AI 下载目录里的明文文件 7 天后自动清理（配置文件常带口令/令牌）
+            ops::cleanup_downloads_on_startup(&dir);
+
+            // 审批到达提醒：注册通知点击回调（点击系统通知 → 唤起主窗口）
+            notify::init(app.handle());
 
             // 空闲自动锁巡检：每 30s 检查一次，锁上时广播事件给前端
             let vault_for_lock = vault.clone();
@@ -169,6 +177,7 @@ fn main() {
                 ai_rate: guard::AiRate::new(),
                 handle: app.handle().clone(),
                 dir: dir.clone(),
+                audit_failures: std::sync::atomic::AtomicU64::new(0),
             });
             app.manage(state.clone());
 
@@ -212,6 +221,8 @@ fn main() {
             commands::approval_decide,
             // 审计
             commands::audit_list,
+            commands::audit_sessions,
+            commands::audit_failures,
             // MCP 接入信息
             commands::mcp_info,
             // 备份与恢复

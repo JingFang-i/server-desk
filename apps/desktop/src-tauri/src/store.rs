@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ts        TEXT NOT NULL,
     source    TEXT NOT NULL,
     server_id TEXT,
+    server_name TEXT NOT NULL DEFAULT '',
     action    TEXT NOT NULL,
     detail    TEXT NOT NULL,
     outcome   TEXT NOT NULL
@@ -64,10 +65,15 @@ pub struct AuditEntry {
     pub ts: String,
     pub source: String,
     pub server_id: Option<String>,
+    /// 写入时的服务器名称快照（服务器改名/删除后仍能看懂历史记录）
+    pub server_name: String,
     pub action: String,
     pub detail: String,
     pub outcome: String,
     pub session: String,
+    /// 由 SQL 统一判定「是否成功」：前端不再靠 `outcome.startsWith("ok")` 猜。
+    /// 成功 = ok / ok:... / exit=Some(0)（且未读超时）。
+    pub ok: bool,
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServerRow> {
@@ -105,7 +111,8 @@ impl Store {
         )
         .map_err(|e| format!("写入 schema 版本失败: {e}"))?;
 
-        // R5 迁移：audit_log 增加 session 列（旧库自动升级）
+        // 审计表增量迁移（旧库自动升级）：
+        // R5 → session（AI 会话归因）；R6 → server_name（服务器名称快照）
         {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(audit_log)")
@@ -118,6 +125,12 @@ impl Store {
             if !cols.iter().any(|c| c == "session") {
                 conn.execute_batch("ALTER TABLE audit_log ADD COLUMN session TEXT NOT NULL DEFAULT '';")
                     .map_err(|e| format!("迁移审计表失败: {e}"))?;
+            }
+            if !cols.iter().any(|c| c == "server_name") {
+                conn.execute_batch(
+                    "ALTER TABLE audit_log ADD COLUMN server_name TEXT NOT NULL DEFAULT '';",
+                )
+                .map_err(|e| format!("迁移审计表失败: {e}"))?;
             }
         }
         Ok(Self { conn: Mutex::new(conn) })
@@ -151,7 +164,7 @@ impl Store {
 
     pub fn list_by_group(&self, group: &str) -> Result<Vec<ServerRow>, String> {
         let conn = self.lock()?;
-        let sql = format!("SELECT {COLS} FROM servers WHERE group_name = ?1 ORDER BY created_at DESC");
+        let sql = format!("SELECT {COLS} FROM servers WHERE lower(trim(group_name)) = lower(trim(?1)) ORDER BY created_at DESC");
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询失败: {e}"))?;
         let rows = stmt
             .query_map(params![group], map_row)
@@ -372,61 +385,91 @@ impl Store {
         session: &str,
         source: &str,
         server_id: Option<&str>,
+        server_name: &str,
         action: &str,
         detail: &str,
         outcome: &str,
     ) -> Result<(), String> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO audit_log(ts, source, server_id, action, detail, outcome, session) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![ts, source, server_id, action, detail, outcome, session],
+            "INSERT INTO audit_log(ts, source, server_id, server_name, action, detail, outcome, session) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![ts, source, server_id, server_name, action, detail, outcome, session],
         )
         .map_err(|e| format!("写审计失败: {e}"))?;
         Ok(())
     }
 
-    pub fn audit_list(&self, limit: i64, source: Option<&str>) -> Result<Vec<AuditEntry>, String> {
+    /// 查询审计记录。`source` / `session` 传空或 "all" 表示不过滤；
+    /// 会话过滤在 SQL 层完成，不再只筛前端最近 200 行。
+    pub fn audit_list(
+        &self,
+        limit: i64,
+        source: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<Vec<AuditEntry>, String> {
         let conn = self.lock()?;
         let limit = limit.clamp(1, 1000);
+        let source = source.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
+        let session = session.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<AuditEntry> {
             Ok(AuditEntry {
                 id: r.get(0)?,
                 ts: r.get(1)?,
                 source: r.get(2)?,
                 server_id: r.get(3)?,
-                action: r.get(4)?,
-                detail: r.get(5)?,
-                outcome: r.get(6)?,
-                session: r.get(7)?,
+                server_name: r.get(4)?,
+                action: r.get(5)?,
+                detail: r.get(6)?,
+                outcome: r.get(7)?,
+                session: r.get(8)?,
+                ok: r.get::<_, i64>(9)? != 0,
             })
         };
         let mut entries = Vec::new();
-        match source {
-            Some(s) if s != "all" => {
-                let mut stmt = conn
-                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome,session FROM audit_log WHERE source=?1 ORDER BY id DESC LIMIT ?2")
-                    .map_err(|e| format!("查询审计失败: {e}"))?;
-                let rows = stmt
-                    .query_map(params![s, limit], map_row)
-                    .map_err(|e| format!("查询审计失败: {e}"))?;
-                for r in rows {
-                    entries.push(r.map_err(|e| e.to_string())?);
-                }
-            }
-            _ => {
-                let mut stmt = conn
-                    .prepare("SELECT id,ts,source,server_id,action,detail,outcome,session FROM audit_log ORDER BY id DESC LIMIT ?1")
-                    .map_err(|e| format!("查询审计失败: {e}"))?;
-                let rows = stmt
-                    .query_map(params![limit], map_row)
-                    .map_err(|e| format!("查询审计失败: {e}"))?;
-                for r in rows {
-                    entries.push(r.map_err(|e| e.to_string())?);
-                }
-            }
+        // server_name 为空的历史记录：按 server_id 关联当前服务器名补全（改名/删除后可读性最好）
+        const SELECT: &str = "SELECT a.id,a.ts,a.source,a.server_id,\
+             COALESCE(NULLIF(a.server_name,''), s.name, ''),\
+             a.action,a.detail,a.outcome,a.session,\
+             CASE WHEN lower(a.outcome) = 'ok' \
+                    OR lower(a.outcome) LIKE 'ok:%' \
+                    OR lower(a.outcome) LIKE 'ok %' \
+                    OR (lower(a.outcome) LIKE 'exit=some(0)%' \
+                        AND lower(a.outcome) NOT LIKE '%timed_out%') \
+                  THEN 1 ELSE 0 END \
+             FROM audit_log a LEFT JOIN servers s ON s.id = a.server_id";
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT} WHERE (?1 = '' OR a.source = ?1) AND (?2 = '' OR a.session = ?2) \
+                 ORDER BY a.id DESC LIMIT ?3"
+            ))
+            .map_err(|e| format!("查询审计失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![source, session, limit], map_row)
+            .map_err(|e| format!("查询审计失败: {e}"))?;
+        for r in rows {
+            entries.push(r.map_err(|e| e.to_string())?);
         }
         Ok(entries)
+    }
+
+    /// 出现过的 AI 会话 id（按最近活动排序），供审计页做会话筛选。
+    pub fn audit_sessions(&self, limit: i64) -> Result<Vec<String>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session FROM audit_log WHERE session <> '' \
+                 GROUP BY session ORDER BY MAX(ts) DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("查询会话失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![limit.clamp(1, 500)], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("查询会话失败: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     }
 
     /// 按 RFC3339 时间戳清理审计记录（ts 为字典序可比的 UTC 字符串）。
@@ -461,12 +504,12 @@ mod tests {
         let old = "2026-11-01T00:00:00.000000+00:00";
         let recent = "2026-11-16T00:00:00.000000+00:00";
         for (ts, source, action) in [
-            (old, "ai", "mcp_exec_command"),
+            (old, "ai", shared::action::MCP_EXEC_COMMAND),
             (old, "manual", "ssh_exec"),
-            (recent, "ai", "mcp_list_servers"),
+            (recent, "ai", shared::action::MCP_LIST_SERVERS),
             (recent, "user", "vault_unlock"),
         ] {
-            store.insert_audit(ts, "", source, None, action, "d", "ok").unwrap();
+            store.insert_audit(ts, "", source, None, "", action, "d", "ok").unwrap();
         }
         // 清理 7 天前的 AI 记录
         let n = store
@@ -474,14 +517,88 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         // 旧的 manual 仍在；新的 ai 仍在
-        assert_eq!(store.audit_list(100, Some("manual")).unwrap().len(), 1);
-        assert_eq!(store.audit_list(100, Some("ai")).unwrap().len(), 1);
+        assert_eq!(store.audit_list(100, Some("manual"), None).unwrap().len(), 1);
+        assert_eq!(store.audit_list(100, Some("ai"), None).unwrap().len(), 1);
         // 全量清理剩余旧行（cutoff 覆盖 recent 前）
         let n = store
             .purge_audit_before("2026-11-15T00:00:00.000000+00:00", None)
             .unwrap();
         assert_eq!(n, 1);
-        assert_eq!(store.audit_list(100, None).unwrap().len(), 2);
+        assert_eq!(store.audit_list(100, None, None).unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn audit_session_filter_and_ok_flag() {
+        let db = std::env::temp_dir().join(format!("sd-audit-sess-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+        // 时间戳错开：会话下拉按最近活动排序，同一时刻会并列
+        let t1 = "2026-11-23T00:00:01.000000+00:00";
+        let t2 = "2026-11-23T00:00:02.000000+00:00";
+        let t3 = "2026-11-23T00:00:03.000000+00:00";
+        let t4 = "2026-11-23T00:00:04.000000+00:00";
+        store.insert_audit(t1, "s-aaa", "ai", None, "", shared::action::MCP_EXEC_COMMAND, "d", "ok").unwrap();
+        store.insert_audit(t2, "s-bbb", "ai", None, "", shared::action::MCP_EXEC_COMMAND, "d", "blocked").unwrap();
+        store.insert_audit(t3, "", "ai", None, "", shared::action::MCP_EXEC_COMMAND, "d", "exit=Some(0)").unwrap();
+        store.insert_audit(t4, "s-bbb", "ai", None, "", shared::action::MCP_EXEC_COMMAND, "d", "exit=Some(0) timed_out").unwrap();
+
+        // 会话筛选在 SQL 层完成
+        let a = store.audit_list(100, Some("ai"), Some("s-aaa")).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].session, "s-aaa");
+        assert!(a[0].ok);
+
+        let b = store.audit_list(100, None, Some("s-bbb")).unwrap();
+        assert_eq!(b.len(), 2);
+        // blocked / timed_out 不算成功，"exit=Some(0)" 算成功
+        assert!(b.iter().all(|r| !r.ok));
+
+        let none = store.audit_list(100, Some("ai"), None).unwrap();
+        assert_eq!(none.len(), 4);
+        assert_eq!(none.iter().filter(|r| r.ok).count(), 2);
+
+        let sessions = store.audit_sessions(10).unwrap();
+        // 按最近活动倒序：s-bbb 最后一次活动更晚
+        assert_eq!(sessions, vec!["s-bbb".to_string(), "s-aaa".to_string()]);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn audit_server_name_snapshot_and_legacy_migration() {
+        let db = std::env::temp_dir().join(format!("sd-audit-name-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        // 先造一个 R5 之前的老库（audit_log 无 server_name / session 列）
+        {
+            let conn = Connection::open(&db).expect("legacy db");
+            conn.execute_batch(
+                "CREATE TABLE audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL, source TEXT NOT NULL, server_id TEXT,
+                    action TEXT NOT NULL, detail TEXT NOT NULL, outcome TEXT NOT NULL
+                );",
+            )
+            .expect("legacy schema");
+        }
+        let store = Store::open(&db).expect("store");
+        store
+            .insert_audit(
+                "2026-11-23T00:00:00+00:00",
+                "",
+                "user",
+                Some("srv-1"),
+                "生产 A",
+                "ssh_exec",
+                "uptime",
+                "ok",
+            )
+            .unwrap();
+        let rows = store.audit_list(10, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_id.as_deref(), Some("srv-1"));
+        assert_eq!(rows[0].server_name, "生产 A");
 
         let _ = std::fs::remove_file(&db);
     }

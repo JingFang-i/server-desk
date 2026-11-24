@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   NButton,
   NConfigProvider,
@@ -9,6 +9,7 @@ import {
   NLayoutContent,
   NMenu,
   NMessageProvider,
+  NNotificationProvider,
   darkTheme,
   zhCN,
   dateZhCN,
@@ -16,6 +17,7 @@ import {
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type VaultStatus } from "./api";
+import ApprovalAlert from "./components/ApprovalAlert.vue";
 import ServersView from "./views/ServersView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import ApprovalsView from "./views/ApprovalsView.vue";
@@ -28,15 +30,20 @@ type PageKey = "servers" | "approvals" | "audit" | "changes" | "backup" | "setti
 const page = ref<PageKey>("servers");
 const vault = ref<VaultStatus | null>(null);
 const booted = ref(false);
+/** 待审批数量：菜单角标，由 ApprovalAlert 轮询维护 */
+const approvalCount = ref(0);
 
-const menuOptions: MenuOption[] = [
+const menuOptions = computed<MenuOption[]>(() => [
   { label: "🖥 服务器", key: "servers" },
-  { label: "✅ 审批中心", key: "approvals" },
+  {
+    label: approvalCount.value > 0 ? `✅ 审批中心 (${approvalCount.value})` : "✅ 审批中心",
+    key: "approvals",
+  },
   { label: "📜 审计日志", key: "audit" },
   { label: "🔄 变更记录", key: "changes" },
   { label: "💾 备份恢复", key: "backup" },
   { label: "⚙️ 设置", key: "settings" },
-];
+]);
 
 function onMenu(key: string) {
   if (["servers", "approvals", "audit", "changes", "backup", "settings"].includes(key)) {
@@ -91,41 +98,45 @@ onUnmounted(() => {
     style="height: 100%"
   >
     <n-message-provider>
-      <n-dialog-provider>
-      <!-- 保险库锁屏门 -->
-      <LockGate
-        v-if="booted && vault && !vault.unlocked"
-        :status="vault"
-        @unlocked="onUnlocked"
-      />
-      <n-layout v-else-if="booted && vault" has-sider style="height: 100vh">
-        <n-layout-sider
-          bordered
-          :width="216"
-          content-style="padding: 18px 12px 14px; display: flex; flex-direction: column; height: 100%"
-        >
-          <div class="brand-title">ServerDesk</div>
-          <div class="brand-sub" style="margin-bottom: 14px">
-            本地服务器管理
-          </div>
-          <n-menu :value="page" :options="menuOptions" @update:value="onMenu" />
-          <div style="flex: 1" />
-          <n-button size="small" block quaternary style="margin-top: 12px" @click="lockVault">
-            🔒 锁定保险库
-          </n-button>
-        </n-layout-sider>
-        <n-layout-content
-          content-style="padding: 20px 24px; height: 100vh; overflow: auto"
-        >
-          <ServersView v-if="page === 'servers'" />
-          <ApprovalsView v-else-if="page === 'approvals'" />
-          <AuditView v-else-if="page === 'audit'" />
-          <ChangeLogView v-else-if="page === 'changes'" />
-          <BackupView v-else-if="page === 'backup'" />
-          <SettingsView v-else-if="page === 'settings'" />
-        </n-layout-content>
-      </n-layout>
-      </n-dialog-provider>
+      <n-notification-provider placement="top-right" :max="3">
+        <!-- 全局审批提醒：提示音 + 应用内通知 + 待审批角标 -->
+        <ApprovalAlert @count="approvalCount = $event" @open="page = 'approvals'" />
+        <n-dialog-provider>
+          <!-- 保险库锁屏门 -->
+          <LockGate
+            v-if="booted && vault && !vault.unlocked"
+            :status="vault"
+            @unlocked="onUnlocked"
+          />
+          <n-layout v-else-if="booted && vault" has-sider style="height: 100vh">
+            <n-layout-sider
+              bordered
+              :width="216"
+              content-style="padding: 18px 12px 14px; display: flex; flex-direction: column; height: 100%"
+            >
+              <div class="brand-title">ServerDesk</div>
+              <div class="brand-sub" style="margin-bottom: 14px">
+                本地服务器管理
+              </div>
+              <n-menu :value="page" :options="menuOptions" @update:value="onMenu" />
+              <div style="flex: 1" />
+              <n-button size="small" block quaternary style="margin-top: 12px" @click="lockVault">
+                🔒 锁定保险库
+              </n-button>
+            </n-layout-sider>
+            <n-layout-content
+              content-style="padding: 20px 24px; height: 100vh; overflow: auto"
+            >
+              <ServersView v-if="page === 'servers'" />
+              <ApprovalsView v-else-if="page === 'approvals'" />
+              <AuditView v-else-if="page === 'audit'" />
+              <ChangeLogView v-else-if="page === 'changes'" />
+              <BackupView v-else-if="page === 'backup'" />
+              <SettingsView v-else-if="page === 'settings'" />
+            </n-layout-content>
+          </n-layout>
+        </n-dialog-provider>
+      </n-notification-provider>
     </n-message-provider>
   </n-config-provider>
 </template>

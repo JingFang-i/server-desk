@@ -10,6 +10,9 @@ dist/
 # Tauri 生成物（桌面 schema 由构建生成，不入库）
 apps/desktop/src-tauri/gen/
 
+# 打包时暂存的 MCP sidecar（由 scripts/stage-sidecar.mjs 复制）
+apps/desktop/src-tauri/resources/
+
 # 移动端图标（桌面应用用不到，由 pnpm tauri icon 随时可再生成）
 apps/desktop/src-tauri/icons/ios/
 apps/desktop/src-tauri/icons/android/
@@ -29,6 +32,10 @@ ipc-port
 *.key
 *.pem
 !docs/**/*.pem.example
+
+# 本地工具缓存（代码索引等）
+.codegraph/
+.serena/
 
 # 备份与临时文件
 .DS_Store

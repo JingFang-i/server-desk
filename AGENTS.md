@@ -23,7 +23,7 @@ apps/desktop/             # Tauri 主应用
   ├─ src-tauri/src/       # Rust 核心逻辑（见下「关键模块」）
   └─ scripts/             # check_vue_imports.py（Vue 导入检查）
 apps/mcp-sidecar/         # stdio MCP Server（AI 工具入口，当前单文件 main.rs）
-docs/                     # 方案与各里程碑验收文档（plan.md、m1~m5、r1-r5、release.md）
+docs/                     # 方案与各里程碑验收文档（plan.md、m1~m5、r1-r6、release.md）
 .github/workflows/        # release.yml（发布 CI）
 ```
 
@@ -31,10 +31,12 @@ docs/                     # 方案与各里程碑验收文档（plan.md、m1~m5�
 
 | 模块 | 职责 | 改动须知 |
 |------|------|---------|
-| `store.rs` | SQLite 资产存储 | 凭据字段必须密文落盘，禁止存明文 |
+| `store.rs` | SQLite 资产存储（含审计表与增量迁移） | 凭据字段必须密文落盘，禁止存明文；审计新增列必须做旧库迁移 |
+| `text.rs` | 审计/审批/通知共用的文本截断与摘要预算 | 新增摘要必须用这里的 `truncate/summary`，不要另写一份 |
 | `crypto.rs` / `vault.rs` | AES-256-GCM 加密；主密码保险库（Argon2 + OS Keychain + 自动锁） | 加密逻辑改动需重新评估备份兼容性 |
 | `guard.rs` | AI 安全管线核心（泄露防护/黑名单拦截/审批/审计/脱敏，七层） | **新增任何 MCP 能力必须先过这里** |
 | `approvals.rs` | 高危命令人工审批流（120s 超时自动拒绝） | |
+| `notify.rs` | 审批到达提醒：系统通知 + 声音 + 程序坞/任务栏注意力 | 只接收 `register_approval` 产出的脱敏摘要，禁止自行拼原始命令 |
 | `ssh.rs` | SSH 连接/保活/重连/命令执行（russh） | |
 | `observe.rs` / `ops.rs` | 观测五件套与文件操作（R1/R2） | 输出统一脱敏、限行数/限大小 |
 | `backup.rs` / `fbackups.rs` | 加密备份导出/恢复；AI 写文件前的自动备份与回滚 | |

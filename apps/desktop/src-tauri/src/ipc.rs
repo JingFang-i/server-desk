@@ -126,8 +126,8 @@ async fn handle_conn(
 
     let req: IpcRequest =
         serde_json::from_slice(&body).map_err(|e| format!("请求体解析失败: {e}"))?;
-    ops::set_session(&req.session);
-    let resp = match handle_tool(&state, &req.session, &req.tool, req.args).await {
+    // 会话 id 作为 task-local 进入本次请求：并发请求各自归因，不会互相覆盖
+    let resp = match ops::with_session(req.session.clone(), handle_tool(&state, &req.tool, req.args)).await {
         Ok(data) => IpcResponse::ok(data),
         Err(e) => IpcResponse::err(e),
     };
@@ -150,7 +150,6 @@ fn tool_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, Strin
 /// MCP 工具实现：全部经主应用安全管线（guard + 审批 + 审计 + 脱敏）。
 async fn handle_tool(
     state: &Arc<AppState>,
-    session: &str,
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -188,7 +187,7 @@ async fn handle_tool(
                     })
                 })
                 .collect();
-            ops::audit(state, "ai", None, "mcp_list_servers", "列出服务器", "ok");
+            ops::audit(state, "ai", None, shared::action::MCP_LIST_SERVERS, "列出服务器", "ok");
             Ok(serde_json::json!({ "servers": servers }))
         }
         "exec_command" => {
@@ -214,9 +213,14 @@ async fn handle_tool(
                        echo '=== mem ==='; free -m 2>/dev/null || vm_stat 2>/dev/null; echo; \
                        echo '=== disk(/) ==='; df -h / 2>/dev/null; echo; \
                        echo '=== load ==='; cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null";
-            let r = ops::run_command(state, server, cmd, 30, "ai").await?;
-            ops::audit(state, "ai", Some(server), "mcp_server_status", "状态探查", "ok");
-            Ok(serde_json::json!({ "server": server, "report": r.stdout, "exitCode": r.exit_code }))
+            let r = ops::run_fixed_template(state, server, shared::action::MCP_SERVER_STATUS, cmd, 30).await?;
+            Ok(serde_json::json!({
+                "server": server,
+                "report": r.stdout,
+                "exitCode": r.exit_code,
+                "truncated": r.truncated,
+                "timedOut": r.timed_out,
+            }))
         }
         "read_file" => {
             let server = args
@@ -328,8 +332,38 @@ async fn handle_tool(
             }))
         }
         "list_file_backups" => {
-            let server = args.get("server").and_then(|v| v.as_str());
-            let items = crate::fbackups::list(&state.dir, server);
+            // 红线 4：每台服务器独立 allow_ai。备份注册表里有远端路径与大小，
+            // 未开放 AI 的服务器不得被枚举。
+            let allowed: std::collections::HashSet<String> = state
+                .store
+                .list()?
+                .into_iter()
+                .filter(|r| r.allow_ai)
+                .map(|r| r.id)
+                .collect();
+            let filter = match args.get("server").and_then(|v| v.as_str()) {
+                Some(reference) => {
+                    let cfg = ops::load_server_config(state, reference)?;
+                    if !cfg.allow_ai {
+                        ops::audit(
+                            state,
+                            "ai",
+                            Some(&cfg.id),
+                            shared::action::MCP_LIST_FILE_BACKUPS,
+                            reference,
+                            "blocked:not_allow_ai",
+                        );
+                        return Err(format!("服务器「{}」未开放 AI 操作（allowAi=false）", cfg.name));
+                    }
+                    Some(cfg.id)
+                }
+                None => None,
+            };
+            let items: Vec<_> = crate::fbackups::list(&state.dir, filter.as_deref())
+                .into_iter()
+                .filter(|m| allowed.contains(&m.server_id))
+                .collect();
+            ops::audit(state, "ai", None, shared::action::MCP_LIST_FILE_BACKUPS, "列出写前备份", "ok");
             Ok(serde_json::to_value(&items).map_err(|e| e.to_string())?)
         }
         "exec_batch" => {

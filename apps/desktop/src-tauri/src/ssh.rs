@@ -4,6 +4,7 @@
 use crate::store::Store;
 use tokio::io::{AsyncReadExt as FuturesRead, AsyncWriteExt as FuturesWrite};
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use russh::client::Handle;
 use russh::Disconnect;
 use shared::AuthMethod;
@@ -38,6 +39,8 @@ pub struct ExecResult {
     pub stderr: String,
     pub exit_code: Option<u32>,
     pub truncated: bool,
+    /// 读取输出超时（远端可能仍在执行）：调用方必须能与「正常结束」区分开。
+    pub timed_out: bool,
 }
 
 /// 连接参数（凭据在调用点解密后构造，不落盘、不常驻）。
@@ -332,6 +335,53 @@ impl SshPool {
         }
     }
 
+    /// 真正的追加语义：以 APPEND 打开（不 truncate、不创建），审批期间别人写入的内容不会被覆盖。
+    pub async fn sftp_append_file(
+        &self,
+        store: &Arc<Store>,
+        server_id: &str,
+        p: &ConnParams,
+        remote_path: &str,
+        content: &[u8],
+    ) -> Result<u64, String> {
+        let mut session = self.acquire_session(store, server_id, p).await?;
+        match Self::sftp_append_bytes(&mut session, remote_path, content).await {
+            Ok(n) => {
+                self.release_session(server_id, session).await;
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn sftp_append_bytes(
+        session: &mut Handle<HostKeyVerifier>,
+        remote_path: &str,
+        data: &[u8],
+    ) -> Result<u64, String> {
+        let sftp = Self::open_sftp(session).await?;
+        // 不带 CREATE：文件不存在直接报错（append 只对已有文件；新建走 write_file）
+        let mut file = sftp
+            .open_with_flags(
+                remote_path,
+                OpenFlags::WRITE | OpenFlags::APPEND,
+            )
+            .await
+            .map_err(|e| format!("远程文件不存在或不可写：{e}"))?;
+        let mut off = 0usize;
+        while off < data.len() {
+            let end = (off + 32768).min(data.len());
+            FuturesWrite::write_all(&mut file, &data[off..end])
+                .await
+                .map_err(|e| format!("追加远程文件失败：{e}"))?;
+            off = end;
+        }
+        FuturesWrite::flush(&mut file)
+            .await
+            .map_err(|e| format!("刷新远程文件失败：{e}"))?;
+        Ok(data.len() as u64)
+    }
+
     /// 读远程文件到内存，cap 为大小上限；返回 (数据, 完整大小, 是否截断)。
     async fn sftp_read_bytes(
         session: &mut Handle<HostKeyVerifier>,
@@ -476,42 +526,69 @@ impl SshPool {
             .await
             .map_err(|e| format!("命令下发失败：{e}"))?;
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        // 用字节缓冲累积，边收边限长：不会先把整段输出读进内存再截断。
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
         let mut code: Option<u32> = None;
-
-        let _ = tokio::time::timeout(timeout, async {
-            loop {
-                match channel.wait().await {
-                    Some(russh::ChannelMsg::Data { data }) => {
-                        stdout.push_str(&String::from_utf8_lossy(data.as_ref()));
-                    }
-                    Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
-                        stderr.push_str(&String::from_utf8_lossy(data.as_ref()));
-                    }
-                    Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
-                        code = Some(exit_status);
-                    }
-                    Some(russh::ChannelMsg::Eof) => {}
-                    Some(russh::ChannelMsg::Close) => break,
-                    None => break,
-                    _ => {}
-                }
-            }
-        })
-        .await;
-
         let mut truncated = false;
-        if stdout.len() > MAX_OUTPUT {
-            stdout.truncate(MAX_OUTPUT);
-            truncated = true;
-        }
-        if stderr.len() > MAX_OUTPUT {
-            stderr.truncate(MAX_OUTPUT);
-            truncated = true;
-        }
-        Ok(ExecResult { stdout, stderr, exit_code: code, truncated })
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let timed_out = {
+            let read = async {
+                loop {
+                    match channel.wait().await {
+                        Some(russh::ChannelMsg::Data { data }) => {
+                            push_capped(&mut stdout, data.as_ref(), &mut truncated);
+                            if truncated {
+                                break;
+                            }
+                        }
+                        Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                            push_capped(&mut stderr, data.as_ref(), &mut truncated);
+                            if truncated {
+                                break;
+                            }
+                        }
+                        Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                            code = Some(exit_status);
+                        }
+                        Some(russh::ChannelMsg::Eof) => {}
+                        Some(russh::ChannelMsg::Close) | None => break,
+                        _ => {}
+                    }
+                }
+            };
+            tokio::time::timeout_at(deadline, read).await.is_err()
+        };
+
+        Ok(ExecResult {
+            stdout: bytes_to_string(stdout),
+            stderr: bytes_to_string(stderr),
+            exit_code: code,
+            truncated,
+            timed_out,
+        })
     }
+}
+
+/// 追加一段输出，超过上限即标记截断（不再继续累积）。
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], truncated: &mut bool) {
+    let room = MAX_OUTPUT.saturating_sub(buf.len());
+    if room == 0 {
+        *truncated = true;
+        return;
+    }
+    if chunk.len() > room {
+        buf.extend_from_slice(&chunk[..room]);
+        *truncated = true;
+    } else {
+        buf.extend_from_slice(chunk);
+    }
+}
+
+/// 字节 → 字符串：按 lossy 解码，截断处即使切断多字节字符也不会 panic。
+fn bytes_to_string(buf: Vec<u8>) -> String {
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]

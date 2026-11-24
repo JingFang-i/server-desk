@@ -5,20 +5,13 @@
 use crate::guard::GuardRules;
 use crate::ops;
 use crate::state::AppState;
+use crate::text::{truncate, ERROR_MAX};
 use crate::vault::VaultStatus;
 use chrono::Utc;
 use shared::{AuthMethod, ServerConfig, TestResult};
 use std::sync::Arc;
 use tauri::{Emitter, State};
 use uuid::Uuid;
-
-pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
 
 fn now() -> String {
     Utc::now().to_rfc3339()
@@ -183,7 +176,7 @@ pub fn list_servers(state: State<'_, Arc<AppState>>) -> Result<ListServersResult
 }
 
 #[tauri::command]
-pub fn save_server(
+pub async fn save_server(
     state: State<'_, Arc<AppState>>,
     input: SaveServerInput,
 ) -> Result<ServerConfig, String> {
@@ -239,6 +232,9 @@ pub fn save_server(
         if !updated {
             return Err("服务器不存在或已被删除".into());
         }
+        // 主机/端口/用户/凭据变更后，旧 SSH 会话必须淘汰：连接池按 server id 复用，
+        // 不淘汰会把后续命令发往旧主机，或继续以旧身份执行（审计里还显示新名字）。
+        let _ = state.ssh.disconnect(&row.id).await;
     }
     ops::audit(
         &state,
@@ -253,12 +249,19 @@ pub fn save_server(
 
 #[tauri::command]
 pub async fn delete_server(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    // 先取名称快照：删除后无法再按 id 回查，审计仍要能显示具体服务器名
+    let name = state.store.get(&id)?.map(|r| r.name).unwrap_or_default();
     let deleted = state.store.delete(&id)?;
     if !deleted {
         return Err("服务器不存在或已被删除".into());
     }
     let _ = state.ssh.disconnect(&id).await;
-    ops::audit(&state, "user", Some(&id), "delete_server", "删除服务器", "ok");
+    let detail = if name.is_empty() {
+        "删除服务器".to_string()
+    } else {
+        format!("删除服务器「{name}」")
+    };
+    ops::audit_named(&state, "user", Some(&id), &name, "delete_server", &detail, "ok");
     Ok(())
 }
 
@@ -327,7 +330,7 @@ pub async fn ssh_test(state: State<'_, Arc<AppState>>, server_id: String) -> Res
                 Some(&server_id),
                 "ssh_test",
                 "SSH 认证测试",
-                &truncate(&e, 300),
+                &truncate(&e, ERROR_MAX),
             );
             Ok(TestResult { ok: false, latency_ms: Some(latency), message: e })
         }
@@ -398,12 +401,52 @@ pub fn guard_set_rules(
     state: State<'_, Arc<AppState>>,
     rules: GuardRules,
 ) -> Result<crate::guard::GuardInfo, String> {
+    // 安全策略是整表覆盖：先取旧值，改完把差异写进审计，否则「谁在什么时候放开了什么」
+    // 事后完全查不到（红线 5 要求逐次可追溯）。
+    let before = state.guard.info();
     state
         .guard
         .set_rules(&state.store, rules)
         .map_err(|e| e.to_string())?;
-    ops::audit(&state, "user", None, "guard_set_rules", "更新安全规则", "ok");
-    Ok(state.guard.info())
+    let after = state.guard.info();
+    let detail = summarize_rule_change(&before, &after);
+    ops::audit(&state, "user", None, "guard_set_rules", &detail, "ok");
+    Ok(after)
+}
+
+/// 把安全规则的前后差异压成一条可审计摘要（新增/删除逐条列出，其余按开关变化）。
+fn summarize_rule_change(before: &crate::guard::GuardInfo, after: &crate::guard::GuardInfo) -> String {
+    fn diff(name: &str, a: &[String], b: &[String], out: &mut Vec<String>) {
+        let added: Vec<&str> = b.iter().map(|s| s.as_str()).filter(|x| !a.iter().any(|y| y == x)).collect();
+        let removed: Vec<&str> = a.iter().map(|s| s.as_str()).filter(|x| !b.iter().any(|y| y == x)).collect();
+        if !added.is_empty() {
+            out.push(format!("{name}+[{}]", added.join(",")));
+        }
+        if !removed.is_empty() {
+            out.push(format!("{name}-[{}]", removed.join(",")));
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    diff("deny", &before.deny, &after.deny, &mut parts);
+    diff("approval", &before.approval, &after.approval, &mut parts);
+    diff("whitelist", &before.whitelist, &after.whitelist, &mut parts);
+    if before.whitelist_mode != after.whitelist_mode {
+        parts.push(format!("whitelist_mode={}", after.whitelist_mode));
+    }
+    if before.readonly != after.readonly {
+        parts.push(format!("readonly={}", after.readonly));
+    }
+    if before.rate_per_min != after.rate_per_min {
+        parts.push(format!("rate={}→{}", before.rate_per_min, after.rate_per_min));
+    }
+    if before.strict_groups != after.strict_groups {
+        parts.push(format!("strict_groups=[{}]", after.strict_groups.join(",")));
+    }
+    if parts.is_empty() {
+        "更新安全规则（无变化）".to_string()
+    } else {
+        truncate(&format!("更新安全规则：{}", parts.join(" ")), 480)
+    }
 }
 
 #[tauri::command]
@@ -419,7 +462,7 @@ pub fn mcp_set_enabled(
         &state,
         "user",
         None,
-        "mcp_set_enabled",
+        shared::action::MCP_SET_ENABLED,
         &format!("AI 接入 {}", if enabled { "开启" } else { "关闭" }),
         "ok",
     );
@@ -453,8 +496,25 @@ pub fn audit_list(
     state: State<'_, Arc<AppState>>,
     limit: Option<i64>,
     source: Option<String>,
+    session: Option<String>,
 ) -> Result<Vec<crate::store::AuditEntry>, String> {
-    state.store.audit_list(limit.unwrap_or(200), source.as_deref())
+    state
+        .store
+        .audit_list(limit.unwrap_or(200), source.as_deref(), session.as_deref())
+}
+
+/// 审计页「会话」筛选的下拉数据（按最近活动倒序）。
+#[tauri::command]
+pub fn audit_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    state.store.audit_sessions(100)
+}
+
+/// 审计落库失败次数：> 0 时界面必须提示（红线 5「逐次审计」不允许静默丢失）。
+#[tauri::command]
+pub fn audit_failures(state: State<'_, Arc<AppState>>) -> u64 {
+    state
+        .audit_failures
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ---------- MCP 接入信息 ----------
@@ -553,8 +613,9 @@ pub async fn file_backup_restore(
     if !state.vault.is_unlocked() {
         return Err("保险库已锁定，请先解锁".into());
     }
+    let dek = state.vault.dek().map_err(|e| e.to_string())?;
     let (meta, content) =
-        crate::fbackups::load(&state.dir, &backup_id).map_err(|e| e.to_string())?;
+        crate::fbackups::load_encrypted(&state.dir, &dek, &backup_id).map_err(|e| e.to_string())?;
     if meta.server_id != server_id {
         return Err("备份不属于该服务器".into());
     }
@@ -578,6 +639,12 @@ pub fn read_key_file(path: String) -> Result<String, String> {
     let p = std::path::PathBuf::from(&path);
     if !p.is_file() {
         return Err("所选路径不是文件".into());
+    }
+    // 私钥文件都很小：限制体积，避免这条命令被当成任意大文件读取通道
+    const MAX_KEY_FILE: u64 = 64 * 1024;
+    let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
+    if size > MAX_KEY_FILE {
+        return Err(format!("私钥文件超过 {}KB，请确认选择了正确的文件", MAX_KEY_FILE / 1024));
     }
     let content = std::fs::read_to_string(&p).map_err(|e| format!("读取私钥文件失败: {e}"))?;
     let trimmed = content.trim();
@@ -646,8 +713,13 @@ pub fn backup_restore(
     password: String,
     mode: String,
 ) -> Result<crate::backup::RestoreResult, String> {
+    // 恢复会写资产表：必须处于解锁状态，才能拿到当前 DEK 校验备份凭据
+    if !state.vault.is_unlocked() {
+        return Err("保险库已锁定，请先解锁再恢复备份".into());
+    }
+    let dek = state.vault.dek().map_err(|e| e.to_string())?;
     let payload = crate::backup::read_payload(std::path::Path::new(&path), &password)?;
-    let res = crate::backup::restore_payload(&state.store, &payload, &mode)?;
+    let res = crate::backup::restore_payload(&state.store, &payload, &mode, &dek)?;
     ops::audit(
         &state,
         "user",

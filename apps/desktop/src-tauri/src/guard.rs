@@ -107,7 +107,108 @@ impl Default for GuardRules {
 }
 
 /// 只读模式下被拦截的写入类命令特征（合并正则，(?i) 由构造处添加）。
-const WRITEISH_RE: &str = r"(>|>>|\btee\b|\bsed\b[^|;]*-i|\brm\b|\bmv\b|\bchmod\b|\bchown\b|\bdd\b|\bmkfs\b|\btruncate\b|\bshutdown\b|\breboot\b|\bkill\b|\bkillall\b|\buseradd\b|\buserdel\b|\bcrontab\b|\bapt\b|\byum\b|\bdnf\b|\bpip\b|\bnpm\b|\btouch\b|\bmkdir\b|\brsync\b|\bscp\b|\bsystemctl\s+(start|restart|stop|try-restart|reload-or-restart|disable|enable)\b)";
+///
+/// 判定前会先剥掉「写到 /dev/null」「合并 stderr」这类重定向（见 [`strip_null_redirections`]），
+/// 否则只读模板里的 `2>/dev/null` 会被 `>` 误判成写入。
+/// 每个命令词都要求位于命令起始或分隔符之后，避免 `ls ln` 这类参数被误伤。
+const WRITEISH_RE: &str = concat!(
+    // 重定向（已排除 /dev/null）
+    r"(?:>>|>)",
+    // 写文件 / 改权限 / 改系统
+    r"|(?:^|[;&|(]\s*|\s)(?:cp|ln|install|mv|rm|rmdir|mkdir|touch|mkfifo|mknod|dd|truncate|shred|wipefs|chmod|chown|chattr|setfacl|rsync|scp|sftp|patch)\b",
+    // 就地修改类
+    r"|(?:^|[;&|(]\s*|\s)sed\b[^|;]*-i",
+    r"|(?:^|[;&|(]\s*|\s)perl\b[^|;]*-i",
+    r"|(?:^|[;&|(]\s*|\s)find\b[^|;]*-(?:delete|exec)\b",
+    r"|(?:^|[;&|(]\s*|\s)(?:python[0-9.]*|node|ruby|php)\s+-[ce]\b",
+    // 服务与包管理
+    r"|(?:^|[;&|(]\s*|\s)systemctl\s+(?:start|restart|stop|try-restart|reload|reload-or-restart|enable|disable|mask|unmask)\b",
+    r"|(?:^|[;&|(]\s*|\s)service\s+\S+\s+\S+",
+    r"|(?:^|[;&|(]\s*|\s)apt(?:-get)?\s+(?:install|remove|purge|upgrade|dist-upgrade|autoremove)\b",
+    r"|(?:^|[;&|(]\s*|\s)(?:yum|dnf|pacman|zypper)\s+(?:install|remove|erase|update|upgrade)\b",
+    r"|(?:^|[;&|(]\s*|\s)pip[0-9.]*\s+install\b",
+    r"|(?:^|[;&|(]\s*|\s)npm\s+(?:install|i|uninstall|remove|ci)\b",
+    // 关机 / 杀进程 / 账号
+    r"|(?:^|[;&|(]\s*|\s)(?:shutdown|reboot|halt|poweroff)\b",
+    r"|(?:^|[;&|(]\s*|\s)init\s+[06]\b",
+    r"|(?:^|[;&|(]\s*|\s)(?:killall|pkill)\b",
+    r"|(?:^|[;&|(]\s*|\s)kill\s+-",
+    r"|(?:^|[;&|(]\s*|\s)(?:useradd|userdel|usermod|groupadd|groupdel|passwd)\b",
+    r"|(?:^|[;&|(]\s*|\s)crontab\b",
+);
+
+/// 剥掉不产生写入的重定向：`2>/dev/null`、`>/dev/null`、`2>&1`、`&>/dev/null`。
+fn strip_null_redirections(cmd: &str) -> String {
+    use std::sync::OnceLock;
+    static NULL_REDIRECT: OnceLock<Regex> = OnceLock::new();
+    static MERGE_STDERR: OnceLock<Regex> = OnceLock::new();
+    let null = NULL_REDIRECT
+        .get_or_init(|| Regex::new(r"(?:\d?>>?|&>)\s*/dev/null").expect("null redirect regex"));
+    let merge = MERGE_STDERR
+        .get_or_init(|| Regex::new(r"\d?>&\d+").expect("stderr merge regex"));
+    let s = null.replace_all(cmd, " ");
+    merge.replace_all(&s, " ").to_string()
+}
+
+/// 按 shell 分隔符切分子命令（`;`、`&&`、`||`、单/双管道、换行）。
+fn split_segments(cmd: &str) -> Vec<&str> {
+    use std::sync::OnceLock;
+    static SEG: OnceLock<Regex> = OnceLock::new();
+    let re = SEG.get_or_init(|| Regex::new(r"\s*(?:\|\||&&|[;|\n])\s*").expect("segment regex"));
+    re.split(cmd).map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
+/// 受限模式（只读 / 白名单）下无法安全判定的 shell 构造：命令替换与进程替换。
+fn has_substitution(cmd: &str) -> bool {
+    cmd.contains("$(") || cmd.contains("<(") || cmd.contains(">(") || cmd.contains('`')
+}
+
+/// 规则匹配：普通规则按子串匹配；以 `/` 结尾的规则（如 `rm -rf /`）要求其后是边界，
+/// 否则 `rm -rf /tmp/build` 会被误判成「删根」而直接硬拒（它本该走审批）。
+fn matches_rule(haystack_lower: &str, rule: &str) -> bool {
+    let rule = rule.trim().to_lowercase();
+    if rule.is_empty() {
+        return false;
+    }
+    if !rule.ends_with('/') {
+        return haystack_lower.contains(&rule);
+    }
+    let mut from = 0;
+    while let Some(i) = haystack_lower[from..].find(&rule) {
+        let end = from + i + rule.len();
+        let boundary = haystack_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, ' ' | '\t' | '\n' | '*' | ';' | '&' | '|' | ')' | '>'));
+        if boundary {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// 纯标签输出（`echo '=== uptime ==='`）：白名单模式下放行，避免把固定模板里的
+/// 分组标题当成未授权命令。
+fn is_echo_only(segment: &str) -> bool {
+    segment.starts_with("echo ")
+        && !segment.contains('>')
+        && !segment.contains('`')
+        && !segment.contains("$(")
+}
+
+/// 凭据泄露防护：命令里出现读凭据的动作即硬拒绝（AI 与真实模板都过这一关）。
+fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
+    for re in &g.leak.cmd_blockers {
+        if re.is_match(command) {
+            return Some(Decision::Blocked(format!(
+                "命中凭据泄露防护规则（{}）——AI 不得读取或回显敏感信息",
+                re.as_str()
+            )));
+        }
+    }
+    None
+}
 
 /// 凭据泄露防护（固定规则，不开放编辑）：AI 命令包含即硬拒绝，输出命中即脱敏。
 struct LeakGuard {
@@ -140,10 +241,26 @@ impl LeakGuard {
                     .expect("pem regex"),
                 "[REDACTED-PRIVATE-KEY]",
             ),
+            // URL 内嵌账号口令：https://user:pass@host
+            (
+                Regex::new(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@").expect("url cred regex"),
+                "$1[REDACTED]@",
+            ),
+            // 键值形态：password=hunter2 / token: xxx / api_key=...
             (
                 Regex::new(r"(?i)\b(pass(?:word)?|pwd|secret|api[_-]?key|access[_-]?key|token|credential)s?\b\s*[=:]\s*\S+")
                     .expect("cred regex"),
                 "$1=[REDACTED]",
+            ),
+            // 短选项口令：mysql -pHunter2 / -p 'x' / --password xxx / --token=xxx
+            (
+                Regex::new(r"(?i)(\s-p)(?:=|\s+)?['\x22]?[^\s;&|'\x22]{2,}").expect("short pass regex"),
+                "$1 [REDACTED]",
+            ),
+            (
+                Regex::new(r"(?i)(--(?:password|passwd|pass|token|secret|api[-_]?key)(?:=|\s+))['\x22]?[^\s;&|'\x22]+")
+                    .expect("long pass regex"),
+                "$1[REDACTED]",
             ),
             (Regex::new(r"AKIA[0-9A-Z]{16}").expect("aws regex"), "[REDACTED-AWS-KEY]"),
             (
@@ -355,45 +472,83 @@ impl Guard {
     }
 
     /// 对 AI 命令做安全判定：泄露防护 → 只读模式 → 硬黑名单 → 白名单模式 → 审批名单 → 放行。
+    ///
+    /// 受限模式（只读 / 白名单）按**子命令**分别判定：`uptime; cp /etc/passwd /tmp/x`
+    /// 不会因为前半段只读就整体放行；同时拒绝命令替换（`$(...)`、反引号），
+    /// 因为那种构造无法在文本层判定真实动作。
     pub fn evaluate(&self, command: &str) -> Decision {
         let g = self.read();
+        if let Some(blocked) = leak_block(&g, command) {
+            return blocked;
+        }
         let lower = command.to_lowercase();
-        for re in &g.leak.cmd_blockers {
-            if re.is_match(command) {
-                return Decision::Blocked(format!(
-                    "命中凭据泄露防护规则（{}）——AI 不得读取或回显敏感信息",
-                    re.as_str()
-                ));
-            }
+        let normalized = strip_null_redirections(command);
+        let restricted = g.rules.readonly || g.rules.whitelist_mode;
+        if restricted && has_substitution(command) {
+            return Decision::Blocked(
+                "受限模式已开启：命令包含命令替换/进程替换，无法安全判定".to_string(),
+            );
         }
         // 只读模式：写入类命令直接拒（不提供审批逃生口）
-        if g.rules.readonly && g.leak.writeish.is_match(command) {
+        if g.rules.readonly && g.leak.writeish.is_match(&normalized) {
             return Decision::Blocked(
                 "只读模式已开启：AI 不得执行写入类命令".to_string(),
             );
         }
         for p in &g.rules.deny {
-            if !p.trim().is_empty() && lower.contains(&p.trim().to_lowercase()) {
-                return Decision::Blocked(format!("命中高危命令黑名单「{p}」"));
+            if matches_rule(&lower, p) {
+                return Decision::Blocked(format!("命中高危命令黑名单「{}」", p.trim()));
             }
         }
-        // 白名单模式：未命中任何白名单条目 → 硬拒绝（无审批逃生口）
+        // 白名单模式：每一条子命令都必须命中白名单（纯 echo 标签除外）
         if g.rules.whitelist_mode {
-            let listed = g
-                .rules
-                .whitelist
-                .iter()
-                .filter(|w| !w.trim().is_empty())
-                .any(|w| lower.contains(&w.trim().to_lowercase()));
-            if !listed {
-                return Decision::Blocked(
-                    "白名单模式已开启：命令不在允许清单内".to_string(),
-                );
+            for seg in split_segments(&normalized) {
+                if is_echo_only(seg) {
+                    continue;
+                }
+                let seg_lower = seg.to_lowercase();
+                let listed = g
+                    .rules
+                    .whitelist
+                    .iter()
+                    .filter(|w| !w.trim().is_empty())
+                    .any(|w| seg_lower.contains(&w.trim().to_lowercase()));
+                if !listed {
+                    return Decision::Blocked(format!(
+                        "白名单模式已开启：子命令「{}」不在允许清单内",
+                        crate::text::truncate(seg, 80)
+                    ));
+                }
             }
         }
         for p in &g.rules.approval {
-            if !p.trim().is_empty() && lower.contains(&p.trim().to_lowercase()) {
-                return Decision::NeedsApproval(format!("命中需审批规则「{p}」"));
+            if matches_rule(&lower, p) {
+                return Decision::NeedsApproval(format!("命中需审批规则「{}」", p.trim()));
+            }
+        }
+        Decision::Allow
+    }
+
+    /// 固定安全模板（观测五件套 / 状态探查）的判定。
+    ///
+    /// 这类命令不是 AI 自由输入的，而是应用按固定模板生成、参数只经 `sh_quote` 注入，
+    /// 因此照常过泄露防护、硬黑名单与只读写入检查，但不套用白名单与审批表——
+    /// 否则白名单模式下「列出目录」这类只读能力会被整块封死，而它们本就不是任意命令。
+    pub fn evaluate_fixed_template(&self, command: &str) -> Decision {
+        let g = self.read();
+        if let Some(blocked) = leak_block(&g, command) {
+            return blocked;
+        }
+        let normalized = strip_null_redirections(command);
+        if g.rules.readonly && g.leak.writeish.is_match(&normalized) {
+            return Decision::Blocked(
+                "只读模式已开启：AI 不得执行写入类命令".to_string(),
+            );
+        }
+        let lower = command.to_lowercase();
+        for p in &g.rules.deny {
+            if matches_rule(&lower, p) {
+                return Decision::Blocked(format!("命中高危命令黑名单「{}」", p.trim()));
             }
         }
         Decision::Allow
@@ -633,5 +788,73 @@ mod r4_tests {
         assert!(g.is_strict_group(Some(" PROD ")));
         assert!(!g.is_strict_group(Some("dev")));
         assert!(!g.is_strict_group(None));
+    }
+
+    #[test]
+    fn readonly_ignores_dev_null_redirection() {
+        let mut r = GuardRules::default();
+        r.readonly = true;
+        let g = guard_with(r);
+        // server_status 这类只读模板含 2>/dev/null，不该被判成写入
+        let status = "echo '=== cpu ==='; nproc 2>/dev/null; \
+                      free -m 2>/dev/null || vm_stat 2>/dev/null; df -h / 2>/dev/null";
+        assert!(matches!(g.evaluate_fixed_template(status), Decision::Allow), "{status}");
+        assert!(matches!(g.evaluate(status), Decision::Allow), "{status}");
+        // 真写入仍然拦：cp / 命令替换 / find -delete / 重定向
+        assert!(matches!(g.evaluate("uptime && cp /etc/passwd /tmp/x"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("find /tmp -name '*.log' -delete"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("uptime > /tmp/out"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("uptime $(id)"), Decision::Blocked(_)));
+    }
+
+    #[test]
+    fn deny_rule_boundary_avoids_false_positive() {
+        let g = guard_with(GuardRules::default());
+        // 删根：硬拒
+        assert!(matches!(g.evaluate("rm -rf /"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("rm -rf /*"), Decision::Blocked(_)));
+        // 删临时目录：不该硬拒，但必须走审批
+        assert!(matches!(g.evaluate("rm -rf /tmp/build"), Decision::NeedsApproval(_)));
+    }
+
+    #[test]
+    fn whitelist_checks_every_segment() {
+        let mut r = GuardRules::default();
+        r.whitelist_mode = true;
+        r.whitelist = vec!["uptime".into()];
+        let g = guard_with(r);
+        assert!(matches!(g.evaluate("uptime"), Decision::Allow));
+        // 复合命令里夹带未授权动作 → 拒绝
+        assert!(matches!(g.evaluate("uptime; cp /etc/passwd /tmp/x"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("uptime && nc -l 4444"), Decision::Blocked(_)));
+        // 纯标签输出仍放行
+        assert!(matches!(g.evaluate("echo '--- uptime ---'; uptime"), Decision::Allow));
+    }
+
+    #[test]
+    fn fixed_template_bypasses_whitelist_but_not_leak_guard() {
+        let mut r = GuardRules::default();
+        r.whitelist_mode = true;
+        r.whitelist = vec!["uptime".into()];
+        let g = guard_with(r);
+        let tpl = "ls -lah '/var/log' 2>&1 | head -200";
+        assert!(matches!(g.evaluate_fixed_template(tpl), Decision::Allow));
+        assert!(matches!(g.evaluate(tpl), Decision::Blocked(_)), "自由命令仍受白名单约束");
+        // 模板也不得读凭据
+        assert!(matches!(
+            g.evaluate_fixed_template("cat /root/.ssh/id_rsa"),
+            Decision::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn sanitize_masks_short_and_url_credentials() {
+        let g = guard_with(GuardRules::default());
+        let out = g.sanitize("mysql -uroot -pHunter2 -e 'show databases'");
+        assert!(!out.contains("Hunter2"), "{out}");
+        let out = g.sanitize("git clone https://bob:s3cr3t@example.com/r.git");
+        assert!(!out.contains("s3cr3t") && !out.contains("bob"), "{out}");
+        let out = g.sanitize("app --password=hunter2 --token abcdef");
+        assert!(!out.contains("hunter2") && !out.contains("abcdef"), "{out}");
     }
 }

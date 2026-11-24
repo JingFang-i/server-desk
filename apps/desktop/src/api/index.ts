@@ -66,6 +66,8 @@ export interface ExecResult {
   stderr: string;
   exitCode: number | null;
   truncated: boolean;
+  /** 读取输出超时：远端可能仍在执行，stdout 只是部分输出 */
+  timedOut?: boolean;
 }
 
 export interface PendingApproval {
@@ -77,15 +79,54 @@ export interface PendingApproval {
   expiresAt: string;
 }
 
+/** 后端写入的审计动作（字面量）；未列出的值仍可透传（自定义/新增动作） */
+export type AuditAction =
+  | "mcp_exec_command"
+  | "mcp_exec_batch"
+  | "mcp_read_file"
+  | "mcp_write_file"
+  | "mcp_append_file"
+  | "mcp_upload_file"
+  | "mcp_download_file"
+  | "mcp_restore_file"
+  | "mcp_list_file_backups"
+  | "mcp_list_files"
+  | "mcp_tail_log"
+  | "mcp_log_search"
+  | "mcp_list_services"
+  | "mcp_port_check"
+  | "mcp_server_status"
+  | "mcp_approval_requested"
+  | "mcp_approval_granted"
+  | "ssh_exec"
+  | "sftp_read"
+  | "sftp_write"
+  | "sftp_upload"
+  | "sftp_download"
+  | "save_server"
+  | "delete_server"
+  | "backup_export"
+  | "backup_restore"
+  | "file_backup_restore"
+  | "guard_set_rules"
+  | "mcp_set_enabled"
+  | "vault_unlock"
+  | "rate_limited"
+  | "ssh_test";
+
 export interface AuditEntry {
   id: number;
   ts: string;
   source: string;
   serverId: string | null;
-  action: string;
+  /** 写入时的服务器名称快照；老记录可能为空，需回退显示 serverId */
+  serverName: string;
+  action: AuditAction | (string & {});
   detail: string;
   outcome: string;
   session: string;
+  /** 由后端 SQL 判定的成功标志（不再由前端猜 outcome 前缀） */
+  ok: boolean;
 }
 
 export interface FileBackupMeta {
@@ -94,6 +135,8 @@ export interface FileBackupMeta {
   path: string;
   sizeBytes: number;
   ts: string;
+  /** 内容是否用保险库密钥加密（旧备份为 false，读取时按明文处理） */
+  encrypted?: boolean;
 }
 
 export interface GuardInfo {
@@ -191,8 +234,10 @@ export const api = {
   approvalsPending: () => invoke<PendingApproval[]>("approvals_pending"),
   approvalDecide: (id: string, approve: boolean) =>
     invoke<void>("approval_decide", { id, approve }),
-  auditList: (limit?: number, source?: string) =>
-    invoke<AuditEntry[]>("audit_list", { limit, source }),
+  auditList: (limit?: number, source?: string, session?: string) =>
+    invoke<AuditEntry[]>("audit_list", { limit, source, session }),
+  auditSessions: () => invoke<string[]>("audit_sessions"),
+  auditFailures: () => invoke<number>("audit_failures"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
   // 备份与恢复
   backupInfo: () => invoke<BackupInfo>("backup_info"),

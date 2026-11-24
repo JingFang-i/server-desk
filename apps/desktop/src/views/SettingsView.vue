@@ -221,7 +221,8 @@ async function copy(text: string, label: string) {
           <div>只读模式</div>
           <div class="desc">
             开启后 AI 的一切写入操作被硬拒绝：文件写入/追加/上传/回滚全拒，
-            命令中含 rm/mv/chmod/systemctl restart 等写入特征也直接拒（无审批逃生口）。适合临时排查场景
+            命令按**子命令**逐段检查，含 rm/cp/ln/chmod/systemctl restart 等写入特征即拒（无审批逃生口）；
+            写到 /dev/null 的重定向不算写入，命令替换（$( )、反引号）在受限模式下直接拒。适合临时排查场景
           </div>
         </div>
         <n-switch v-model:value="readonly" />
@@ -238,7 +239,7 @@ async function copy(text: string, label: string) {
       <div class="row">
         <div class="label">
           <div>严格分组（全部审批）</div>
-          <div class="desc">这些分组的服务器上，AI 的所有命令（包括只读命令）都需要人工批准</div>
+          <div class="desc">这些分组的服务器上，AI 的所有命令（包括只读命令与观测五件套）都需要人工批准</div>
         </div>
         <n-select
           v-model:value="strictGroups"
@@ -257,7 +258,9 @@ async function copy(text: string, label: string) {
           <div>判定模式</div>
           <div class="desc">
             黑名单：默认——除黑名单/审批名单外都放行。
-            白名单：只放行命中白名单的命令，其余直接拒（生产环境推荐）
+            白名单：只放行命中白名单的子命令，其余直接拒（生产环境推荐）。
+            复合命令（;、&&、||、|）逐段匹配，任何一段未命中即整体拒绝；
+            观测五件套这类应用内置的只读模板不套用白名单
           </div>
         </div>
         <n-select v-model:value="modeValue" :options="modeOptions" style="width: 160px" />
@@ -265,7 +268,7 @@ async function copy(text: string, label: string) {
       <div v-if="whitelistMode" class="row" style="margin-bottom: 10px">
         <div class="label">
           <div>白名单条目</div>
-          <div class="desc">AI 命令命中任意一条即放行（子串匹配，每行一条）</div>
+          <div class="desc">子命令命中任意一条即放行（子串匹配，每行一条）</div>
         </div>
       </div>
       <textarea

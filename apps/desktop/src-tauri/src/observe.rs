@@ -57,7 +57,7 @@ pub fn build_port_check_cmd(port: u16) -> String {
 // ---------- 执行与审计 ----------
 
 fn cmd_digest(c: &str) -> String {
-    crate::commands::truncate(c, 200)
+    crate::text::truncate(c, crate::text::COMMAND_DIGEST_MAX)
 }
 
 async fn observe_exec(
@@ -67,6 +67,16 @@ async fn observe_exec(
     command: &str,
     timeout_secs: u64,
 ) -> Result<ExecResult, String> {
+    // 固定模板同样要过 guard（凭据泄露防护 / 硬黑名单 / 只读写入检查）：
+    // 之前这里直接 SSH，绕过了整条安全管线。
+    if let crate::guard::Decision::Blocked(reason) = state.guard.evaluate_fixed_template(command) {
+        audit(state, "ai", Some(&cfg.id), action, &cmd_digest(command), "blocked");
+        return Err(format!("已拦截：{reason}"));
+    }
+    // 严格分组：只读命令同样需要人工审批（设置页承诺「包括只读命令」）
+    if state.guard.is_strict_group(cfg.group.as_deref()) {
+        crate::ops::request_approval(state, cfg, command, "observe").await?;
+    }
     let res = state
         .ssh
         .exec(
@@ -84,9 +94,21 @@ async fn observe_exec(
             Some(&cfg.id),
             action,
             &cmd_digest(command),
-            &format!("exit={:?} bytes={}", r.exit_code, r.stdout.len()),
+            &format!(
+                "exit={:?} bytes={}{}",
+                r.exit_code,
+                r.stdout.len(),
+                if r.timed_out { " timed_out" } else { "" }
+            ),
         ),
-        Err(e) => audit(state, "ai", Some(&cfg.id), action, &cmd_digest(command), &crate::commands::truncate(e, 200)),
+        Err(e) => audit(
+            state,
+            "ai",
+            Some(&cfg.id),
+            action,
+            &cmd_digest(command),
+            &crate::text::truncate(e, crate::text::ERROR_MAX),
+        ),
     }
     match res {
         Ok(r) => Ok(ExecResult {
@@ -94,14 +116,23 @@ async fn observe_exec(
             stderr: state.guard.sanitize(&r.stderr),
             exit_code: r.exit_code,
             truncated: r.truncated,
+            timed_out: r.timed_out,
         }),
         Err(e) => Err(e),
     }
 }
 
-fn gate_path(state: &AppState, cfg: &shared::ServerConfig, action: &str, path: &str) -> Result<(), String> {
+async fn gate_path(
+    state: &AppState,
+    cfg: &shared::ServerConfig,
+    action: &str,
+    path: &str,
+) -> Result<(), String> {
     ai_gate(state, cfg, action, path)?;
-    if let crate::guard::Decision::Blocked(reason) = state.guard.evaluate_read_path(path) {
+    // 解析真实路径后再判定：符号链接别名不能把受保护文件带进来
+    if let crate::guard::Decision::Blocked(reason) =
+        crate::ops::evaluate_remote_read(state, cfg, path).await
+    {
         audit(state, "ai", Some(&cfg.id), action, path, "blocked");
         return Err(format!("已拦截：{reason}"));
     }
@@ -112,14 +143,14 @@ fn gate_path(state: &AppState, cfg: &shared::ServerConfig, action: &str, path: &
 
 pub async fn list_files(state: &AppState, server_ref: &str, path: &str) -> Result<ExecResult, String> {
     let cfg = load_server_config(state, server_ref)?;
-    gate_path(state, &cfg, "mcp_list_files", path)?;
-    observe_exec(state, &cfg, "mcp_list_files", &build_list_files_cmd(path), 30).await
+    gate_path(state, &cfg, shared::action::MCP_LIST_FILES, path).await?;
+    observe_exec(state, &cfg, shared::action::MCP_LIST_FILES, &build_list_files_cmd(path), 30).await
 }
 
 pub async fn tail_log(state: &AppState, server_ref: &str, path: &str, lines: u32) -> Result<ExecResult, String> {
     let cfg = load_server_config(state, server_ref)?;
-    gate_path(state, &cfg, "mcp_tail_log", path)?;
-    observe_exec(state, &cfg, "mcp_tail_log", &build_tail_log_cmd(path, lines), 30).await
+    gate_path(state, &cfg, shared::action::MCP_TAIL_LOG, path).await?;
+    observe_exec(state, &cfg, shared::action::MCP_TAIL_LOG, &build_tail_log_cmd(path, lines), 30).await
 }
 
 pub async fn log_search(
@@ -132,21 +163,21 @@ pub async fn log_search(
     context: u32,
 ) -> Result<ExecResult, String> {
     let cfg = load_server_config(state, server_ref)?;
-    gate_path(state, &cfg, "mcp_log_search", path)?;
+    gate_path(state, &cfg, shared::action::MCP_LOG_SEARCH, path).await?;
     let cmd = build_log_search_cmd(path, pattern, ignore_case, max_matches, context);
-    observe_exec(state, &cfg, "mcp_log_search", &cmd, 60).await
+    observe_exec(state, &cfg, shared::action::MCP_LOG_SEARCH, &cmd, 60).await
 }
 
 pub async fn list_services(state: &AppState, server_ref: &str) -> Result<ExecResult, String> {
     let cfg = load_server_config(state, server_ref)?;
-    ai_gate(state, &cfg, "mcp_list_services", "列出服务")?;
-    observe_exec(state, &cfg, "mcp_list_services", &build_list_services_cmd(), 30).await
+    ai_gate(state, &cfg, shared::action::MCP_LIST_SERVICES, "列出服务")?;
+    observe_exec(state, &cfg, shared::action::MCP_LIST_SERVICES, &build_list_services_cmd(), 30).await
 }
 
 pub async fn port_check(state: &AppState, server_ref: &str, port: u16) -> Result<ExecResult, String> {
     let cfg = load_server_config(state, server_ref)?;
-    ai_gate(state, &cfg, "mcp_port_check", &format!("port {port}"))?;
-    observe_exec(state, &cfg, "mcp_port_check", &build_port_check_cmd(port), 30).await
+    ai_gate(state, &cfg, shared::action::MCP_PORT_CHECK, &format!("port {port}"))?;
+    observe_exec(state, &cfg, shared::action::MCP_PORT_CHECK, &build_port_check_cmd(port), 30).await
 }
 
 #[cfg(test)]

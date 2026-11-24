@@ -116,6 +116,20 @@ fn rows_from_payload(payload: &BackupPayload) -> Result<Vec<ServerRow>, String> 
         .collect()
 }
 
+/// 校验备份中的凭据能否用当前 DEK 解开。
+fn verify_credentials(rows: &[ServerRow], dek: &[u8; crypto::KEY_LEN]) -> Result<(), String> {
+    for r in rows {
+        crypto::decrypt(dek, &r.secret_blob).map_err(|_| {
+            format!(
+                "备份中的凭据无法用当前保险库解密（可能来自另一台机器或另一个主密码）——\
+                 已拒绝恢复「{}」，数据库未改动",
+                r.name
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// 手动导出：口令加密写入指定路径。
 pub fn export_encrypted(store: &Store, path: &Path, password: &str) -> Result<ExportResult, String> {
     if password.chars().count() < 8 {
@@ -169,12 +183,19 @@ pub fn read_payload(path: &Path, password: &str) -> Result<BackupPayload, String
     Ok(payload)
 }
 
+/// 恢复：写库前先用**当前保险库 DEK** 试解全部凭据。
+///
+/// 备份里的 `secret_blob` 是用**导出方**的数据密钥加密的；两台机器各自初始化保险库时
+/// DEK 不同，原样写回会「报告成功、之后读取才报解密失败」，并已覆盖原有资产。
+/// 这里在事务之前就失败，保证库不被改动。
 pub fn restore_payload(
     store: &Store,
     payload: &BackupPayload,
     mode: &str,
+    dek: &[u8; crypto::KEY_LEN],
 ) -> Result<RestoreResult, String> {
     let rows = rows_from_payload(payload)?;
+    verify_credentials(&rows, dek)?;
     match mode {
         "overwrite" => {
             store.replace_all_servers(&rows)?;
@@ -238,7 +259,7 @@ pub fn restore_auto_backup(
     let json = crypto::decrypt(&dek, &raw).map_err(|_| "自动备份解密失败（密钥不匹配或文件损坏）".to_string())?;
     let payload: BackupPayload =
         serde_json::from_slice(&json).map_err(|e| format!("备份内容解析失败: {e}"))?;
-    restore_payload(store, &payload, mode)
+    restore_payload(store, &payload, mode, &dek)
 }
 
 pub fn list_auto_backups(data_dir: &Path) -> Vec<BackupFileMeta> {
@@ -292,6 +313,8 @@ fn prune_old(dir: &Path, keep: usize) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    const TEST_DEK: [u8; crypto::KEY_LEN] = [7u8; crypto::KEY_LEN];
+
     fn sample_rows() -> Vec<ServerRow> {
         vec![ServerRow {
             id: "id-1".into(),
@@ -300,7 +323,8 @@ mod tests {
             port: 22,
             username: "root".into(),
             auth_type: "password".into(),
-            secret_blob: vec![1u8; 40],
+            secret_blob: crypto::encrypt(&TEST_DEK, br#"{"type":"password","password":"p"}"#)
+                .expect("encrypt"),
             group_name: Some("prod".into()),
             tags: r#"["web"]"#.into(),
             notes: None,
@@ -338,9 +362,17 @@ mod tests {
         assert!(!text.contains("10.0.0.1"), "不应出现明文主机信息");
 
         // 合并恢复到空库
-        let res2 = restore_payload(&store, &payload, "merge").expect("restore");
+        let res2 = restore_payload(&store, &payload, "merge", &TEST_DEK).expect("restore");
         assert_eq!(res2.imported, 1);
         assert_eq!(store.list().unwrap().len(), 1);
+
+        // 另一个保险库（DEK 不同）恢复：必须失败，且不能改动现有数据
+        let other_dek = [9u8; crypto::KEY_LEN];
+        let before = store.list().unwrap().len();
+        let err = restore_payload(&store, &payload, "overwrite", &other_dek)
+            .expect_err("跨库恢复必须失败");
+        assert!(err.contains("无法用当前保险库解密"), "{err}");
+        assert_eq!(store.list().unwrap().len(), before, "失败时不得写库");
 
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(&path);

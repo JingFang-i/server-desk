@@ -16,6 +16,7 @@
 - 🔐 **主密码保险库** — Argon2 派生密钥 + OS Keychain + 自动锁定；凭据 AES-256-GCM 密文落盘，库中无明文
 - 🔌 **稳定 SSH 连接** — 连接保活、断线自动重连、远程命令执行
 - 🤖 **AI 安全执行管线** — 泄露防护 / 黑白名单 / 高危审批 / 全量审计 / 输出脱敏，七层防护
+- 🔔 **审批提醒** — 高危操作需人工批准时发出系统通知 + 提示音 + 侧栏角标；120 秒未处理自动拒绝
 - 📦 **加密备份** — 手动导出/恢复（合并 / 覆盖两种模式）+ 定时自动备份（保留 N 份）
 - 🖥️ **多平台** — macOS / Windows / Linux 原生打包（Linux 提供 .deb / .rpm / AppImage）
 
@@ -87,7 +88,7 @@ apps/desktop/             # Tauri 主应用
   │                       #   approvals / ssh / observe / ops / backup / commands
   └─ scripts/             # check_vue_imports.py
 apps/mcp-sidecar/         # stdio MCP Server（AI 工具入口）
-docs/                     # 方案与验收文档（plan.md、m1~m5、r1-r5、release.md）
+docs/                     # 方案与验收文档（plan.md、m1~m5、r1-r6、release.md）
 .github/workflows/        # release.yml（发布 CI）
 ```
 
@@ -110,7 +111,7 @@ docs/                     # 方案与验收文档（plan.md、m1~m5、r1-r5、re
 
 - 凭据 **AES-256-GCM** 加密落盘，数据库中无明文（M2 起升级为主密码保险库 + OS Keychain）
 - 日志与工具输出**统一脱敏**，AI 结果中严禁出现凭据
-- 高危命令**黑名单 + 人工审批流**（120s 超时自动拒绝）+ 全量审计日志
+- 高危命令**黑名单 + 人工审批流**（系统通知与提示音提醒，120s 超时自动拒绝）+ 全量审计日志（记录服务器名称快照）
 - 每台服务器独立「允许 AI 操作」开关；支持只读模式与 AI 限速
 - AI 写文件前自动备份，支持一键回滚（R2/R5）
 
@@ -119,6 +120,7 @@ docs/                     # 方案与验收文档（plan.md、m1~m5、r1-r5、re
 - 完整方案：[docs/plan.md](docs/plan.md)
 - 里程碑验收：[docs/m1-acceptance.md](docs/m1-acceptance.md) ~ [docs/m4-acceptance.md](docs/m4-acceptance.md)、[docs/acceptance-final.md](docs/acceptance-final.md)
 - AI 扩展验收：[docs/r1-r5-acceptance.md](docs/r1-r5-acceptance.md)
+- 审批提醒与审计服务器名：[docs/r6-acceptance.md](docs/r6-acceptance.md)
 - 发布说明：[docs/release.md](docs/release.md)
 - AI 协作指南：[AGENTS.md](AGENTS.md)
 

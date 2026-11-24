@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from "vue";
 import {
+  NAlert,
   NButton,
   NCard,
   NDataTable,
@@ -27,19 +28,16 @@ const sourceOptions = [
 
 const rowKey = (r: AuditEntry) => r.id;
 
-/** 会话筛选（前端过滤）：全部 / 各会话 id */
+/** 会话筛选在 SQL 层完成（不再只筛前端已加载的最近 300 行） */
 const sessionFilter = ref<string>("all");
-const sessionOptions = computed(() => {
-  const set = new Set(rows.value.filter((r) => r.session).map((r) => r.session));
-  return [{ label: "全部会话", value: "all" }].concat(
-    [...set].map((s) => ({ label: s, value: s }))
-  );
-});
-const displayRows = computed(() =>
-  sessionFilter.value === "all"
-    ? rows.value
-    : rows.value.filter((r) => r.session === sessionFilter.value)
+const sessionList = ref<string[]>([]);
+const sessionOptions = computed(() =>
+  [{ label: "全部会话", value: "all" }].concat(
+    sessionList.value.map((s) => ({ label: s, value: s }))
+  )
 );
+/** 审计落库失败次数：>0 时必须让用户看到，不能静默 */
+const auditFailures = ref(0);
 
 function fmtTs(iso: string): string {
   const d = new Date(iso);
@@ -56,17 +54,17 @@ function preview(text: string): string {
     : oneLine;
 }
 
-function outcomeTag(outcome: string) {
-  const lower = outcome.toLowerCase();
-  const type = lower.startsWith("ok")
+function outcomeTag(row: AuditEntry) {
+  const lower = row.outcome.toLowerCase();
+  const type = row.ok
     ? "success"
-    : lower.includes("block") || lower.includes("denied")
+    : lower.includes("block") || lower.includes("denied") || lower.includes("timed_out")
       ? "error"
       : "default";
   return h(
     NTag,
     { size: "small", type: type as "success" | "error" | "default", bordered: false },
-    { default: () => outcome }
+    { default: () => row.outcome }
   );
 }
 
@@ -82,11 +80,13 @@ function openDetail(row: AuditEntry) {
 async function copyDetail() {
   if (!detailEntry.value) return;
   const e = detailEntry.value;
+  const serverLabel = e.serverName || e.serverId || "—";
+  const serverExtra = e.serverName && e.serverId ? `（ID: ${e.serverId}）` : "";
   const text = [
     `时间: ${fmtTs(e.ts)}`,
     `来源: ${e.source}`,
     `操作: ${e.action}`,
-    `服务器: ${e.serverId ?? "—"}`,
+    `服务器: ${serverLabel}${serverExtra}`,
     `结果: ${e.outcome}`,
     `内容:\n${e.detail || "—"}`,
   ].join("\n");
@@ -116,7 +116,31 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
       ),
   },
   { title: "操作", key: "action", width: 170 },
-  { title: "服务器", key: "serverId", width: 190, render: (r) => r.serverId ?? "—" },
+  {
+    title: "服务器",
+    key: "serverName",
+    width: 200,
+    render: (r) => {
+      if (!r.serverName && !r.serverId) return "—";
+      const lines = [];
+      if (r.serverName) {
+        lines.push(h("div", { style: "font-size:13px;font-weight:600" }, r.serverName));
+      }
+      if (r.serverId) {
+        lines.push(
+          h(
+            "div",
+            {
+              style:
+                "font-size:11px;opacity:.5;font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap",
+            },
+            r.serverId
+          )
+        );
+      }
+      return h("div", {}, lines);
+    },
+  },
   {
     title: "内容",
     key: "detail",
@@ -131,7 +155,7 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
         preview(r.detail)
       ),
   },
-  { title: "结果", key: "outcome", width: 170, render: (r) => outcomeTag(r.outcome) },
+  { title: "结果", key: "outcome", width: 170, render: (r) => outcomeTag(r) },
   {
     title: "会话",
     key: "session",
@@ -157,7 +181,9 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
 async function refresh() {
   loading.value = true;
   try {
-    rows.value = await api.auditList(300, sourceFilter.value);
+    rows.value = await api.auditList(300, sourceFilter.value, sessionFilter.value);
+    auditFailures.value = await api.auditFailures();
+    sessionList.value = await api.auditSessions();
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -181,28 +207,38 @@ onMounted(refresh);
             @update:value="refresh"
           />
           <n-select
-            v-if="sourceFilter === 'ai'"
             v-model:value="sessionFilter"
             :options="sessionOptions"
             size="small"
-            style="width: 180px"
+            style="width: 200px"
             placeholder="按会话筛选"
+            @update:value="refresh"
           />
           <n-button size="small" :loading="loading" @click="refresh">刷新</n-button>
         </div>
       </template>
+      <n-alert
+        v-if="auditFailures > 0"
+        type="error"
+        :bordered="false"
+        style="margin-bottom: 10px"
+        title="审计写入失败"
+      >
+        有 {{ auditFailures }} 条操作未能写入审计表（数据库异常或磁盘问题）。这些操作本身可能已经执行，
+        请检查数据目录权限与剩余空间。
+      </n-alert>
       <n-data-table
         :columns="columns"
-        :data="displayRows"
+        :data="rows"
         :loading="loading"
         :bordered="false"
         size="small"
         :row-key="rowKey"
         :max-height="520"
-        :scroll-x="1010"
+        :scroll-x="1080"
       />
       <p class="hint" style="margin-top: 10px">
-        所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；列表仅显示内容摘要，点「详情」查看全文。内容已自动脱敏。
+        所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；列表仅显示内容摘要，点「详情」查看全文。服务器列显示操作发生时的名称快照（服务器改名或删除后仍可追溯）。内容已自动脱敏。
       </p>
     </n-card>
 
@@ -226,7 +262,14 @@ onMounted(refresh);
             </n-tag>
           </span>
           <span class="k">操作</span><span>{{ detailEntry.action }}</span>
-          <span class="k">服务器</span><span>{{ detailEntry.serverId ?? "—" }}</span>
+          <span class="k">服务器</span>
+          <span>{{ detailEntry.serverName || detailEntry.serverId || "—" }}</span>
+          <template v-if="detailEntry.serverName && detailEntry.serverId">
+            <span class="k">服务器 ID</span>
+            <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px; opacity: 0.7">
+              {{ detailEntry.serverId }}
+            </span>
+          </template>
           <span class="k">结果</span><span>{{ detailEntry.outcome }}</span>
           <template v-if="detailEntry.session">
             <span class="k">会话</span>
