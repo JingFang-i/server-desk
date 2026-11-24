@@ -18,10 +18,10 @@ use zeroize::Zeroizing;
 
 const KEYCHAIN_SERVICE: &str = "com.qsmx.serverdesk";
 const KEYCHAIN_USER: &str = "vault-dek";
-/// 默认 10 分钟空闲自动锁（M2 验收口径：默认 10 分钟，设置页可调 5/10/30/60/从不）。
-/// 之前这里被改成 0，并把旧默认值 "10" 静默迁移成"从不"，
-/// 等于给没动过设置的用户单方面关掉了一项安全控制。
-const DEFAULT_AUTOLOCK_MINUTES: u64 = 10;
+/// 默认不自动锁：由用户手动锁定（侧栏「锁定保险库」/设置页「立即锁定」）。
+/// 2026-11-24 产品决策：日常本机使用以手动锁为准；需要定时锁在设置页调 5/10/30/60 分钟。
+/// （此前曾按 M2 文档把默认改回 10 分钟，与实际使用习惯不符，现改回 0。）
+const DEFAULT_AUTOLOCK_MINUTES: u64 = 0;
 const MIN_PASSWORD_LEN: usize = 8;
 
 #[derive(Debug, Clone, serde::Serialize)]
