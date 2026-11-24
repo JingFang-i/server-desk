@@ -4,8 +4,10 @@ import {
   NAlert,
   NButton,
   NCard,
-  NDataTable,
+  NDescriptions,
+  NDescriptionsItem,
   NDropdown,
+  NEmpty,
   NForm,
   NFormItem,
   NIcon,
@@ -17,15 +19,15 @@ import {
   NSelect,
   NSwitch,
   NTag,
-  NTooltip,
+  NTree,
   useDialog,
   useMessage,
-  type DataTableColumns,
+  type TreeOption,
   type DropdownOption,
   type FormInst,
   type FormRules,
 } from "naive-ui";
-import { EllipsisVertical, LinkOutline, TerminalOutline } from "@vicons/ionicons5";
+import { EllipsisVertical, FolderOpenOutline } from "@vicons/ionicons5";
 import { api, type SaveServerInput, type ServerConfig } from "../api";
 import { open, save as save$ } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
@@ -34,7 +36,7 @@ const store = useServersStore();
 const message = useMessage();
 const dialog = useDialog();
 
-// 行内下拉操作菜单
+// ---------- 行内下拉操作菜单 ----------
 const actionOptions: DropdownOption[] = [
   { label: "SSH 测试", key: "test" },
   { label: "编辑", key: "edit" },
@@ -64,21 +66,38 @@ function handleAction(key: string, row: ServerConfig) {
   }
 }
 
-// ---------- 连接状态 ----------
-const connMap = ref<Record<string, boolean>>({});
+// ---------- 连接状态（三态：绿=已连接，红=最近一次连接失败，灰=未连接） ----------
+type ConnState = "connected" | "error" | "disconnected";
+const connMap = ref<Record<string, ConnState>>({});
+/**
+ * 最近一次连接/SSH 测试失败的服务器。连接池只有「在/不在」两种状态，
+ * 失败不会留痕，所以红点由前端记忆：保持到下一次连接成功、主动断开或删除服务器。
+ */
+const connectFailures = new Set<string>();
 const connectingId = ref<string | null>(null);
 let statusTimer: number | undefined;
 
 async function refreshConnStatus() {
   try {
     const list = await api.sshStatus();
-    const map: Record<string, boolean> = {};
-    for (const c of list) map[c.serverId] = c.status === "connected";
+    const map: Record<string, ConnState> = {};
+    for (const c of list)
+      map[c.serverId] = c.status === "connected" ? "connected" : "disconnected";
+    for (const id of connectFailures) {
+      if (map[id] && map[id] !== "connected") map[id] = "error";
+    }
     connMap.value = map;
   } catch {
     /* 锁定状态下静默 */
   }
 }
+
+const DOT_STYLES: Record<ConnState, string> = {
+  connected: "background:#63c28a;box-shadow:0 0 0 3px rgba(99,194,138,.15)",
+  error: "background:#e88080;box-shadow:0 0 0 3px rgba(232,128,128,.15)",
+  disconnected: "background:transparent;border:1.5px solid rgba(255,255,255,.35)",
+};
+const dotStyle = (id: string) => DOT_STYLES[connMap.value[id] ?? "disconnected"];
 
 onMounted(() => {
   store.load().catch((e) => message.error(String(e)));
@@ -89,15 +108,10 @@ onUnmounted(() => {
   if (statusTimer) window.clearInterval(statusTimer);
 });
 
-// ---------- 列表过滤（按分组树形展示，无分组归入「默认分组」） ----------
+// ---------- 左侧树（只显示名称） ----------
 const keyword = ref("");
 const DEFAULT_GROUP = "默认分组";
-
-interface GroupRow extends ServerConfig {
-  isGroup: true;
-  groupKey: string;
-  children: ServerConfig[];
-}
+const UNGROUPED_KEY = "g:__ungrouped__";
 
 const filteredServers = computed(() =>
   store.servers.filter((s) => {
@@ -112,62 +126,158 @@ const filteredServers = computed(() =>
   })
 );
 
-const tableData = computed(() => {
+/** 分组 → 该组服务器（未分组用独立键，不会被真实的「默认分组」合并） */
+const groupings = computed(() => {
   const groups = new Map<string, ServerConfig[]>();
+  let ungrouped: ServerConfig[] = [];
   for (const s of filteredServers.value) {
-    const g = (s.group ?? "").trim() || DEFAULT_GROUP;
+    const g = (s.group ?? "").trim();
+    if (!g) {
+      ungrouped.push(s);
+      continue;
+    }
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g)!.push(s);
   }
-  const out: GroupRow[] = [];
-  // 分组按名称排序，默认分组固定排最后
-  const names = [...groups.keys()].sort((a, b) =>
-    a === DEFAULT_GROUP ? 1 : b === DEFAULT_GROUP ? -1 : a.localeCompare(b, "zh-CN")
-  );
-  for (const g of names) {
-    const children = groups.get(g)!;
-    out.push({
-      isGroup: true,
-      groupKey: `g:${g}`,
-      id: `g:${g}`,
-      name: g,
-      host: "",
-      port: 0,
-      username: "",
-      auth: { type: "password", password: "" },
-      group: null,
-      tags: [],
-      notes: null,
-      allowAi: true,
-      createdAt: "",
-      updatedAt: "",
-      children,
-    });
-  }
-  return out;
+  return { groups, ungrouped };
 });
 
-const groupOptions = computed(() => store.groups.map((g) => ({ label: g, value: g })));
+const treeData = computed<TreeOption[]>(() => {
+  const { groups, ungrouped } = groupings.value;
+  const nodes: TreeOption[] = [];
+  const names = [...groups.keys()].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  for (const g of names) {
+    const children = groups.get(g)!;
+    nodes.push({
+      key: `g:${g}`,
+      label: `${g}（${children.length}）`,
+      prefix: () =>
+        h(NIcon, { size: 15, color: "#e2b93b" }, { default: () => h(FolderOpenOutline) }),
+      isGroupNode: true,
+      groupName: g,
+      children: children.map((s) => serverNode(s)),
+    });
+  }
+  if (ungrouped.length) {
+    nodes.push({
+      key: UNGROUPED_KEY,
+      label: `${DEFAULT_GROUP}（${ungrouped.length}）`,
+      prefix: () =>
+        h(NIcon, { size: 15, color: "#e2b93b" }, { default: () => h(FolderOpenOutline) }),
+      isGroupNode: true,
+      groupName: null,
+      children: ungrouped.map((s) => serverNode(s)),
+    });
+  }
+  return nodes;
+});
+
+function serverNode(s: ServerConfig): TreeOption {
+  return {
+    key: s.id,
+    label: s.name,
+    // 状态点：绿=已连接，红=最近一次连接失败，灰=未连接
+    prefix: () => h("span", { class: "srv-dot", style: dotStyle(s.id) }),
+    isServerNode: true,
+    server: s,
+  };
+}
+
+/** key → 节点附加信息（选中后取详情用） */
+const nodeInfo = computed(() => {
+  const map = new Map<
+    string,
+    { server?: ServerConfig; groupName?: string | null; isGroupNode?: boolean }
+  >();
+  const walk = (nodes: TreeOption[]) => {
+    for (const n of nodes) {
+      const info = n as TreeOption & {
+        server?: ServerConfig;
+        groupName?: string | null;
+        isGroupNode?: boolean;
+      };
+      map.set(String(n.key), {
+        server: info.server,
+        groupName: info.groupName,
+        isGroupNode: info.isGroupNode,
+      });
+      if (n.children) walk(n.children);
+    }
+  };
+  walk(treeData.value);
+  return map;
+});
+
+const selectedKey = ref<string | null>(null);
+const selectedKeys = computed<string[]>(() =>
+  selectedKey.value ? [selectedKey.value] : []
+);
+const selectedServer = computed(() => {
+  if (!selectedKey.value) return null;
+  return nodeInfo.value.get(selectedKey.value)?.server ?? null;
+});
+const selectedGroup = computed(() => {
+  if (!selectedKey.value) return null;
+  const info = nodeInfo.value.get(selectedKey.value);
+  if (!info?.isGroupNode) return null;
+  const { groupName } = info;
+  const { groups, ungrouped } = groupings.value;
+  const members = groupName === null ? ungrouped : groups.get(groupName ?? "") ?? [];
+  return { name: groupName ?? DEFAULT_GROUP, isUngrouped: groupName === null, members };
+});
+
+function onSelect(keys: string[]) {
+  selectedKey.value = keys[0] ?? null;
+}
 
 const expandedKeys = ref<string[]>([]);
+const knownGroups = new Set<string>();
+// 保留用户已有的折叠状态：搜索/刷新导致数据重算时，只有「新出现的分组」默认展开
 watch(
-  tableData,
-  (d) => {
-    expandedKeys.value = d.filter((r) => r.isGroup).map((r) => r.groupKey);
+  treeData,
+  (nodes) => {
+    const keys = nodes.map((n) => String(n.key));
+    const prev = new Set(expandedKeys.value);
+    expandedKeys.value = keys.filter((k) => prev.has(k) || !knownGroups.has(k));
+    for (const k of keys) knownGroups.add(k);
+    // 数据加载完成且尚未选中时，默认选中第一台服务器
+    if (!selectedKey.value) {
+      const first = nodes[0]?.children?.[0];
+      if (first) selectedKey.value = String(first.key);
+    }
   },
   { immediate: true }
 );
+
+// 删除/搜索后选中的服务器消失 → 清空选中（右侧回空态）
+watch(
+  () => store.servers.length,
+  () => {
+    if (selectedKey.value && !nodeInfo.value.has(selectedKey.value)) {
+      selectedKey.value = null;
+    }
+  }
+);
+
+const groupOptions = computed(() => store.groups.map((g) => ({ label: g, value: g })));
 
 // ---------- 连接 / 测试 / 执行 ----------
 async function connectRow(row: ServerConfig) {
   connectingId.value = row.id;
   try {
-    if (connMap.value[row.id]) {
+    if (connMap.value[row.id] === "connected") {
       await api.sshDisconnect(row.id);
+      connectFailures.delete(row.id); // 主动断开 → 灰点
       message.info(`「${row.name}」已断开`);
     } else {
-      await api.sshConnect(row.id);
-      message.success(`「${row.name}」已连接（保活 30s）`);
+      try {
+        await api.sshConnect(row.id);
+        connectFailures.delete(row.id);
+        message.success(`「${row.name}」已连接（保活 30s）`);
+      } catch (e) {
+        connectFailures.add(row.id); // 连接失败 → 红点保持
+        message.error(`「${row.name}」连接失败：${String(e)}`);
+      }
     }
   } catch (e) {
     message.error(String(e));
@@ -181,9 +291,15 @@ async function testRow(row: ServerConfig) {
   message.loading(`正在测试「${row.name}」的 SSH 认证…`, { duration: 1500 });
   try {
     const r = await api.sshTest(row.id);
-    if (r.ok) message.success(`「${row.name}」${r.message}`);
-    else message.error(`「${row.name}」${r.message}`);
+    if (r.ok) {
+      connectFailures.delete(row.id);
+      message.success(`「${row.name}」${r.message}`);
+    } else {
+      connectFailures.add(row.id);
+      message.error(`「${row.name}」${r.message}`);
+    }
   } catch (e) {
+    connectFailures.add(row.id);
     message.error(String(e));
   } finally {
     refreshConnStatus();
@@ -224,7 +340,7 @@ const execModal = ref(false);
 const execTarget = ref<ServerConfig | null>(null);
 const execCommand = ref("uptime");
 const execRunning = ref(false);
-const execOutput = ref<{ stdout: string; stderr: string; exitCode: number | null; truncated: boolean } | null>(null);
+const execOutput = ref<{ stdout: string; stderr: string; exitCode: number | null; truncated: boolean; timedOut?: boolean } | null>(null);
 
 function openExec(row: ServerConfig) {
   execTarget.value = row;
@@ -246,127 +362,6 @@ async function runExec() {
     refreshConnStatus();
   }
 }
-
-// ---------- 表格 ----------
-const rowKey = (r: any) => (r.isGroup ? r.groupKey : r.id);
-const columns = computed<DataTableColumns<any>>(() => [
-  {
-    title: "名称",
-    key: "name",
-    width: 190,
-    render: (row) =>
-      row.isGroup
-        ? h(
-            "div",
-            { style: "font-weight:700" },
-            `📁 ${row.name}（${row.children.length} 台）`
-          )
-        : h("div", null, [
-            h("div", { style: "font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, row.name),
-            h("div", { style: "font-size:12px;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, `${row.host}:${row.port}`),
-          ]),
-  },
-  { title: "用户名", key: "username", width: 84 },
-  {
-    title: "认证",
-    key: "auth",
-    width: 70,
-    render: (row) =>
-      row.isGroup
-        ? "—"
-        : row.auth.type === "password"
-        ? h(NTag, { size: "small", type: "info", bordered: false }, { default: () => "密码" })
-        : h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "私钥" }),
-  },
-  { title: "分组", key: "group", width: 90, render: (row) => row.group ?? "—" },
-  {
-    title: "标签",
-    key: "tags",
-    width: 130,
-    render: (row) =>
-      row.isGroup
-        ? "—"
-        : row.tags.length
-        ? h(
-            "div",
-            { style: "display:flex;gap:4px;flex-wrap:wrap" },
-            row.tags.map((t: string) =>
-              h(NTag, { size: "tiny", bordered: false }, { default: () => t })
-            )
-          )
-        : "—",
-  },
-  {
-    title: "连接",
-    key: "conn",
-    width: 76,
-    render: (row) =>
-      row.isGroup
-        ? "—"
-        : connMap.value[row.id]
-        ? h(NTag, { size: "small", type: "success", bordered: false }, { default: () => "已连接" })
-        : h(NTag, { size: "small", bordered: false }, { default: () => "未连接" }),
-  },
-  {
-    title: "AI",
-    key: "allowAi",
-    width: 56,
-    render: (row) =>
-      row.isGroup
-        ? "—"
-        : row.allowAi
-        ? h(NTag, { size: "small", type: "warning", bordered: false }, { default: () => "允许" })
-        : h(NTag, { size: "small", bordered: false }, { default: () => "禁止" }),
-  },
-  {
-    title: "操作",
-    key: "actions",
-    width: 104,
-    render: (row) =>
-      row.isGroup
-        ? "—"
-        : h("div", { style: "display:flex;gap:6px;align-items:center" }, [
-        h(NTooltip, null, {
-          trigger: () =>
-            h(
-              NButton,
-              {
-                size: "tiny",
-                circle: true,
-                type: connMap.value[row.id] ? "warning" : "primary",
-                loading: connectingId.value === row.id,
-                onClick: () => connectRow(row),
-              },
-              {
-                icon: () => h(NIcon, null, { default: () => h(LinkOutline) }),
-              }
-            ),
-          default: () => (connMap.value[row.id] ? "断开连接" : "连接"),
-        }),
-        h(NTooltip, null, {
-          trigger: () =>
-            h(
-              NButton,
-              { size: "tiny", circle: true, onClick: () => openExec(row) },
-              { icon: () => h(NIcon, null, { default: () => h(TerminalOutline) }) }
-            ),
-          default: () => "执行命令",
-        }),
-        h(
-          NDropdown,
-          { options: actionOptions, trigger: "click", onSelect: (key: string) => handleAction(key, row) },
-          {
-            default: () =>
-              h(
-                NButton,
-                { size: "tiny", circle: true, quaternary: true },
-                { icon: () => h(NIcon, null, { default: () => h(EllipsisVertical) }) }
-              ),
-          }
-        ),
-      ]),
-  },
-]);
 
 // ---------- 新增 / 编辑表单 ----------
 const showModal = ref(false);
@@ -412,8 +407,8 @@ const rules: FormRules = {
   port: { required: true, type: "number", message: "请输入端口", trigger: "blur" },
 };
 
-function openCreate() {
-  Object.assign(model, emptyModel());
+function openCreate(group: string | null = null) {
+  Object.assign(model, emptyModel(), { group: group ?? null });
   editingId.value = null;
   showModal.value = true;
 }
@@ -476,9 +471,11 @@ async function submit() {
   }
   saving.value = true;
   try {
-    await store.save(buildInput());
+    const saved = await store.save(buildInput());
     message.success(editingId.value ? "服务器已更新" : "服务器已添加");
     showModal.value = false;
+    // 新增后直接选中新服务器，详情面板立即可见
+    if (!editingId.value && saved) selectedKey.value = saved.id;
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -487,6 +484,7 @@ async function submit() {
 }
 
 async function removeRow(row: ServerConfig) {
+  connectFailures.delete(row.id);
   try {
     await store.remove(row.id);
     message.success(`已删除「${row.name}」`);
@@ -590,20 +588,31 @@ async function doDownload() {
     downloading.value = false;
   }
 }
+
+// ---------- 详情面板辅助 ----------
+function fmtTs(ts: string | null): string {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  return isNaN(+d) ? ts : d.toLocaleString("zh-CN", { hour12: false });
+}
+
+const authLabel = (s: ServerConfig) =>
+  s.auth.type === "password"
+    ? "密码"
+    : `SSH 私钥${s.auth.passphrase ? "（带口令）" : ""}`;
+
+const selectedConnState = computed<ConnState>(() =>
+  selectedServer.value ? (connMap.value[selectedServer.value.id] ?? "disconnected") : "disconnected"
+);
 </script>
 
 <template>
   <div class="page">
     <div class="toolbar">
-      <n-input
-        v-model:value="keyword"
-        placeholder="搜索名称 / 主机 / 用户名 / 标签"
-        clearable
-        style="width: 300px"
-      />
+      <span style="font-size: 13px; opacity: 0.7">服务器资产</span>
       <div style="flex: 1" />
       <n-button :loading="store.loading" @click="store.load()">刷新</n-button>
-      <n-button type="primary" @click="openCreate">＋ 新增服务器</n-button>
+      <n-button type="primary" @click="openCreate()">＋ 新增服务器</n-button>
     </div>
 
     <n-alert v-if="store.loadError" type="error" style="margin-bottom: 2px">
@@ -612,17 +621,195 @@ async function doDownload() {
       </div>
     </n-alert>
 
-    <n-data-table
-      :columns="columns"
-      :data="tableData"
-      :loading="store.loading"
-      :bordered="false"
-      size="small"
-      :row-key="rowKey"
-      :scroll-x="820"
-      :expanded-row-keys="expandedKeys"
-      @update:expanded-row-keys="(k: any) => (expandedKeys = k)"
-    />
+    <div class="servers-layout">
+      <!-- 左：分组树（只显示名称） -->
+      <aside class="tree-pane">
+        <n-input
+          v-model:value="keyword"
+          size="small"
+          placeholder="搜索名称 / 主机 / 标签"
+          clearable
+        />
+        <div class="tree-scroll">
+          <n-tree
+            v-if="treeData.length"
+            block-line
+            :data="treeData"
+            :selected-keys="selectedKeys"
+            :expanded-keys="expandedKeys"
+            @update:selected-keys="onSelect"
+            @update:expanded-keys="(k: any) => (expandedKeys = k)"
+          />
+          <n-empty
+            v-else
+            :description="keyword ? '没有匹配的服务器' : '还没有服务器'"
+            size="small"
+            style="margin-top: 48px"
+          />
+        </div>
+        <div class="tree-foot">
+          {{ store.servers.length }} 台 · {{ treeData.length }} 个分组
+        </div>
+      </aside>
+
+      <!-- 右：详情面板 -->
+      <section class="detail-pane">
+        <n-card
+          v-if="selectedServer"
+          size="small"
+          class="detail-card"
+        >
+          <template #header>
+            <div class="detail-head">
+              <span class="srv-dot big" :style="dotStyle(selectedServer.id)" />
+              <span class="detail-name">{{ selectedServer.name }}</span>
+              <n-tag
+                size="small"
+                :type="selectedConnState === 'connected'
+                  ? 'success'
+                  : selectedConnState === 'error'
+                    ? 'error'
+                    : 'default'"
+                :bordered="false"
+              >
+                {{ selectedConnState === "connected"
+                  ? "已连接"
+                  : selectedConnState === "error"
+                    ? "连接失败"
+                    : "未连接" }}
+              </n-tag>
+              <n-tag
+                v-if="!selectedServer.allowAi"
+                size="small"
+                type="warning"
+                :bordered="false"
+              >
+                AI 禁止
+              </n-tag>
+              <n-tag
+                v-for="t in selectedServer.tags"
+                :key="t"
+                size="small"
+                :bordered="false"
+              >
+                {{ t }}
+              </n-tag>
+            </div>
+          </template>
+          <template #header-extra>
+            <n-dropdown
+              :options="actionOptions"
+              trigger="click"
+              @select="(key: string) => handleAction(key, selectedServer!)"
+            >
+              <n-button size="small" circle quaternary>
+                <template #icon>
+                  <n-icon><EllipsisVertical /></n-icon>
+                </template>
+              </n-button>
+            </n-dropdown>
+          </template>
+
+          <div class="detail-sub">
+            <code class="mono">{{ selectedServer.host }}:{{ selectedServer.port }}</code>
+            <span class="mono" style="opacity: 0.7">{{ selectedServer.username }}</span>
+          </div>
+
+          <div class="detail-actions">
+            <n-button
+              :type="selectedConnState === 'connected' ? 'warning' : 'primary'"
+              :loading="connectingId === selectedServer.id"
+              @click="connectRow(selectedServer)"
+            >
+              {{ selectedConnState === "connected" ? "断开连接" : "连接" }}
+            </n-button>
+            <n-button @click="openExec(selectedServer)">执行命令</n-button>
+            <n-button @click="openFiles(selectedServer)">文件传输</n-button>
+            <n-button @click="openEdit(selectedServer)">编辑</n-button>
+            <n-button @click="testRow(selectedServer)">SSH 测试</n-button>
+          </div>
+
+          <n-descriptions
+            label-placement="left"
+            bordered
+            size="small"
+            :column="1"
+            style="margin-top: 14px"
+          >
+            <n-descriptions-item label="主机">
+              <code class="mono">{{ selectedServer.host }}</code>
+            </n-descriptions-item>
+            <n-descriptions-item label="端口">
+              {{ selectedServer.port }}
+            </n-descriptions-item>
+            <n-descriptions-item label="用户名">
+              {{ selectedServer.username }}
+            </n-descriptions-item>
+            <n-descriptions-item label="认证方式">
+              {{ authLabel(selectedServer) }}
+            </n-descriptions-item>
+            <n-descriptions-item label="分组">
+              {{ selectedServer.group ?? "默认分组" }}
+            </n-descriptions-item>
+            <n-descriptions-item label="允许 AI">
+              {{ selectedServer.allowAi ? "允许" : "禁止" }}
+            </n-descriptions-item>
+            <n-descriptions-item label="备注">
+              <span style="white-space: pre-wrap">{{ selectedServer.notes || "—" }}</span>
+            </n-descriptions-item>
+            <n-descriptions-item label="创建时间">
+              {{ fmtTs(selectedServer.createdAt) }}
+            </n-descriptions-item>
+            <n-descriptions-item label="更新时间">
+              {{ fmtTs(selectedServer.updatedAt) }}
+            </n-descriptions-item>
+          </n-descriptions>
+
+          <p class="hint" style="margin: 12px 0 0">
+            连接保持 30s 心跳；手动执行与文件传输都会写入审计日志。
+          </p>
+        </n-card>
+
+        <!-- 选中分组：展示组内成员 -->
+        <n-card v-else-if="selectedGroup" size="small" class="detail-card">
+          <template #header>
+            <div class="detail-head">
+              <n-icon :size="16" color="#e2b93b"><FolderOpenOutline /></n-icon>
+              <span class="detail-name">{{ selectedGroup.name }}</span>
+              <n-tag size="small" :bordered="false">
+                {{ selectedGroup.members.length }} 台
+              </n-tag>
+            </div>
+          </template>
+          <div class="member-list">
+            <div
+              v-for="m in selectedGroup.members"
+              :key="m.id"
+              class="member-row"
+              @click="selectedKey = m.id"
+            >
+              <span class="srv-dot" :style="dotStyle(m.id)" />
+              <span>{{ m.name }}</span>
+              <span class="mono" style="opacity: 0.55; margin-left: auto">
+                {{ m.host }}:{{ m.port }}
+              </span>
+            </div>
+          </div>
+          <div class="detail-actions">
+            <n-button
+              type="primary"
+              @click="openCreate(selectedGroup.isUngrouped ? null : selectedGroup.name)"
+            >
+              ＋ 新增到该分组
+            </n-button>
+          </div>
+        </n-card>
+
+        <div v-else class="detail-empty">
+          <n-empty description="从左侧选择一台服务器查看详情" style="margin-top: 96px" />
+        </div>
+      </section>
+    </div>
 
     <n-modal
       v-model:show="showModal"
@@ -755,6 +942,9 @@ async function doDownload() {
           <n-tag size="small" :type="execOutput.exitCode === 0 ? 'success' : 'error'" :bordered="false">
             exit = {{ execOutput.exitCode ?? "无" }}
           </n-tag>
+          <n-tag v-if="execOutput.timedOut" size="small" type="error" :bordered="false">
+            读取超时（远端可能仍在执行）
+          </n-tag>
           <n-tag v-if="execOutput.truncated" size="small" type="warning" :bordered="false">
             输出已截断
           </n-tag>
@@ -805,6 +995,116 @@ async function doDownload() {
 </template>
 
 <style scoped>
+.servers-layout {
+  display: flex;
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 左：树面板 */
+.tree-pane {
+  width: 250px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.tree-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.tree-foot {
+  font-size: 12px;
+  opacity: 0.5;
+  text-align: center;
+}
+
+/* 右：详情面板 */
+.detail-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.detail-card {
+  max-width: 760px;
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.detail-name {
+  font-size: 17px;
+  font-weight: 700;
+}
+.detail-sub {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-top: 2px;
+  font-size: 13px;
+}
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.mono {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12.5px;
+}
+.member-list {
+  display: flex;
+  flex-direction: column;
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.member-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.detail-empty {
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  min-height: 320px;
+}
+
+/* 状态点 */
+.srv-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.srv-dot.big {
+  width: 10px;
+  height: 10px;
+}
+
+/* 让树节点留出状态点的位置间距 */
+.tree-scroll :deep(.n-tree-node-content) {
+  padding-left: 6px;
+}
+.tree-scroll :deep(.n-tree-node-content__prefix) {
+  margin-right: 8px;
+}
+
 .execout {
   margin-top: 12px;
 }
