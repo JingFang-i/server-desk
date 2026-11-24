@@ -54,6 +54,8 @@ pub fn vault_unlock(state: State<'_, Arc<AppState>>, password: String) -> Result
 pub fn vault_lock(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.vault.lock();
     ops::audit(&state, "user", None, "vault_lock", "手动锁定保险库", "ok");
+    // 广播锁定事件：设置页/侧栏立即回到锁屏（此前最长要等 20s 轮询才生效）
+    let _ = state.handle.emit("vault-locked", ());
     Ok(())
 }
 

@@ -235,6 +235,14 @@ impl Vault {
         let dek = unwrap_dek(&kek, &wrapped)?;
         g.dek = Some(dek);
         g.last_activity = Instant::now();
+        // 「系统钥匙串自动解锁」开启时，解锁成功即写入条目，
+        // 保证下次启动能自动解锁（此前只有「保存设置」这一条写入路径，
+        // 若开启时写入失败，开关看着开着、重启却永远要输主密码）。
+        if g.keychain_auto_unlock {
+            if let Err(e) = self.keychain_sync() {
+                eprintln!("保险库：Keychain 条目写入失败，下次启动需手动解锁（{e}）");
+            }
+        }
         Ok(())
     }
 
@@ -309,9 +317,18 @@ impl Vault {
             })?;
         if enabled {
             match dek {
-                Some(d) => entry
-                    .set_password(&B64.encode(d.as_slice()))
-                    .map_err(|e| VaultError::Keychain(format!("写入失败: {e}")))?,
+                Some(d) => {
+                    entry
+                        .set_password(&B64.encode(d.as_slice()))
+                        .map_err(|e| VaultError::Keychain(format!("写入失败: {e}")))?;
+                    // 写入后读回校验：macOS 钥匙串偶发静默失败，读不回来等于白写
+                    let back = entry.get_password().map_err(|e| {
+                        VaultError::Keychain(format!("写入后读取校验失败: {e}"))
+                    })?;
+                    if back != B64.encode(d.as_slice()) {
+                        return Err(VaultError::Keychain("写入后读取校验不一致".into()));
+                    }
+                }
                 None => return Err(VaultError::Locked),
             }
         } else {
@@ -330,7 +347,15 @@ impl Vault {
             .map_err(|e| VaultError::Keychain(format!("创建条目失败: {e}")))?;
         let b64 = match entry.get_password() {
             Ok(v) => v,
-            Err(_) => return Ok(false),
+            // 条目不存在 = 自动解锁已开启但从未成功写入：给出明确指引
+            Err(keyring::Error::NoEntry) => {
+                eprintln!("保险库：钥匙串自动解锁已开启但条目不存在（解锁一次后会自动写入），本次需要手动解锁");
+                return Ok(false);
+            }
+            Err(e) => {
+                eprintln!("保险库：钥匙串自动解锁条目读取失败（{e}）");
+                return Ok(false);
+            }
         };
         let raw = B64.decode(b64.as_bytes())
             .map_err(|_| VaultError::Keychain("Keychain 内容损坏".into()))?;

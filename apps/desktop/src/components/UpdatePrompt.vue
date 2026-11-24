@@ -13,11 +13,13 @@ import { useDialog, useMessage } from "naive-ui";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 
 const message = useMessage();
 const dialog = useDialog();
 const checking = ref(false);
 const version = ref("");
+let unlistenMenu: (() => void) | undefined;
 
 async function checkUpdate(manual: boolean) {
   checking.value = true;
@@ -101,8 +103,14 @@ function prompt(update: Update) {
   });
 }
 
-onMounted(() => {
-  getVersion().then((v) => (version.value = v)).catch(() => {});
+onMounted(async () => {
+  version.value = await getVersion().catch(() => "");
+  // 原生菜单「检查更新…」（mac 应用菜单 / win 菜单栏，快捷键 Cmd/Ctrl+U）
+  try {
+    unlistenMenu = await listen("menu-check-update", () => void checkUpdate(true));
+  } catch {
+    /* 事件通道不可用时忽略 */
+  }
   setTimeout(() => void checkUpdate(false), 3000);
 });
 

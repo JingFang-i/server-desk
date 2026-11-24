@@ -106,7 +106,8 @@ async function save() {
 async function lockNow() {
   try {
     await api.vaultLock();
-    message.success("已锁定（窗口即将回到锁屏）");
+    message.success("已锁定");
+    status.value = await api.vaultStatus();
   } catch (e) {
     message.error(String(e));
   }
@@ -222,27 +223,6 @@ async function copy(text: string, label: string) {
       <pre class="pre">{{ mcpInfo?.configJson ?? "（应用启动后生成）" }}</pre>
     </n-card>
 
-    <n-card title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
-      <div style="display: flex; gap: 10px; align-items: center">
-        <span style="font-size: 13px">当前版本</span>
-        <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12.5px">
-          v{{ appVersion || "…" }}
-        </span>
-        <n-button
-          size="small"
-          :loading="updatePromptRef?.checking"
-          @click="updatePromptRef?.check(true)"
-        >
-          检查更新
-        </n-button>
-      </div>
-      <p class="hint" style="margin: 8px 0 0">
-        启动时也会自动检查；发现新版本会弹窗提示，确认后自动下载安装并重启。更新包经数字签名校验，
-        Linux 的 deb/rpm 安装不支持应用内更新（AppImage 支持）。
-      </p>
-      <UpdatePrompt ref="updatePromptRef" />
-    </n-card>
-
     <n-card title="AI 高级策略" size="small" style="max-width: 720px; margin-top: 16px">
       <div class="row">
         <div class="label">
@@ -330,6 +310,26 @@ async function copy(text: string, label: string) {
       <template #footer>
         <n-button type="primary" :loading="savingRules" @click="saveRules">保存全部规则与策略</n-button>
       </template>
+    </n-card>
+    <n-card title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
+      <div style="display: flex; gap: 10px; align-items: center">
+        <span style="font-size: 13px">当前版本</span>
+        <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12.5px">
+          v{{ appVersion || "…" }}
+        </span>
+        <n-button
+          size="small"
+          :loading="updatePromptRef?.checking"
+          @click="updatePromptRef?.check(true)"
+        >
+          检查更新
+        </n-button>
+      </div>
+      <p class="hint" style="margin: 8px 0 0">
+        启动时也会自动检查；发现新版本会弹窗提示，确认后自动下载安装并重启。更新包经数字签名校验，
+        Linux 的 deb/rpm 安装不支持应用内更新（AppImage 支持）。
+      </p>
+      <UpdatePrompt ref="updatePromptRef" />
     </n-card>
   </div>
 </template>

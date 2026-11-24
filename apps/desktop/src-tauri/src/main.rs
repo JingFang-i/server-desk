@@ -19,6 +19,9 @@ mod store;
 mod text;
 mod vault;
 
+#[cfg(target_os = "macos")]
+use tauri::menu::SubmenuBuilder;
+use tauri::menu::{MenuBuilder, MenuItem, PredefinedMenuItem};
 use state::AppState;
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,6 +89,50 @@ fn main() {
 
             // 审批到达提醒：注册通知点击回调（点击系统通知 → 唤起主窗口）
             notify::init(app.handle());
+
+            // 原生应用菜单：mac/win 菜单里提供「检查更新」「锁定保险库」入口，
+            // 触发后以事件形式转给前端（复用 UpdatePrompt 的检查与锁屏流程）
+            let check_item = MenuItem::with_id(
+                app,
+                "menu-check-update",
+                "检查更新…",
+                true,
+                if cfg!(target_os = "macos") { Some("Cmd+U") } else { Some("Ctrl+U") },
+            )?;
+            let lock_item = MenuItem::with_id(
+                app,
+                "menu-lock-vault",
+                "锁定保险库",
+                true,
+                if cfg!(target_os = "macos") { Some("Cmd+L") } else { Some("Ctrl+L") },
+            )?;
+            let quit_item = PredefinedMenuItem::quit(app, None)?;
+            let sep_item = PredefinedMenuItem::separator(app)?;
+            #[cfg(target_os = "macos")]
+            let menu = {
+                let sub = SubmenuBuilder::new(app, "ServerDesk")
+                    .about(None)
+                    .separator()
+                    .item(&check_item)
+                    .separator()
+                    .item(&lock_item)
+                    .separator()
+                    .quit()
+                    .build()?;
+                MenuBuilder::new(app).item(&sub).build()?
+            };
+            #[cfg(not(target_os = "macos"))]
+            let menu = MenuBuilder::new(app)
+                .items(&[&check_item, &lock_item, &sep_item, &quit_item])
+                .build()?;
+            app.set_menu(menu.clone())?;
+            app.on_menu_event(move |handle, event| {
+                let _ = match event.id().as_ref() {
+                    "menu-check-update" => handle.emit("menu-check-update", ()),
+                    "menu-lock-vault" => handle.emit("menu-lock-vault", ()),
+                    _ => Ok(()),
+                };
+            });
 
             // 空闲自动锁巡检：每 30s 检查一次，锁上时广播事件给前端
             let vault_for_lock = vault.clone();

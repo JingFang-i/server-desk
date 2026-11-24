@@ -74,12 +74,15 @@ async function lockVault() {
 }
 
 let unlisten: UnlistenFn | undefined;
+let unlistenMenuLock: UnlistenFn | undefined;
 let pollTimer: number | undefined;
 
 onMounted(async () => {
   await refreshVault();
   booted.value = true;
   unlisten = await listen("vault-locked", () => refreshVault());
+  // 原生菜单「锁定保险库」（mac 应用菜单 / win 菜单栏，快捷键 Cmd/Ctrl+L）
+  unlistenMenuLock = await listen("menu-lock-vault", () => void lockVault());
   pollTimer = window.setInterval(() => {
     if (vault.value?.unlocked) refreshVault();
   }, 20000);
@@ -87,6 +90,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlisten?.();
+  unlistenMenuLock?.();
   if (pollTimer) window.clearInterval(pollTimer);
 });
 </script>
