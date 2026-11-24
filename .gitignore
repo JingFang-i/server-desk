@@ -48,3 +48,6 @@ coverage/
 
 # pnpm 本地依赖存储（沙箱内全局存储不可写时的回退）
 .pnpm-store/
+
+# Developer ID 签名私钥与 CSR
+.apple-cert/

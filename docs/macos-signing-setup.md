@@ -57,3 +57,13 @@ spctl -a -t exec -vv /path/to/ServerDesk.app   # 期望: accepted, source=Notari
 ## 本地构建不受影响
 
 日常 `pnpm tauri build` 仍走 adhoc（本机打开没问题）；只有 CI 发版才做 Developer ID 签名 + 公证。
+
+## 已验证（2026-11-24）
+
+- 本机实测全链路：legacy .p12 导入 → Developer ID 签名（含 sidecar 与 hardened runtime）→
+  notarytool 公证 **Accepted** → staple → `spctl: accepted, source=Notarized Developer ID`。
+- 踩坑记录（CI/本地都会遇到）：
+  1. `security import` 不认 OpenSSL 3 新格式 p12 → 导出时加 `-legacy`；
+  2. 钥匙串缺 `Developer ID CA G2` 中间证书 → 从证书 AIA 扩展拿 `certs.apple.com/devidg2.der` 导入；
+  3. 导入后必须 `security set-key-partition-list -S apple-tool:,apple: -s -k <口令> <钥匙串>`；
+  4. sidecar（serverdesk-mcp）必须单独签名，公证才会通过——已固化进 stage-sidecar.mjs。
