@@ -542,10 +542,16 @@ pub fn mcp_info(state: State<'_, Arc<AppState>>) -> Result<McpInfo, String> {
         .and_then(|exe| {
             let dir = exe.parent()?;
             // 开发：target/debug 同目录；macOS .app：Contents/Resources；Windows：安装目录
+            // 顺序：开发（target/[debug|release] 同目录）→ 打包（资源子目录 resources/，
+            // Windows/Linux 安装目录与 macOS Contents/Resources 同构）→ macOS 旧布局（资源根）
             let candidates = [
                 dir.join("serverdesk-mcp"),
-                dir.join("../Resources/serverdesk-mcp"),
                 dir.join("serverdesk-mcp.exe"),
+                dir.join("resources/serverdesk-mcp"),
+                dir.join("resources/serverdesk-mcp.exe"),
+                dir.join("../Resources/resources/serverdesk-mcp"),
+                dir.join("../Resources/serverdesk-mcp"),
+                dir.join("../Resources/resources/serverdesk-mcp.exe"),
                 dir.join("../Resources/serverdesk-mcp.exe"),
             ];
             candidates
