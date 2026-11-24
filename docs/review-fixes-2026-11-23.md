@@ -11,7 +11,8 @@
 | `cargo test --workspace` | **36 项通过**（主应用 35 + sidecar 契约 1；新增 guard 5 项、text 2 项、store 会话/成功判定 1 项、fbackups 加密 1 项、下载留存 1 项） |
 | `pnpm build`（含 `vue-tsc`） | 通过 |
 | `python3 apps/desktop/scripts/check_vue_imports.py` | 从仓库根与 `apps/desktop` 均可运行，实测检查 9 个 .vue |
-| `pnpm tauri build --bundles app` | 通过；`ServerDesk.app/Contents/Resources/serverdesk-mcp` 已存在（1.2MB，可执行） |
+| `pnpm tauri build --bundles app` | 通过；sidecar 位于 `Contents/Resources/resources/serverdesk-mcp`（1.2MB，可执行） |
+| CI 发布 v0.1.4 | 三平台矩阵全绿；Release 产物 7 件：dmg / app.tar.gz / AppImage / deb / rpm / x64-setup.exe / x64_en-US.msi |
 | sidecar MCP 握手（新旧两个二进制） | `initialize` 正常；`tools/list` 返回 16 个工具且顺序与 `shared::MCP_TOOL_NAMES` 一致 |
 | 真机只读冒烟（本地服务器 192.168.110.120） | 通过正在运行的 0.1.3 应用调用 `server_status`，exitCode=0、输出正常（验证 MCP→IPC→SSH 链路与脱敏） |
 
@@ -36,7 +37,7 @@
 
 | # | 问题 | 修复 | 位置 |
 |---|---|---|---|
-| 1 | 安装包不含 sidecar | `bundle.resources` 映射 `resources/`；`beforeBuildCommand` 编译并暂存 sidecar；release.yml 增加暂存步骤；已用 `tauri build` 实测打进去 | `tauri.conf.json`、`scripts/stage-sidecar.mjs`、`release.yml` |
+| 1 | 安装包不含 sidecar | `bundle.resources` 映射到 `resources/` 子目录（映射到根目录会让 WiX 把 serverdesk-mcp.exe 登记成两个组件，MSI 打包 ICE30 失败）；`beforeBuildCommand` 编译并暂存 sidecar；release.yml 增加暂存步骤；v0.1.4 三平台产物已实测齐全 | `tauri.conf.json`、`scripts/stage-sidecar.mjs`、`release.yml` |
 | 2 | 自动锁默认关、旧默认被静默迁成 0 | 默认回到 10 分钟；删除把 `"10"` 改写成 `0` 的迁移 | `vault.rs` |
 | 3 | 批量并发 5 未生效 | `acquire_owned()` 后才发远程操作，许可持有到该台结束 | `ops::exec_batch` |
 | 4 | `list_file_backups` 无 allow_ai 闸门 | 指定服务器时先校验 allow_ai；未指定时只返回开放 AI 的服务器的备份 | `ipc.rs` |
