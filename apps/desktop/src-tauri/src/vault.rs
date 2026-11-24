@@ -236,9 +236,12 @@ impl Vault {
         g.dek = Some(dek);
         g.last_activity = Instant::now();
         // 「系统钥匙串自动解锁」开启时，解锁成功即写入条目，
-        // 保证下次启动能自动解锁（此前只有「保存设置」这一条写入路径，
-        // 若开启时写入失败，开关看着开着、重启却永远要输主密码）。
-        if g.keychain_auto_unlock {
+        // 保证下次启动能自动解锁（此前只有「保存设置」这一条写入路径）。
+        // 注意：必须先释放 g 再调 keychain_sync——它内部会再取同一把
+        // std::sync::Mutex（不可重入），同时持有会永久死锁（界面假死）。
+        let need_keychain_sync = g.keychain_auto_unlock;
+        drop(g);
+        if need_keychain_sync {
             if let Err(e) = self.keychain_sync() {
                 eprintln!("保险库：Keychain 条目写入失败，下次启动需手动解锁（{e}）");
             }

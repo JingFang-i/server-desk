@@ -39,15 +39,25 @@ pub fn vault_setup(state: State<'_, Arc<AppState>>, password: String) -> Result<
     Ok(mig.summary())
 }
 
+/// 异步命令：解锁要做 Argon2 与 macOS 钥匙串同步（Security 框架可能阻塞），
+/// 同步命令跑在主线程上——一旦阻塞整个界面假死（症状：输完密码回车后无响应）。
 #[tauri::command]
-pub fn vault_unlock(state: State<'_, Arc<AppState>>, password: String) -> Result<Option<String>, String> {
-    state.vault.unlock(&password).map_err(|e| e.to_string())?;
-    let mig = state
-        .vault
-        .migrate_legacy_if_needed(&state.store)
-        .map_err(|e| e.to_string())?;
-    ops::audit(&state, "user", None, "vault_unlock", "解锁保险库", "ok");
-    Ok(mig.summary())
+pub async fn vault_unlock(
+    state: State<'_, Arc<AppState>>,
+    password: String,
+) -> Result<Option<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.vault.unlock(&password).map_err(|e| e.to_string())?;
+        let mig = state
+            .vault
+            .migrate_legacy_if_needed(&state.store)
+            .map_err(|e| e.to_string())?;
+        ops::audit(&state, "user", None, "vault_unlock", "解锁保险库", "ok");
+        Ok(mig.summary())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -60,24 +70,29 @@ pub fn vault_lock(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn vault_set_settings(
+pub async fn vault_set_settings(
     state: State<'_, Arc<AppState>>,
     auto_lock_minutes: u64,
     keychain_auto_unlock: bool,
 ) -> Result<VaultStatus, String> {
-    state
-        .vault
-        .set_settings(auto_lock_minutes, keychain_auto_unlock)
-        .map_err(|e| e.to_string())?;
-    ops::audit(
-        &state,
-        "user",
-        None,
-        "vault_settings",
-        &format!("自动锁 {auto_lock_minutes} 分钟，钥匙串自动解锁 {keychain_auto_unlock}"),
-        "ok",
-    );
-    Ok(state.vault.status())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .vault
+            .set_settings(auto_lock_minutes, keychain_auto_unlock)
+            .map_err(|e| e.to_string())?;
+        ops::audit(
+            &state,
+            "user",
+            None,
+            "vault_settings",
+            &format!("自动锁 {auto_lock_minutes} 分钟，钥匙串自动解锁 {keychain_auto_unlock}"),
+            "ok",
+        );
+        Ok(state.vault.status())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 危险操作：忘记主密码时的重置（清空全部数据，不可恢复）。
