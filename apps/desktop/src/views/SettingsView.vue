@@ -10,6 +10,8 @@ import {
   NTag,
   useMessage,
 } from "naive-ui";
+import { getVersion } from "@tauri-apps/api/app";
+import UpdatePrompt from "../components/UpdatePrompt.vue";
 import { api, type GuardInfo, type GuardRules, type McpInfo, type VaultStatus } from "../api";
 import { useServersStore } from "../stores/servers";
 
@@ -30,6 +32,10 @@ const ratePerMin = ref<number>(30);
 const strictGroups = ref<string[]>([]);
 const savingRules = ref(false);
 const mcpInfo = ref<McpInfo | null>(null);
+
+// ---------- 应用内更新 ----------
+const appVersion = ref("");
+const updatePromptRef = ref<{ check: (manual: boolean) => Promise<void>; checking: boolean } | null>(null);
 const showToken = ref(false);
 
 const lockOptions = [
@@ -73,6 +79,7 @@ async function loadGuard() {
 }
 
 onMounted(async () => {
+  getVersion().then((v: string) => (appVersion.value = v)).catch(() => {});
   try {
     status.value = await api.vaultStatus();
     autoLockMinutes.value = status.value.autoLockMinutes;
@@ -213,6 +220,27 @@ async function copy(text: string, label: string) {
         <n-button size="small" @click="copy(mcpInfo?.configJson ?? '', '配置 JSON')">复制配置</n-button>
       </div>
       <pre class="pre">{{ mcpInfo?.configJson ?? "（应用启动后生成）" }}</pre>
+    </n-card>
+
+    <n-card title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
+      <div style="display: flex; gap: 10px; align-items: center">
+        <span style="font-size: 13px">当前版本</span>
+        <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12.5px">
+          v{{ appVersion || "…" }}
+        </span>
+        <n-button
+          size="small"
+          :loading="updatePromptRef?.checking"
+          @click="updatePromptRef?.check(true)"
+        >
+          检查更新
+        </n-button>
+      </div>
+      <p class="hint" style="margin: 8px 0 0">
+        启动时也会自动检查；发现新版本会弹窗提示，确认后自动下载安装并重启。更新包经数字签名校验，
+        Linux 的 deb/rpm 安装不支持应用内更新（AppImage 支持）。
+      </p>
+      <UpdatePrompt ref="updatePromptRef" />
     </n-card>
 
     <n-card title="AI 高级策略" size="small" style="max-width: 720px; margin-top: 16px">

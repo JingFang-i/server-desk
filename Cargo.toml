@@ -20,6 +20,8 @@ base64 = "0.22"
 regex = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 russh-sftp = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"

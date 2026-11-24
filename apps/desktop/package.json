@@ -12,6 +12,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
     "@vicons/ionicons5": "^0.13.0",
     "naive-ui": "^2.41.0",
     "pinia": "^2.3.0",

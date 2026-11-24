@@ -37,6 +37,15 @@
     ],
     "resources": {
       "resources/": "resources/"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/JingFang-i/server-desk/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRBRDU5N0M2QkVEQjdDREYKUldUZmZOdSt4cGZWU29IYlF0eVQ4UlhzVlhDNFpEVzlNakVJYzVBcDlJR3M1OHBRTjQ0UC9zMEQK"
     }
   }
 }

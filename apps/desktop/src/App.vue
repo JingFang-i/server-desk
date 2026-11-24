@@ -18,6 +18,7 @@ import {
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type VaultStatus } from "./api";
 import ApprovalAlert from "./components/ApprovalAlert.vue";
+import UpdatePrompt from "./components/UpdatePrompt.vue";
 import ServersView from "./views/ServersView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import ApprovalsView from "./views/ApprovalsView.vue";
@@ -101,6 +102,8 @@ onUnmounted(() => {
       <n-notification-provider placement="top-right" :max="3">
         <!-- 全局审批提醒：提示音 + 应用内通知 + 待审批角标 -->
         <ApprovalAlert @count="approvalCount = $event" @open="page = 'approvals'" />
+        <!-- 应用内更新：启动静默检查，发现新版本弹窗提示 -->
+        <UpdatePrompt />
         <n-dialog-provider>
           <!-- 保险库锁屏门 -->
           <LockGate
