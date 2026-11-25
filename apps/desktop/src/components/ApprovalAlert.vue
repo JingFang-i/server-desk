@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, shallowRef } from "vue";
-import { NButton, NTag, useMessage, useNotification } from "naive-ui";
+import { h, onMounted, onUnmounted, shallowRef } from "vue";
+import { NButton, useNotification } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type ApprovalReview, type PendingApproval } from "../api";
 import ApprovalReviewNote from "./ApprovalReviewNote.vue";
-import { alertAudioState, ensureAudio, playApprovalChime, primeAlertSound } from "../alert";
+import { playApprovalChime, primeAlertSound } from "../alert";
 import { notifyPermission } from "../notifyStatus";
 
 /**
@@ -18,15 +18,8 @@ const props = defineProps<{ /** 当前页面：已在审批中心时不再弹卡
 const emit = defineEmits<{ (e: "count", n: number): void; (e: "open"): void }>();
 
 const notification = useNotification();
-const message = useMessage();
 const POLL_MS = 3000;
 const REMIND_MS = 30000;
-
-/** 提示音是否已可出声（自动播放策略要求用户手势后才能响） */
-const audioReady = computed(() => alertAudioState.value === "running");
-
-/** 横幅只提示「提示音未启用」；系统通知授权状态在设置页查看，不做全局提醒 */
-const bannerVisible = computed(() => !audioReady.value);
 
 let pollTimer: number | undefined;
 let remindTimer: number | undefined;
@@ -35,16 +28,6 @@ let unlistenUpdates: UnlistenFn | undefined;
 let refreshVersion = 0;
 const pending = shallowRef(new Map<string, PendingApproval>());
 let pendingCount = 0;
-
-/** 用户点击「开启提示音」：显式 resume + 试听一声 */
-async function enableAudio() {
-  const ok = await ensureAudio();
-  if (ok) {
-    message.success("审批提示音已启用（刚才那声就是试听）");
-  } else {
-    message.error("启用失败：请检查系统音量与输出设备后重试");
-  }
-}
 
 async function checkPerm() {
   await notifyPermission();
@@ -144,40 +127,5 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- 提示音未启用时的显式提示条：一键修复，修完自动消失 -->
-  <div v-if="bannerVisible" class="alert-banner" role="alert">
-    <div v-if="!audioReady" class="banner-row">
-      <n-tag size="small" type="warning" :bordered="false">提示音未启用</n-tag>
-      <span class="banner-text">审批到达时将没有声音（浏览器自动播放策略）</span>
-      <n-button size="tiny" type="primary" @click="enableAudio">开启提示音并试听</n-button>
-    </div>
-  </div>
   <span style="display: none" />
 </template>
-
-<style scoped>
-.alert-banner {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 2000;
-  background: rgba(99, 226, 183, 0.06);
-  backdrop-filter: blur(6px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  padding: 8px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.banner-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12.5px;
-}
-.banner-text {
-  opacity: 0.85;
-  flex: 1;
-}
-</style>
