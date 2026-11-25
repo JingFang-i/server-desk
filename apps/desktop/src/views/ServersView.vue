@@ -31,10 +31,15 @@ import { EllipsisVertical, FolderOpenOutline } from "@vicons/ionicons5";
 import { api, type SaveServerInput, type ServerConfig } from "../api";
 import { open, save as save$ } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
+import { useActivityStore, outcomeKind, prettyTool } from "../stores/activity";
 
 const store = useServersStore();
+const activity = useActivityStore();
 const message = useMessage();
 const dialog = useDialog();
+
+/** AI 实时活动小窗：可折叠（默认展开） */
+const showActivity = ref(true);
 
 // ---------- 行内下拉操作菜单 ----------
 const actionOptions: DropdownOption[] = [
@@ -103,6 +108,7 @@ onMounted(() => {
   store.load().catch((e) => message.error(String(e)));
   refreshConnStatus();
   statusTimer = window.setInterval(refreshConnStatus, 5000);
+  void activity.init();
 });
 onUnmounted(() => {
   if (statusTimer) window.clearInterval(statusTimer);
@@ -991,6 +997,38 @@ const selectedConnState = computed<ConnState>(() =>
         </p>
       </n-card>
     </n-modal>
+
+    <!-- AI 实时活动小窗：哪个服务器正在被调用什么工具（事件流驱动，右下角可折叠） -->
+    <div class="activity-widget">
+      <div class="activity-head" @click="showActivity = !showActivity">
+        <span class="activity-title">
+          ⚡ AI 实时活动
+          <n-tag v-if="activity.runningCount" size="small" type="info" :bordered="false">
+            {{ activity.runningCount }} 个执行中
+          </n-tag>
+        </span>
+        <n-button size="tiny" quaternary>{{ showActivity ? "收起" : "展开" }}</n-button>
+      </div>
+      <div v-if="showActivity" class="activity-list">
+        <n-empty
+          v-if="!activity.entries.length"
+          size="small"
+          description="暂无 AI 调用（AI 通过 MCP 操作服务器时会实时显示在这里）"
+        />
+        <div v-for="(e, i) in activity.entries.slice(0, 12)" :key="e.key + i" class="activity-row">
+          <n-tag
+            size="small"
+            :bordered="false"
+            :type="e.running ? 'info' : e.ok === true ? 'success' : e.ok === false ? 'error' : 'default'"
+          >
+            {{ e.running ? "执行中…" : e.ok ? "完成" : "失败/拦截" }}
+          </n-tag>
+          <span class="act-server">{{ e.server || "全局" }}</span>
+          <span class="act-tool">{{ prettyTool(e.tool) }}</span>
+          <span class="act-time">{{ new Date(e.ts).toLocaleTimeString("zh-CN", { hour12: false }) }}</span>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1000,6 +1038,73 @@ const selectedConnState = computed<ConnState>(() =>
   gap: 14px;
   flex: 1;
   min-height: 0;
+}
+
+/* AI 实时活动小窗：右下角悬浮，可折叠 */
+.activity-widget {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 100;
+  width: 340px;
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(20, 20, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(8px);
+  overflow: hidden;
+}
+.activity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.activity-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.activity-list {
+  overflow-y: auto;
+  padding: 4px 12px 10px;
+}
+.activity-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.06);
+  font-size: 12px;
+}
+.activity-row:last-child {
+  border-bottom: none;
+}
+.act-server {
+  font-weight: 600;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.act-tool {
+  flex: 1;
+  font-family: ui-monospace, Menlo, monospace;
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.act-time {
+  opacity: 0.45;
+  flex-shrink: 0;
 }
 
 /* 左：树面板 */

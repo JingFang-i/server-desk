@@ -177,6 +177,23 @@ fn write_audit(
             + 1;
         eprintln!("审计写入失败（累计 {n} 次）: {e} | {action} {outcome}");
     }
+
+    // 服务器页「实时活动」小窗：AI 工具调用完成即广播（开始事件在 ipc.rs 分发处发出）。
+    // 只覆盖 AI 来源的 mcp_* 动作；用户手动操作不进入这条动态流。
+    if source == "ai" && action.starts_with("mcp_") {
+        let _ = state.handle.emit(
+            "tool-activity",
+            serde_json::json!({
+                "phase": "done",
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "session": session,
+                "tool": action,
+                "server_name": resolved_name,
+                "server_id": resolved_id,
+                "outcome": outcome,
+            }),
+        );
+    }
 }
 
 /// 登记一条待审批操作：入队 → 广播刷新事件 → 审批提醒（系统通知 + 声音）→ 返回等待端。

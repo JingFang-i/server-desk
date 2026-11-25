@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   NButton,
   NCard,
@@ -36,6 +36,25 @@ const ratePerMin = ref<number>(30);
 const strictGroups = ref<string[]>([]);
 const savingRules = ref(false);
 const mcpInfo = ref<McpInfo | null>(null);
+
+// ---------- 设置项目录（左侧锚点导航） ----------
+const sections = [
+  { id: "sec-vault", label: "保险库安全" },
+  { id: "sec-alerts", label: "审批提醒与声音" },
+  { id: "sec-mcp", label: "AI 管线（MCP 接入）" },
+  { id: "sec-review", label: "AI 智能审查" },
+  { id: "sec-policy", label: "AI 高级策略" },
+  { id: "sec-rules", label: "命令安全规则" },
+  { id: "sec-update", label: "应用更新" },
+];
+const activeSection = ref("sec-vault");
+let sectionObserver: IntersectionObserver | undefined;
+
+/** 点击目录：平滑滚动到对应卡片 */
+function jumpTo(id: string) {
+  activeSection.value = id;
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 
 // ---------- 审批提醒与声音 ----------
 // 「提示音一定会响」的两个前提都在这里显式管理：
@@ -246,6 +265,23 @@ onMounted(async () => {
   loadAlertStatus();
 });
 
+// IntersectionObserver 挂在 DOM 就绪后（卡片 id 存在于模板）
+onMounted(() => {
+  sectionObserver = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) activeSection.value = e.target.id;
+      }
+    },
+    { rootMargin: "-15% 0px -75% 0px" }
+  );
+  for (const s of sections) {
+    const el = document.getElementById(s.id);
+    if (el) sectionObserver.observe(el);
+  }
+});
+onUnmounted(() => sectionObserver?.disconnect());
+
 async function save() {
   saving.value = true;
   try {
@@ -320,8 +356,20 @@ async function copy(text: string, label: string) {
 </script>
 
 <template>
-  <div class="settings">
-    <n-card title="保险库安全设置" size="small" style="max-width: 720px">
+  <div class="settings-layout">
+    <aside class="settings-toc">
+      <div
+        v-for="s in sections"
+        :key="s.id"
+        class="toc-item"
+        :class="{ active: activeSection === s.id }"
+        @click="jumpTo(s.id)"
+      >
+        {{ s.label }}
+      </div>
+    </aside>
+    <div class="settings">
+    <n-card id="sec-vault" title="保险库安全设置" size="small" style="max-width: 720px">
       <div class="row">
         <div class="label">
           <div>空闲自动锁定</div>
@@ -355,7 +403,7 @@ async function copy(text: string, label: string) {
       </template>
     </n-card>
 
-    <n-card title="审批提醒与声音" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-alerts" title="审批提醒与声音" size="small" style="max-width: 720px; margin-top: 16px">
       <p class="hint" style="margin: 0 0 6px">
         确保 AI 请求审批时你一定能听到。两条通道互为补充：
         应用内提示音在窗口内响（三音提示，未处理每 30 秒重复）；
@@ -401,7 +449,7 @@ async function copy(text: string, label: string) {
       </div>
     </n-card>
 
-    <n-card title="AI 安全管线（MCP 接入）" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-mcp" title="AI 安全管线（MCP 接入）" size="small" style="max-width: 720px; margin-top: 16px">
       <div class="row">
         <div class="label">
           <div>允许 AI 通过 MCP 操作服务器</div>
@@ -424,7 +472,7 @@ async function copy(text: string, label: string) {
       <pre class="pre">{{ mcpInfo?.configJson ?? "（应用启动后生成）" }}</pre>
     </n-card>
 
-    <n-card title="AI 高级策略" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-policy" title="AI 高级策略" size="small" style="max-width: 720px; margin-top: 16px">
       <div class="row">
         <div class="label">
           <div>只读模式</div>
@@ -461,7 +509,7 @@ async function copy(text: string, label: string) {
       </div>
     </n-card>
 
-    <n-card title="AI 智能审查（实验性）" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-review" title="AI 智能审查（实验性）" size="small" style="max-width: 720px; margin-top: 16px">
       <p class="hint" style="margin: 0 0 6px">
         启用后，AI 的每条命令在静态规则判定之后，会再交给一个你配置的模型做语义安全审查；
         结论只会让判定更严格（放行/转人工/建议拒绝）。待审命令文本会先做凭据脱敏再发送到所选服务——
@@ -575,7 +623,7 @@ async function copy(text: string, label: string) {
       </div>
     </n-card>
 
-    <n-card title="命令安全规则（可自定义）" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-rules" title="命令安全规则（可自定义）" size="small" style="max-width: 720px; margin-top: 16px">
       <div class="row" style="margin-bottom: 10px">
         <div class="label">
           <div>判定模式</div>
@@ -626,7 +674,7 @@ async function copy(text: string, label: string) {
         <n-button type="primary" :loading="savingRules" @click="saveRules">保存全部规则与策略</n-button>
       </template>
     </n-card>
-    <n-card title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-update" title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
       <div style="display: flex; gap: 10px; align-items: center">
         <span style="font-size: 13px">当前版本</span>
         <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12.5px">
@@ -646,10 +694,43 @@ async function copy(text: string, label: string) {
       </p>
       <UpdatePrompt ref="updatePromptRef" />
     </n-card>
+    </div>
   </div>
 </template>
 
 <style scoped>
+/* 左侧设置目录：sticky 跟随滚动，点击平滑跳转到对应卡片 */
+.settings-layout {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+}
+.settings-toc {
+  position: sticky;
+  top: 12px;
+  width: 150px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.toc-item {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0.65;
+  transition: background 0.15s, opacity 0.15s;
+}
+.toc-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  opacity: 0.9;
+}
+.toc-item.active {
+  background: rgba(255, 255, 255, 0.09);
+  opacity: 1;
+  font-weight: 600;
+}
 .row {
   display: flex;
   align-items: center;

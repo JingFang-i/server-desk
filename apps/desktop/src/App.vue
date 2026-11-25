@@ -33,9 +33,26 @@ const vault = ref<VaultStatus | null>(null);
 const booted = ref(false);
 /** 待审批数量：菜单角标，由 ApprovalAlert 轮询维护 */
 const approvalCount = ref(0);
+/** 当前 SSH 已连接的服务器数：侧栏「服务器」角标，轮询连接池状态（内存读，开销极小） */
+const connectedCount = ref(0);
+let connTimer: number | undefined;
+
+async function refreshConnectedCount() {
+  try {
+    connectedCount.value = (await api.sshStatus()).filter((c) => c.status === "connected").length;
+  } catch {
+    /* 后端未就绪时静默 */
+  }
+}
 
 const menuOptions = computed<MenuOption[]>(() => [
-  { label: "🖥 服务器", key: "servers" },
+  {
+    label:
+      connectedCount.value > 0
+        ? `🖥 服务器 (${connectedCount.value} 台已连接)`
+        : "🖥 服务器",
+    key: "servers",
+  },
   {
     label: approvalCount.value > 0 ? `✅ 审批中心 (${approvalCount.value})` : "✅ 审批中心",
     key: "approvals",
@@ -86,12 +103,16 @@ onMounted(async () => {
   pollTimer = window.setInterval(() => {
     if (vault.value?.unlocked) refreshVault();
   }, 20000);
+  // 全局已连接服务器数：5s 轮询（ssh_status 只读连接池内存，无 SSH 往返）
+  void refreshConnectedCount();
+  connTimer = window.setInterval(refreshConnectedCount, 5000);
 });
 
 onUnmounted(() => {
   unlisten?.();
   unlistenMenuLock?.();
   if (pollTimer) window.clearInterval(pollTimer);
+  if (connTimer) window.clearInterval(connTimer);
 });
 </script>
 

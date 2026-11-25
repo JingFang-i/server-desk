@@ -8,6 +8,7 @@ use crate::state::AppState;
 use shared::{IpcRequest, IpcResponse};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Emitter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
@@ -126,6 +127,22 @@ async fn handle_conn(
 
     let req: IpcRequest =
         serde_json::from_slice(&body).map_err(|e| format!("请求体解析失败: {e}"))?;
+
+    // 服务器页「实时活动」小窗：工具调用**开始**即上报（完成事件由 ops::audit 发出）。
+    // 服务器取 args 里的 server/group 字段（批量与全局工具可能没有，留空显示「全局」）。
+    state.handle.emit(
+        "tool-activity",
+        serde_json::json!({
+            "phase": "start",
+            "session": req.session,
+            "tool": req.tool,
+            "server": req.args.get("server")
+                .or_else(|| req.args.get("group"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        }),
+    );
+
     // 会话 id 作为 task-local 进入本次请求：并发请求各自归因，不会互相覆盖
     let resp = match ops::with_session(req.session.clone(), handle_tool(&state, &req.tool, req.args)).await {
         Ok(data) => IpcResponse::ok(data),
