@@ -1,25 +1,22 @@
-// 系统通知权限状态：审批提醒的「后台可达」通道依赖它（R8.4 后置增强）。
-// macOS 需要用户显式授权；Windows/Linux 的 WebView 通知通常默认放行。
-// 查询/请求失败（如纯浏览器预览）返回 unknown，UI 按「无法确认」提示而不是误报。
+// 通过桌面端查询系统权限。平台无法确认时避免误报已授权。
+import { readonly, shallowRef } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 
-import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+type NotifyPermission = "granted" | "denied" | "prompt" | "unknown";
+const permission = shallowRef<NotifyPermission>("unknown");
+export const notifyPermissionState = readonly(permission);
+let requesting = false;
 
-export type NotifyPermission = "granted" | "denied" | "unknown";
-
-export async function notifyPermission(): Promise<NotifyPermission> {
+export async function notifyPermission(request = false): Promise<NotifyPermission> {
+  if (requesting) return permission.value;
+  requesting = request;
   try {
-    return (await isPermissionGranted()) ? "granted" : "denied";
+    const status = await invoke<NotifyPermission>("approval_notification_permission", { request });
+    if (request || !requesting) permission.value = status;
   } catch {
-    return "unknown";
+    if (request || !requesting) permission.value = "unknown";
+  } finally {
+    if (request) requesting = false;
   }
-}
-
-/** 触发系统授权弹窗；用户拒绝或弹窗失败返回 denied / unknown。 */
-export async function requestNotifyPermission(): Promise<NotifyPermission> {
-  try {
-    const r = await requestPermission();
-    return r === "granted" ? "granted" : "denied";
-  } catch {
-    return "unknown";
-  }
+  return permission.value;
 }

@@ -25,7 +25,7 @@ pub struct ChatOutcome {
 
 /// 单轮 chat 调用，要求 JSON 输出。
 /// 供应商不支持 `response_format`（HTTP 400）时自动去掉该字段重试一次；
-/// 其余错误一律原样上抛。
+/// 错误仅返回状态或通用说明，避免第三方错误正文携带凭据。
 pub async fn chat_json(
     http: &reqwest::Client,
     cfg: &ReviewConfig,
@@ -34,11 +34,15 @@ pub async fn chat_json(
     user: &str,
 ) -> Result<ChatOutcome, String> {
     debug_assert!(matches!(cfg.protocol, Protocol::OpenAiCompat));
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = cfg.endpoint()?;
     let timeout = Duration::from_millis(u64::from(cfg.timeout_ms));
 
-    let mut last_err = String::new();
+    let started = Instant::now();
     for with_response_format in [true, false] {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err("审查请求超时".into());
+        }
         let mut body = json!({
             "model": cfg.model,
             "temperature": 0,
@@ -51,8 +55,7 @@ pub async fn chat_json(
         if with_response_format {
             body["response_format"] = json!({ "type": "json_object" });
         }
-        let started = Instant::now();
-        let mut req = http.post(&url).timeout(timeout).json(&body);
+        let mut req = http.post(url.clone()).timeout(remaining).json(&body);
         if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
             req = req.bearer_auth(key);
         }
@@ -63,24 +66,48 @@ pub async fn chat_json(
                 return Err(format!(
                     "请求失败（timeout={}ms）：{}",
                     cfg.timeout_ms,
-                    brief(&e.to_string())
+                    if e.is_timeout() { "超时" } else { "无法连接审查服务或发送请求" }
                 ));
             }
         };
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let latency = started.elapsed().as_millis() as u64;
-        if status.is_success() {
-            return parse_ok(&text, latency);
-        }
-        let detail = brief(&text);
         if status.as_u16() == 400 && with_response_format {
-            last_err = format!("HTTP 400（去掉 response_format 重试）：{detail}");
             continue;
         }
-        return Err(format!("HTTP {}: {detail}", status.as_u16()));
+        if !status.is_success() {
+            return Err(format!("审查服务返回 HTTP {}", status.as_u16()));
+        }
+        let body = read_response(resp).await?;
+        let text = std::str::from_utf8(&body).map_err(|_| "审查响应编码无效".to_string())?;
+        return parse_ok(text, started.elapsed().as_millis() as u64);
     }
-    Err(last_err)
+    Err("审查服务未返回有效响应".into())
+}
+
+/// 先遮盖本次请求的已知凭据，再复用通用脱敏。
+pub(crate) fn redact(guard: &crate::guard::Guard, key: &str, text: &str) -> String {
+    guard.sanitize(&text.replace(key, "[REDACTED]"))
+}
+
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+async fn read_response(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|n| n > MAX_RESPONSE_BYTES as u64) {
+        return Err("审查响应超过 64 KiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "读取审查响应失败".to_string())? {
+        append_response_chunk(&mut bytes, &chunk)?;
+    }
+    Ok(bytes)
+}
+
+fn append_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+        return Err("审查响应超过 64 KiB".into());
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// 解析成功响应：取模型输出 + model + usage。
@@ -88,16 +115,16 @@ pub async fn chat_json(
 /// 输出字段回退链（推理模型兼容，实测 openbmb/minicpm5-2b 经 Ollama 时
 /// `content` 在思维链结束前恒为空、正文在 `reasoning` 字段）：
 /// `content` → `reasoning_content`（DeepSeek-R1 风格）→ `reasoning`（Ollama 风格）。
-/// 审查解析器（verdict::parse）扫描全部 JSON 对象，思维链里的最终结论同样可解析。
+/// 审查解析器（verdict::parse_redacted）扫描全部 JSON 对象，思维链里的最终结论同样可解析。
 fn parse_ok(text: &str, latency_ms: u64) -> Result<ChatOutcome, String> {
     let v: Value =
-        serde_json::from_str(text).map_err(|e| format!("响应不是合法 JSON：{e}"))?;
+        serde_json::from_str(text).map_err(|_| "响应不是合法 JSON".to_string())?;
     let choice = v
         .pointer("/choices/0/message")
         .ok_or_else(|| "响应缺少 choices[0].message".to_string())?;
     let content = ["content", "reasoning_content", "reasoning"]
         .iter()
-        .find_map(|k| choice.get(*k).and_then(|c| c.as_str()))
+        .find_map(|k| choice.get(*k).and_then(|c| c.as_str()).filter(|c| !c.trim().is_empty()))
         .unwrap_or_default()
         .to_string();
     if content.trim().is_empty() {
@@ -123,14 +150,19 @@ fn parse_ok(text: &str, latency_ms: u64) -> Result<ChatOutcome, String> {
     })
 }
 
-/// 错误信息压成单行并截断：响应体可能很大，且不允许携带换行进审计。
-fn brief(s: &str) -> String {
-    crate::text::summary(s, 200)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_limit_applies_to_accumulated_chunks() {
+        let mut bytes = Vec::new();
+        let chunk = vec![0; MAX_RESPONSE_BYTES / 2];
+        append_response_chunk(&mut bytes, &chunk).unwrap();
+        append_response_chunk(&mut bytes, &chunk).unwrap();
+        assert!(append_response_chunk(&mut bytes, &[0]).is_err());
+        assert_eq!(bytes.len(), MAX_RESPONSE_BYTES);
+    }
 
     #[test]
     fn parse_ok_reads_content_model_usage() {
@@ -154,9 +186,11 @@ mod tests {
     }
 
     #[test]
-    fn brief_is_single_line_and_capped() {
-        let b = brief("line1\nline2\n huge error body ".repeat(20).as_str());
-        assert!(!b.contains('\n'));
-        assert!(b.chars().count() <= 200);
+    fn parse_ok_skips_blank_content() {
+        let out = parse_ok(
+            r#"{"choices":[{"message":{"content":" ","reasoning_content":"","reasoning":"结论"}}]}"#,
+            1,
+        ).unwrap();
+        assert_eq!(out.content, "结论");
     }
 }

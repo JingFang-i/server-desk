@@ -76,13 +76,13 @@ pub struct AiReview {
 }
 
 /// 解析 categories：字符串数组，最多取 4 个，单项截断 24 字；缺失/类型错 → 空。
-fn parse_categories(v: &serde_json::Value) -> Vec<String> {
+fn parse_categories(v: &serde_json::Value, redact: &impl Fn(&str) -> String) -> Vec<String> {
     v.get("categories")
         .and_then(|x| x.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|c| c.as_str())
-                .map(|s| truncate(s.trim(), 24))
+                .map(|s| truncate(&redact(s.trim()), 24))
                 .filter(|s| !s.is_empty())
                 .take(4)
                 .collect()
@@ -94,7 +94,15 @@ fn parse_categories(v: &serde_json::Value) -> Vec<String> {
 /// - 找不到完整 JSON 对象 / 全部损坏 → `Err`（走失败策略，绝不默认放行）；
 /// - 存在 JSON 但没有合法 verdict（含「诱饵对象」在前的情况）→ 逐个扫描，
 ///   取第一个含合法 verdict 的对象；全部不合法 → `Ok`（格式降级为 `Review`，绝不 allow）。
+#[cfg(test)]
 pub fn parse(content: &str) -> Result<AiReview, String> {
+    parse_redacted(content, str::to_string)
+}
+
+pub(super) fn parse_redacted(
+    content: &str,
+    redact: impl Fn(&str) -> String,
+) -> Result<AiReview, String> {
     let objects = extract_json_objects(content);
     if objects.is_empty() {
         return Err("模型未返回 JSON 对象".to_string());
@@ -127,13 +135,13 @@ pub fn parse(content: &str) -> Result<AiReview, String> {
             let reason = if reason.is_empty() {
                 "（模型未给出理由）".to_string()
             } else {
-                truncate(&reason, 200)
+                truncate(&redact(&reason), 200)
             };
             return Ok(AiReview {
                 verdict,
                 risk: Risk::parse(v.get("risk").and_then(|x| x.as_str()).unwrap_or("")),
                 reason,
-                categories: parse_categories(&v),
+                categories: parse_categories(&v, &redact),
                 cached: false,
                 latency_ms: 0,
                 model: String::new(),
@@ -294,6 +302,19 @@ mod tests {
     }
 
     /// 穷举「静态 × AI 结论 × 失败 × 两种策略」全部组合，守护合并不变式。
+    #[test]
+    fn provider_text_is_redacted_before_truncation() {
+        let key = "fixture-key";
+        let reason = format!("{}{}", "字".repeat(195), key);
+        let category = format!("{}{}", "字".repeat(20), key);
+        let output = serde_json::json!({
+            "verdict": "review", "reason": reason, "categories": [category],
+        });
+        let result = parse_redacted(&output.to_string(), |text| text.replace(key, "*")).unwrap();
+        assert!(result.reason.ends_with('*'));
+        assert!(result.categories[0].ends_with('*'));
+    }
+
     #[test]
     fn merge_never_loosens_static_decision() {
         let statics = [

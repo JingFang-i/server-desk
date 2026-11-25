@@ -125,6 +125,7 @@ docs/                     # Design & acceptance docs (plan.md, m1~m5, r1-r6, rel
 
 ## 📚 Documentation
 
+- If you used the experimental Secret Indirection feature, check the original SSH host for credential files before re-enabling AI access. See the [migration notes (Chinese)](docs/r9-secret-ref-design.md).
 - Full design: [docs/plan.md](docs/plan.md) (Chinese)
 - Milestone acceptance: [docs/m1-acceptance.md](docs/m1-acceptance.md) ~ [docs/m4-acceptance.md](docs/m4-acceptance.md), [docs/acceptance-final.md](docs/acceptance-final.md)
 - AI extension acceptance: [docs/r1-r5-acceptance.md](docs/r1-r5-acceptance.md)

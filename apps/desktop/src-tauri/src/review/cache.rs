@@ -20,6 +20,22 @@ pub fn cache_key(tool: &str, command: &str, static_verdict: &str, cfg: &ReviewCo
     h.finalize().into()
 }
 
+/// 使用实际送审内容和配置版本，避免跨上下文或跨热更新复用结论。
+pub(super) fn request_key(
+    tool: &str,
+    command: &str,
+    static_verdict: &str,
+    cfg: &ReviewConfig,
+    payload: &str,
+    generation: u64,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(cache_key(tool, command, static_verdict, cfg));
+    hash.update(generation.to_be_bytes());
+    hash.update(payload.as_bytes());
+    hash.finalize().into()
+}
+
 pub struct VerdictCache {
     entries: HashMap<[u8; 32], (Instant, AiReview)>,
     order: VecDeque<[u8; 32]>,
@@ -107,6 +123,14 @@ mod tests {
 
     fn cfg() -> ReviewConfig {
         ReviewConfig::default()
+    }
+
+    #[test]
+    fn request_key_changes_with_context_and_settings_generation() {
+        let c = cfg();
+        let key = request_key("exec_command", "uptime", "allow", &c, "分组一", 0);
+        assert_ne!(key, request_key("exec_command", "uptime", "allow", &c, "分组二", 0));
+        assert_ne!(key, request_key("exec_command", "uptime", "allow", &c, "分组一", 1));
     }
 
     #[test]

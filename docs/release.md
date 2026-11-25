@@ -50,3 +50,7 @@ pnpm tauri build
 ## 版本升级
 
 统一改三处：根 `Cargo.toml` workspace version、`apps/desktop/src-tauri/tauri.conf.json` version、`apps/desktop/package.json` version。
+
+### 从使用过实验性敏感引用的版本升级
+
+首次打开旧数据库时，ServerDesk 会关闭可能留有远端凭据副本的资产的“允许 AI 操作”开关。请在原主机核对并清理后，再按需重新开启。具体范围及步骤见[敏感引用退役与迁移说明](r9-secret-ref-design.md)。

@@ -151,20 +151,41 @@ impl ReviewConfig {
     /// 结构校验：enabled 时 base_url 与 model 必填；协议必须是 https，
     /// 仅本机回环 http（Ollama / LM Studio 本地部署）放行。
     pub fn validate(&self) -> Result<(), String> {
-        if self.base_url.is_empty() || self.model.is_empty() {
+        if self.enabled && (self.base_url.is_empty() || self.model.is_empty()) {
             return Err("启用 AI 审查前必须填写 BaseUrl 与模型名称".into());
         }
-        let loopback = self.base_url.starts_with("http://127.0.0.1")
-            || self.base_url.starts_with("http://localhost")
-            || self.base_url.starts_with("http://[::1]");
-        if !self.base_url.starts_with("https://") && !loopback {
-            return Err("BaseUrl 必须是 https://（或本机回环 http://127.0.0.1）".into());
+        if !self.base_url.is_empty() {
+            self.endpoint()?;
         }
         if self.prompt_version.trim().is_empty() {
             return Err("prompt_version 不能为空".into());
         }
         Ok(())
     }
+
+    pub fn endpoint(&self) -> Result<reqwest::Url, String> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| "BaseUrl 格式无效".to_string())?;
+        let loopback = is_loopback(&url);
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+            return Err("BaseUrl 必须是 https://（或本机回环 HTTP）".into());
+        }
+        if url.host().is_none() || !url.username().is_empty() || url.password().is_some()
+            || url.query().is_some() || url.fragment().is_some()
+        {
+            return Err("BaseUrl 必须是服务地址，不能携带凭据、查询参数或片段".into());
+        }
+        url.path_segments_mut()
+            .map_err(|_| "BaseUrl 路径无效".to_string())?
+            .pop_if_empty()
+            .extend(["chat", "completions"]);
+        Ok(url)
+    }
+
+}
+
+pub(super) fn is_loopback(url: &reqwest::Url) -> bool {
+    matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
 }
 
 /// 读配置（无配置 / 解析失败 → 默认值：审查关闭，行为等同 R7）。
@@ -177,10 +198,13 @@ pub fn load_config(store: &Store) -> ReviewConfig {
         .unwrap_or_default()
 }
 
-/// 写配置（调用方负责先 normalized + validate）。
-pub fn save_config(store: &Store, cfg: &ReviewConfig) -> Result<(), String> {
+/// 配置与密文同一次提交，避免重启后拿到另一端点的凭据。
+pub fn save_config(store: &Store, cfg: &ReviewConfig, key_blob: Option<&str>) -> Result<(), String> {
     let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
-    store.set_meta(META_CONFIG, &json)
+    match key_blob {
+        Some(blob) => store.set_meta_values(&[(META_CONFIG, &json), (META_KEY_BLOB, blob)]),
+        None => store.set_meta(META_CONFIG, &json),
+    }
 }
 
 // ---------- API Key：加密落盘，绝不回传前端 ----------
@@ -200,20 +224,13 @@ pub fn decode_key_blob(dek: &[u8; KEY_LEN], blob: &str) -> Result<String, String
     String::from_utf8(plain).map_err(|_| "API Key 数据损坏（UTF-8）".to_string())
 }
 
-/// 保存 API Key（加密落盘）。
-pub fn save_api_key(store: &Store, vault: &Vault, key: &str) -> Result<(), String> {
-    let dek = vault.dek().map_err(|e| e.to_string())?;
-    let blob = encode_key_blob(&dek, key)?;
-    store.set_meta(META_KEY_BLOB, &blob)
-}
-
 /// 读取 API Key（未配置返回 None；保险库锁定时返回错误）。
-pub fn load_api_key(store: &Store, vault: &Vault) -> Result<Option<String>, String> {
-    let Some(blob) = store.get_meta(META_KEY_BLOB).ok().flatten() else {
+pub fn load_api_key(store: &Store, vault: &Vault) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+    let Some(blob) = store.get_meta(META_KEY_BLOB)?.filter(|blob| !blob.is_empty()) else {
         return Ok(None);
     };
     let dek = vault.dek().map_err(|e| e.to_string())?;
-    decode_key_blob(&dek, &blob).map(Some)
+    decode_key_blob(&dek, &blob).map(zeroize::Zeroizing::new).map(Some)
 }
 
 /// 是否已配置 Key（不读取内容）。
@@ -362,6 +379,21 @@ mod tests {
         assert!(c.validate().is_ok(), "本地 Ollama 回环放行");
         c.base_url = "https://api.moonshot.cn/v1".into();
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn endpoint_only_allows_loopback_http_and_plain_base_paths() {
+        let mut c = ReviewConfig::default();
+        for base in [
+            "http://localhost.invalid/v1",
+            "http://127.0.0.1.invalid/v1",
+            "https://example.invalid/v1?debug=true",
+        ] {
+            c.base_url = base.into();
+            assert!(c.endpoint().is_err());
+        }
+        c.base_url = "http://[::1]:11434/v1/".into();
+        assert_eq!(c.endpoint().unwrap().path(), "/v1/chat/completions");
     }
 
     #[test]

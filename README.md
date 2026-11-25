@@ -122,6 +122,7 @@ docs/                     # 方案与验收文档（plan.md、m1~m5、r1-r6、re
 
 ## 📚 文档
 
+- 使用过实验性敏感引用功能的用户，升级后请按[退役与迁移说明](docs/r9-secret-ref-design.md)核对旧服务器上的凭据副本。
 - 完整方案：[docs/plan.md](docs/plan.md)
 - 里程碑验收：[docs/m1-acceptance.md](docs/m1-acceptance.md) ~ [docs/m4-acceptance.md](docs/m4-acceptance.md)、[docs/acceptance-final.md](docs/acceptance-final.md)
 - AI 扩展验收：[docs/r1-r5-acceptance.md](docs/r1-r5-acceptance.md)

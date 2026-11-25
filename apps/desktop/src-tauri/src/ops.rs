@@ -178,22 +178,6 @@ fn write_audit(
         eprintln!("审计写入失败（累计 {n} 次）: {e} | {action} {outcome}");
     }
 
-    // 服务器页「实时活动」小窗：AI 工具调用完成即广播（开始事件在 ipc.rs 分发处发出）。
-    // 只覆盖 AI 来源的 mcp_* 动作；用户手动操作不进入这条动态流。
-    if source == "ai" && action.starts_with("mcp_") {
-        let _ = state.handle.emit(
-            "tool-activity",
-            serde_json::json!({
-                "phase": "done",
-                "ts": chrono::Utc::now().to_rfc3339(),
-                "session": session,
-                "tool": action,
-                "server_name": resolved_name,
-                "server_id": resolved_id,
-                "outcome": outcome,
-            }),
-        );
-    }
 }
 
 /// 登记一条待审批操作：入队 → 广播刷新事件 → 审批提醒（系统通知 + 声音）→ 返回等待端。
@@ -206,7 +190,7 @@ fn register_approval(
     server_name: &str,
     summary: &str,
     ai_note: Option<&str>,
-) -> tokio::sync::oneshot::Receiver<bool> {
+) -> (String, tokio::sync::oneshot::Receiver<bool>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let safe_command = truncate(
         &state.guard.sanitize(summary.trim()),
@@ -219,7 +203,59 @@ fn register_approval(
     let _ = state.handle.emit("approvals-updated", ());
     let _ = state.handle.emit("approval-requested", pending.clone());
     crate::notify::approval_requested(&state.handle, &pending);
+    (pending.id, rx)
+}
+
+/// 静态审批立即入队，模型只负责补充意见，且继承原调用会话。
+fn start_static_approval(
+    state: &Arc<AppState>,
+    tool: &'static str,
+    command: &str,
+    decision: Decision,
+    ctx: &crate::review::ReviewContext<'_>,
+    server_id: Option<&str>,
+    approval_label: &str,
+) -> tokio::sync::oneshot::Receiver<bool> {
+    let (id, rx) = register_approval(state, server_id.unwrap_or_default(), approval_label, command, None);
+    if state.reviewer.config().enabled {
+        let state = Arc::clone(state);
+        let command = command.to_string();
+        let server_id = server_id.map(str::to_string);
+        let group = ctx.group.map(str::to_string);
+        let server_name = ctx.server_name.map(str::to_string);
+        let batch_size = ctx.batch_size;
+        tauri::async_runtime::spawn(with_session(current_session(), async move {
+            let outcome = crate::review::review_and_merge(
+                &state, tool, &command, decision,
+                &crate::review::ReviewContext {
+                    group: group.as_deref(), server_name: server_name.as_deref(), batch_size,
+                },
+                server_id.as_deref(),
+            ).await;
+            if let Some(note) = outcome.ai_note {
+                if state.approvals.set_ai_note(&id, note) {
+                    let _ = state.handle.emit("approvals-updated", ());
+                }
+            }
+        }));
+    }
     rx
+}
+
+async fn review_command(
+    state: &Arc<AppState>,
+    tool: &'static str,
+    command: &str,
+    decision: Decision,
+    ctx: &crate::review::ReviewContext<'_>,
+    server_id: Option<&str>,
+    approval_label: &str,
+) -> (crate::review::ReviewOutcome, Option<tokio::sync::oneshot::Receiver<bool>>) {
+    if matches!(decision, Decision::NeedsApproval(_)) {
+        let rx = start_static_approval(state, tool, command, decision.clone(), ctx, server_id, approval_label);
+        return (crate::review::ReviewOutcome { decision, ai_note: None }, Some(rx));
+    }
+    (crate::review::review_and_merge(state, tool, command, decision, ctx, server_id).await, None)
 }
 
 /// 执行一条**应用固定模板**命令（观测五件套 / 状态探查）。
@@ -235,17 +271,7 @@ pub async fn run_fixed_template(
     timeout_secs: u64,
 ) -> Result<ExecResult, String> {
     let cfg = load_server_config(state, server_ref)?;
-    if !cfg.allow_ai {
-        audit(
-            state,
-            "ai",
-            Some(&cfg.id),
-            action,
-            "模板命令",
-            "blocked:not_allow_ai",
-        );
-        return Err(format!("服务器「{}」未开放 AI 操作（allowAi=false）", cfg.name));
-    }
+    ai_gate(state, &cfg, action, "模板命令")?;
     match state.guard.evaluate_fixed_template(command) {
         Decision::Blocked(reason) => {
             audit(
@@ -309,7 +335,7 @@ pub async fn run_fixed_template(
 
 /// 执行一条命令。source: "manual"（用户）或 "ai"（MCP 管线）。
 pub async fn run_command(
-    state: &AppState,
+    state: &Arc<AppState>,
     server_ref: &str,
     command: &str,
     timeout_secs: u64,
@@ -324,17 +350,7 @@ pub async fn run_command(
 
     // ---- AI 专属安全管线 ----
     if source == "ai" {
-        if !cfg.allow_ai {
-            audit(
-                state,
-                source,
-                Some(&cfg.id),
-                shared::action::MCP_EXEC_COMMAND,
-                &command,
-                "blocked:not_allow_ai",
-            );
-            return Err(format!("服务器「{}」未开放 AI 操作（allowAi=false）", cfg.name));
-        }
+        ai_gate(state, &cfg, shared::action::MCP_EXEC_COMMAND, &command)?;
         let mut decision = state.guard.evaluate(&command);
         // 严格分组：命中分组的服务器，Allow 也强制审批
         if matches!(decision, Decision::Allow) && state.guard.is_strict_group(cfg.group.as_deref()) {
@@ -344,7 +360,7 @@ pub async fn run_command(
             ));
         }
         // R8.2/R8.4：AI 审查层——只能收紧判定（静态 Blocked 不送审）；ai_note 附到审批卡
-        let outcome = crate::review::review_and_merge(
+        let (outcome, pending) = review_command(
             state,
             shared::action::MCP_EXEC_COMMAND,
             &command,
@@ -355,6 +371,7 @@ pub async fn run_command(
                 batch_size: None,
             },
             Some(&cfg.id),
+            &cfg.name,
         )
         .await;
         let decision = outcome.decision;
@@ -364,7 +381,9 @@ pub async fn run_command(
                 return Err(format!("已拦截：{reason}"));
             }
             Decision::NeedsApproval(reason) => {
-                let rx = register_approval(state, &cfg.id, &cfg.name, &command, outcome.ai_note.as_deref());
+                let rx = pending.unwrap_or_else(|| {
+                    register_approval(state, &cfg.id, &cfg.name, &command, outcome.ai_note.as_deref()).1
+                });
                 audit(
                     state,
                     source,
@@ -393,30 +412,9 @@ pub async fn run_command(
         }
     }
 
-    // ---- 执行 ----
-    // R9：敏感引用解引用——AI 命令含 $SD_SEC_x 时校验（存在/绑定服务器/未过期）
-    // 并注入 export 前缀；审计 detail 始终记录原命令（句柄可见，明文永不出现）。
-    let mut exec_text = command.clone();
-    if source == "ai" {
-        match crate::secrets::resolve_for_command(state, &cfg.id, &command) {
-            Ok(Some(wrapped)) => exec_text = wrapped,
-            Ok(None) => {}
-            Err(e) => {
-                audit(
-                    state,
-                    source,
-                    Some(&cfg.id),
-                    shared::action::MCP_EXEC_COMMAND,
-                    &command,
-                    &format!("blocked:secret_ref:{}", crate::text::summary(&e, 80)),
-                );
-                return Err(e);
-            }
-        }
-    }
     let res = state
         .ssh
-        .exec(&state.store, &cfg.id, &conn_params(&cfg), &exec_text, timeout)
+        .exec(&state.store, &cfg.id, &conn_params(&cfg), &command, timeout)
         .await;
 
     let out = match res {
@@ -469,7 +467,7 @@ pub(crate) async fn request_approval(
     summary: &str,
     kind: &str,
 ) -> Result<(), String> {
-    let rx = register_approval(state, &cfg.id, &cfg.name, summary, None);
+    let (_, rx) = register_approval(state, &cfg.id, &cfg.name, summary, None);
     audit(
         state,
         "ai",
@@ -1049,7 +1047,7 @@ pub async fn exec_batch(
         );
     }
     // R8.2/R8.4：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
-    let outcome = crate::review::review_and_merge(
+    let (outcome, pending) = review_command(
         state,
         shared::action::MCP_EXEC_BATCH,
         &command,
@@ -1060,6 +1058,7 @@ pub async fn exec_batch(
             batch_size: Some(rows.len()),
         },
         None,
+        &batch_label,
     )
     .await;
     let decision = outcome.decision;
@@ -1069,7 +1068,9 @@ pub async fn exec_batch(
             return Err(format!("已拦截：{reason}"));
         }
         Decision::NeedsApproval(reason) => {
-            let rx = register_approval(state, "", &batch_label, &command, outcome.ai_note.as_deref());
+            let rx = pending.unwrap_or_else(|| {
+                register_approval(state, "", &batch_label, &command, outcome.ai_note.as_deref()).1
+            });
             audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_REQUESTED, &command, &format!("batch:{reason}"));
             let decided = tokio::time::timeout(
                 Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),
@@ -1083,22 +1084,6 @@ pub async fn exec_batch(
             audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_GRANTED, &command, "batch");
         }
         Decision::Allow => {}
-    }
-
-    // R9：批量命令不支持敏感引用——句柄绑定单台服务器，批量语义下无法逐台校验
-    if crate::secrets::scan_handles(&command).len() > 0 {
-        audit_named(
-            state,
-            "ai",
-            None,
-            &batch_label,
-            shared::action::MCP_EXEC_BATCH,
-            &command,
-            "blocked:secret_ref:batch_not_supported",
-        );
-        return Err(
-            "批量执行不支持敏感引用（$SD_SEC_*）：请改用单服务器的 exec_command".into(),
-        );
     }
 
     // 并发执行（信号量限流 5）

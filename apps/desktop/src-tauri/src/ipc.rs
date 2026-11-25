@@ -128,26 +128,25 @@ async fn handle_conn(
     let req: IpcRequest =
         serde_json::from_slice(&body).map_err(|e| format!("请求体解析失败: {e}"))?;
 
-    // 服务器页「实时活动」小窗：工具调用**开始**即上报（完成事件由 ops::audit 发出）。
-    // 服务器取 args 里的 server/group 字段（批量与全局工具可能没有，留空显示「全局」）。
-    state.handle.emit(
-        "tool-activity",
-        serde_json::json!({
-            "phase": "start",
-            "session": req.session,
-            "tool": req.tool,
-            "server": req.args.get("server")
-                .or_else(|| req.args.get("group"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        }),
-    );
+    // 每个 IPC 请求只产生一对活动事件，审计和审批中间状态单独记录。
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let server = req.args.get("server")
+        .or_else(|| req.args.get("group"))
+        .and_then(|v| v.as_str())
+        .map(|name| crate::text::summary(&state.guard.sanitize(name), 120))
+        .unwrap_or_default();
+    let _ = state.handle.emit("tool-activity", serde_json::json!({
+        "id": request_id, "phase": "start", "tool": req.tool, "server": server,
+    }));
 
-    // 会话 id 作为 task-local 进入本次请求：并发请求各自归因，不会互相覆盖
-    let resp = match ops::with_session(req.session.clone(), handle_tool(&state, &req.tool, req.args)).await {
+    let resp = match ops::with_session(req.session, handle_tool(&state, &req.tool, req.args)).await {
         Ok(data) => IpcResponse::ok(data),
         Err(e) => IpcResponse::err(e),
     };
+    let _ = state.handle.emit("tool-activity", serde_json::json!({
+        "id": request_id, "phase": "done", "tool": req.tool, "server": server,
+        "ok": activity_succeeded(&req.tool, &resp),
+    }));
     let out = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
     let http = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -156,6 +155,33 @@ async fn handle_conn(
     stream.write_all(http.as_bytes()).await.map_err(|e| e.to_string())?;
     stream.write_all(&out).await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn activity_succeeded(tool: &str, resp: &IpcResponse) -> bool {
+    fn exited_cleanly(data: &serde_json::Value) -> bool {
+        data["timedOut"].as_bool() != Some(true) && data["exitCode"].as_u64() == Some(0)
+    }
+    resp.ok && match tool {
+        "exec_command" | "server_status" => exited_cleanly(&resp.data),
+        "exec_batch" => resp.data["results"].as_array().is_some_and(|entries| {
+            entries.iter().all(|entry| entry["ok"].as_bool() == Some(true) && exited_cleanly(entry))
+        }),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn activity_result_distinguishes_exit_status_and_partial_batch() {
+    let success = IpcResponse::ok(serde_json::json!({"exitCode": 0, "timedOut": false}));
+    let timeout = IpcResponse::ok(serde_json::json!({"exitCode": 0, "timedOut": true}));
+    let batch = IpcResponse::ok(serde_json::json!({
+        "results": [{"ok": true, "exitCode": 0}, {"ok": false, "exitCode": 1}],
+    }));
+    assert!(activity_succeeded("exec_command", &success));
+    assert!(!activity_succeeded("exec_command", &timeout));
+    assert!(!activity_succeeded("exec_batch", &batch));
+    assert!(!activity_succeeded("list_servers", &IpcResponse::err("未执行")));
 }
 
 fn tool_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {

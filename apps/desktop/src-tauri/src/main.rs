@@ -14,7 +14,6 @@ mod notify;
 mod observe;
 mod ops;
 mod review;
-mod secrets;
 mod ssh;
 mod state;
 mod store;
@@ -243,16 +242,6 @@ fn main() {
                 ipc::serve(state_for_ipc, dir_for_ipc).await;
             });
 
-            // R9：过期敏感引用清扫（本地映射；远端 tmpfs 文件靠生命周期兜底）。
-            // 不需要解锁保险库——清扫只动 meta/表，不碰明文。
-            let state_for_sweep = state.clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    secrets::sweep_expired(&state_for_sweep).await;
-                }
-            });
-
             eprintln!("ServerDesk 数据目录: {}", dir.display());
             Ok(())
         })
@@ -286,13 +275,8 @@ fn main() {
             commands::ai_review_save,
             commands::ai_review_test,
             commands::ai_review_recent,
-            // 敏感引用（R9）
-            commands::secret_config_info,
-            commands::secret_config_save,
-            commands::secret_refs_list,
-            commands::secret_refs_create,
-            commands::secret_refs_revoke,
             // 审批
+            notify::approval_notification_permission,
             commands::approvals_pending,
             commands::approval_decide,
             // 审计

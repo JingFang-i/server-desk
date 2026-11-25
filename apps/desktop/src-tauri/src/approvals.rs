@@ -64,11 +64,21 @@ impl Approvals {
         pending
     }
 
+    /// 审批可能已被处理，只有有效待审批项才更新意见。
+    pub fn set_ai_note(&self, id: &str, note: String) -> bool {
+        let mut entries = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries.get_mut(id).filter(|e| e.deadline > Instant::now()) else {
+            return false;
+        };
+        entry.pending.ai_note = Some(note);
+        true
+    }
+
     /// 用户决定；返回是否成功送达（不存在/已过期 → false）。
     pub fn decide(&self, id: &str, approve: bool) -> bool {
         match self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(id) {
-            Some(entry) => entry.tx.send(approve).is_ok(),
-            None => false,
+            Some(entry) if entry.deadline > Instant::now() => entry.tx.send(approve).is_ok(),
+            _ => false,
         }
     }
 
@@ -90,4 +100,18 @@ impl Approvals {
         list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         list
     }
+}
+
+#[cfg(test)]
+#[test]
+fn review_note_updates_pending_entry_only() {
+    let approvals = Approvals::default();
+    let (tx, mut rx) = oneshot::channel();
+    let pending = approvals.create("server", "服务器", "uptime", None, tx);
+    assert!(approvals.pending()[0].ai_note.is_none());
+    assert!(approvals.set_ai_note(&pending.id, "建议人工确认".into()));
+    assert_eq!(approvals.pending()[0].ai_note.as_deref(), Some("建议人工确认"));
+    assert!(approvals.decide(&pending.id, true));
+    assert_eq!(rx.try_recv(), Ok(true));
+    assert!(!approvals.set_ai_note(&pending.id, "结果晚于审批".into()));
 }

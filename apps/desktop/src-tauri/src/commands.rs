@@ -496,7 +496,7 @@ pub fn ai_review_info(
     Ok(state.reviewer.info(&state.store, &state.vault))
 }
 
-/// 保存审查配置并热生效；`api_key` 为空 / None 表示不修改已存 Key。
+/// 保存审查配置并热生效。同一端点留空保留 Key，端点变更时移除旧 Key。
 /// Key 加密落盘；审计只记配置事实与「key 是否更新」，绝不记 Key 本体。
 #[tauri::command]
 pub fn ai_review_save(
@@ -510,14 +510,7 @@ pub fn ai_review_save(
         .as_deref()
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false);
-    if key_changed {
-        crate::review::config::save_api_key(
-            &state.store,
-            &state.vault,
-            api_key.as_deref().unwrap_or_default(),
-        )?;
-    }
-    state.reviewer.set_config(&state.store, cfg)?;
+    state.reviewer.set_config(&state.store, &state.vault, cfg, api_key.as_deref())?;
     let saved = state.reviewer.config();
     ops::audit(
         &state,
@@ -558,17 +551,16 @@ pub struct ReviewTestResult {
 #[tauri::command]
 pub async fn ai_review_test(state: State<'_, Arc<AppState>>) -> Result<ReviewTestResult, String> {
     let state = state.inner().clone();
-    let cfg = state.reviewer.config();
+    let (cfg, _, key) = state.reviewer.request_settings(&state.store, &state.vault);
     if !cfg.enabled {
         return Err("AI 审查未启用：请先开启并保存配置".into());
     }
-    let key = crate::review::config::load_api_key(&state.store, &state.vault)?
-        .filter(|k| !k.trim().is_empty());
+    let key = key?.filter(|k| !k.trim().is_empty());
     let Some(key) = key else {
         return Err("未配置 API Key".into());
     };
     let outcome = crate::review::client::chat_json(
-        state.reviewer.http(),
+        state.reviewer.http(&cfg)?,
         &cfg,
         Some(&key),
         "你是服务器运维命令的安全审查员。只输出 JSON，不要解释。",
@@ -577,13 +569,15 @@ pub async fn ai_review_test(state: State<'_, Arc<AppState>>) -> Result<ReviewTes
     .await;
     match outcome {
         Ok(o) => {
+            let model = crate::review::client::redact(&state.guard, &key, &o.model);
+            let content = crate::review::client::redact(&state.guard, &key, &o.content);
             ops::audit(
                 &state,
                 "user",
                 None,
                 "ai_review_test",
                 &truncate(
-                    &format!("AI 审查连通性测试：model={} {}ms", o.model, o.latency_ms),
+                    &format!("AI 审查连通性测试：model={model} {}ms", o.latency_ms),
                     AUDIT_DETAIL_MAX,
                 ),
                 "ok",
@@ -591,8 +585,8 @@ pub async fn ai_review_test(state: State<'_, Arc<AppState>>) -> Result<ReviewTes
             Ok(ReviewTestResult {
                 ok: true,
                 latency_ms: o.latency_ms,
-                model: o.model,
-                content: truncate(&o.content, 120),
+                model,
+                content: truncate(&content, 120),
                 error: String::new(),
             })
         }
@@ -623,80 +617,6 @@ pub fn ai_review_recent(
     limit: Option<i64>,
 ) -> Result<Vec<crate::review::ReviewEntry>, String> {
     state.store.recent_reviews(limit.unwrap_or(20))
-}
-
-// ---------- 敏感引用（R9） ----------
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretConfigInfo {
-    pub enabled: bool,
-    pub ttl_minutes: u64,
-}
-
-#[tauri::command]
-pub fn secret_config_info(state: State<'_, Arc<AppState>>) -> Result<SecretConfigInfo, String> {
-    Ok(SecretConfigInfo {
-        enabled: crate::secrets::enabled(&state.store),
-        ttl_minutes: crate::secrets::ttl_minutes(&state.store),
-    })
-}
-
-#[tauri::command]
-pub fn secret_config_save(
-    state: State<'_, Arc<AppState>>,
-    enabled: bool,
-    ttl_minutes: u64,
-) -> Result<SecretConfigInfo, String> {
-    crate::secrets::set_config(&state.store, enabled, ttl_minutes)?;
-    ops::audit(
-        &state,
-        "user",
-        None,
-        "secret_ref_config",
-        &format!("敏感引用：enabled={} ttl={ttl_minutes} 分钟", enabled),
-        "ok",
-    );
-    Ok(SecretConfigInfo { enabled, ttl_minutes })
-}
-
-/// 句柄列表（绝不含明文/密文）。
-#[tauri::command]
-pub fn secret_refs_list(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::store::SecretRefMeta>, String> {
-    state.store.list_secret_refs()
-}
-
-/// 手动登记：把值写入服务器 tmpfs（SFTP，0600）并登记句柄。
-/// 需要保险库已解锁；返回句柄名。审计只记来源描述与句柄，绝不记值。
-#[tauri::command]
-pub async fn secret_refs_create(
-    state: State<'_, Arc<AppState>>,
-    server_id: String,
-    source: String,
-    value: String,
-) -> Result<String, String> {
-    let state = state.inner().clone();
-    if !state.vault.is_unlocked() {
-        return Err("保险库已锁定，请先解锁".into());
-    }
-    if value.trim().is_empty() {
-        return Err("敏感值不能为空".into());
-    }
-    let cfg = ops::load_server_config(&state, &server_id)?;
-    crate::secrets::grant(&state, &ops::conn_params(&cfg), &cfg.id, &source, &value)
-        .await
-}
-
-/// 撤销句柄：删除远端临时文件与本地映射，立即失效。
-#[tauri::command]
-pub async fn secret_refs_revoke(
-    state: State<'_, Arc<AppState>>,
-    handle: String,
-) -> Result<(), String> {
-    let state = state.inner().clone();
-    crate::secrets::revoke(&state, &handle).await.map(|_| ())
 }
 
 // ---------- 审批 ----------

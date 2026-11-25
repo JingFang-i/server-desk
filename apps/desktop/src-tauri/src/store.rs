@@ -60,14 +60,6 @@ CREATE TABLE IF NOT EXISTS ai_review_log (
   error          TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ai_review_ts ON ai_review_log(ts DESC);
-CREATE TABLE IF NOT EXISTS secret_refs (
-  id          TEXT PRIMARY KEY,      -- 句柄名，如 SD_SEC_a7b3c9d2
-  server_id   TEXT NOT NULL,         -- 绑定的服务器（跨服务器使用即拒绝）
-  source      TEXT NOT NULL DEFAULT '',
-  value_blob  BLOB NOT NULL,         -- AES-256-GCM(DEK, 明文值)，绝不明文落盘
-  created_at  TEXT NOT NULL,
-  expires_at  TEXT NOT NULL          -- RFC3339；过期即失效并清扫
-);
 ";
 
 #[derive(Debug, Clone)]
@@ -139,6 +131,33 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+// 仅旧版数据库需要处理。保留历史记录供人工在原主机核对，避免按已改址的资产自动删除文件。
+fn retire_legacy_secret_refs(conn: &Connection) -> rusqlite::Result<()> {
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='secret_refs')
+         AND NOT EXISTS(SELECT 1 FROM meta WHERE key='legacy_secret_refs_retired')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !pending {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let has_copy_flag: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('secret_refs') WHERE name='remote_copy')",
+        [],
+        |row| row.get(0),
+    )?;
+    let disable_ai = if has_copy_flag {
+        "UPDATE servers SET allow_ai=0 WHERE id IN (SELECT server_id FROM secret_refs WHERE remote_copy=1)"
+    } else {
+        "UPDATE servers SET allow_ai=0 WHERE id IN (SELECT server_id FROM secret_refs)"
+    };
+    tx.execute(disable_ai, [])?;
+    tx.execute("INSERT INTO meta(key,value) VALUES ('legacy_secret_refs_retired','1')", [])?;
+    tx.commit()
+}
+
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("打开数据库失败: {e}"))?;
@@ -174,6 +193,7 @@ impl Store {
                 .map_err(|e| format!("迁移审计表失败: {e}"))?;
             }
         }
+        retire_legacy_secret_refs(&conn).map_err(|e| format!("迁移旧版凭据引用失败: {e}"))?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -408,14 +428,21 @@ impl Store {
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map_err(|e| format!("写入 meta 失败: {e}"))?;
-        Ok(())
+        self.set_meta_values(&[(key, value)])
+    }
+
+    pub fn set_meta_values(&self, entries: &[(&str, &str)]) -> Result<(), String> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|e| format!("写入 meta 失败: {e}"))?;
+        for (key, value) in entries {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| format!("写入 meta 失败: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("提交 meta 失败: {e}"))
     }
 
     // ---------- 审计 ----------
@@ -559,109 +586,6 @@ impl Store {
         Ok(n)
     }
 
-    // ---------- 敏感引用（R9） ----------
-
-    /// 写入一条敏感引用。value_blob 必须已是 AES-GCM 密文（调用方用 DEK 加密）。
-    pub fn insert_secret_ref(&self, r: &SecretRefRow) -> Result<(), String> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO secret_refs (id,server_id,source,value_blob,created_at,expires_at) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![r.id, r.server_id, r.source, r.value_blob, r.created_at, r.expires_at],
-        )
-        .map_err(|e| format!("写入敏感引用失败: {e}"))?;
-        Ok(())
-    }
-
-    /// 取句柄的密文与元数据（使用前校验服务器绑定 / 过期）；不存在返回 None。
-    pub fn get_secret_ref(&self, id: &str) -> Result<Option<(SecretRefMeta, Vec<u8>)>, String> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id,server_id,source,created_at,expires_at,value_blob \
-                 FROM secret_refs WHERE id = ?1",
-            )
-            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
-        let mut rows = stmt
-            .query_map(params![id], |r| {
-                Ok((
-                    SecretRefMeta {
-                        id: r.get(0)?,
-                        server_id: r.get(1)?,
-                        source: r.get(2)?,
-                        created_at: r.get(3)?,
-                        expires_at: r.get(4)?,
-                    },
-                    r.get::<_, Vec<u8>>(5)?,
-                ))
-            })
-            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
-        match rows.next() {
-            Some(Ok(pair)) => Ok(Some(pair)),
-            Some(Err(e)) => Err(e.to_string()),
-            None => Ok(None),
-        }
-    }
-
-    /// 全部敏感引用（新→旧，不含值），设置页管理列表用。
-    pub fn list_secret_refs(&self) -> Result<Vec<SecretRefMeta>, String> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id,server_id,source,created_at,expires_at \
-                 FROM secret_refs ORDER BY created_at DESC",
-            )
-            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(SecretRefMeta {
-                    id: r.get(0)?,
-                    server_id: r.get(1)?,
-                    source: r.get(2)?,
-                    created_at: r.get(3)?,
-                    expires_at: r.get(4)?,
-                })
-            })
-            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| e.to_string())?);
-        }
-        Ok(out)
-    }
-
-    /// 撤销句柄：返回是否存在过。
-    pub fn delete_secret_ref(&self, id: &str) -> Result<bool, String> {
-        let conn = self.lock()?;
-        let n = conn
-            .execute("DELETE FROM secret_refs WHERE id = ?1", params![id])
-            .map_err(|e| format!("删除敏感引用失败: {e}"))?;
-        Ok(n > 0)
-    }
-
-    /// 清扫过期句柄：删除本地映射并返回被删的 id 列表（远端 tmpfs 文件由 tmpfs
-    /// 生命周期兜底 + 下次在线清理；tmpfs 重启即失）。
-    pub fn delete_expired_secret_refs(&self, now_rfc3339: &str) -> Result<Vec<String>, String> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare("SELECT id FROM secret_refs WHERE expires_at < ?1")
-            .map_err(|e| format!("清扫敏感引用失败: {e}"))?;
-        let ids: Vec<String> = stmt
-            .query_map(params![now_rfc3339], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("清扫敏感引用失败: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-        if !ids.is_empty() {
-            conn.execute(
-                "DELETE FROM secret_refs WHERE expires_at < ?1",
-                params![now_rfc3339],
-            )
-            .map_err(|e| format!("清扫敏感引用失败: {e}"))?;
-        }
-        Ok(ids)
-    }
-
     // ---------- AI 审查日志（R8.5） ----------
 
     /// 写入一条审查记录。正文只存脱敏摘要与 hash，不落原始命令全文（设计 §3.3）。
@@ -735,28 +659,6 @@ impl Store {
     }
 }
 
-/// 一条敏感引用的写入载荷（R9）。`value_blob` 必须已是 AES-GCM 密文（调用方用 DEK 加密）。
-#[derive(Debug, Clone)]
-pub struct SecretRefRow {
-    pub id: String,
-    pub server_id: String,
-    pub source: String,
-    pub value_blob: Vec<u8>,
-    pub created_at: String,
-    pub expires_at: String,
-}
-
-/// 敏感引用的查询形态（绝不含明文/密文）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretRefMeta {
-    pub id: String,
-    pub server_id: String,
-    pub source: String,
-    pub created_at: String,
-    pub expires_at: String,
-}
-
 /// 一条审查日志的写入载荷（R8.5）。
 #[derive(Debug, Clone)]
 pub struct ReviewLogRow {
@@ -789,6 +691,39 @@ pub struct ReviewLogRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_refs_only_disable_affected_assets_on_first_upgrade() {
+        for has_copy_flag in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE servers(id TEXT, allow_ai INTEGER);
+                 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO servers VALUES ('remote',1),('local',1),('other',1);",
+            ).unwrap();
+            retire_legacy_secret_refs(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE secret_refs(server_id TEXT);
+                 INSERT INTO secret_refs VALUES ('remote'),('local');",
+            ).unwrap();
+            if has_copy_flag {
+                conn.execute_batch(
+                    "ALTER TABLE secret_refs ADD COLUMN remote_copy INTEGER DEFAULT 1;
+                     UPDATE secret_refs SET remote_copy=0 WHERE server_id='local';",
+                ).unwrap();
+            }
+            retire_legacy_secret_refs(&conn).unwrap();
+            let enabled = |id: &str| -> bool {
+                conn.query_row("SELECT allow_ai FROM servers WHERE id=?1", [id], |r| r.get(0)).unwrap()
+            };
+            assert!(!enabled("remote"));
+            assert_eq!(enabled("local"), has_copy_flag);
+            assert!(enabled("other"));
+            conn.execute("UPDATE servers SET allow_ai=1 WHERE id='remote'", []).unwrap();
+            retire_legacy_secret_refs(&conn).unwrap();
+            assert!(enabled("remote"));
+        }
+    }
 
     #[test]
     fn review_log_insert_and_recent() {

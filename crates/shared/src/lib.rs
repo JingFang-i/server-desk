@@ -170,8 +170,6 @@ pub mod action {
     /// AI 智能审查（R8）：审查步骤本身的审计动作，结论写在 outcome
     /// （约定：ok:ai_review:{verdict} 为正常路径；ai_review:degraded:* 为降级）
     pub const AI_REVIEW: &str = "ai_review";
-    /// 敏感数据映射库（R9）：句柄的授予/撤销/过期/使用审计（绝不含明文）
-    pub const SECRET_REF: &str = "secret_ref";
 
     /// 全部已登记动作（可用于校验/导出）
     pub const ALL: &[&str] = &[
@@ -195,6 +193,5 @@ pub mod action {
         MCP_APPROVAL_GRANTED,
         MCP_SET_ENABLED,
         AI_REVIEW,
-        SECRET_REF,
     ];
 }

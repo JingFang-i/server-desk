@@ -32,3 +32,7 @@ chrono = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"

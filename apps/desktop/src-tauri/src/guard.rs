@@ -199,6 +199,10 @@ fn is_echo_only(segment: &str) -> bool {
 
 /// 凭据泄露防护：命令里出现读凭据的动作即硬拒绝（AI 与真实模板都过这一关）。
 fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
+    // 只对单一的 systemd 配置读取放宽 env 规则，保留其他固定泄露保护。
+    if g.leak.env_word.is_match(command) && !g.leak.systemd_env_read.is_match(command) {
+        return Some(Decision::Blocked("命中凭据泄露防护规则「env」".into()));
+    }
     for re in &g.leak.cmd_blockers {
         if re.is_match(command) {
             return Some(Decision::Blocked(format!(
@@ -211,6 +215,8 @@ fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
 }
 /// 凭据泄露防护（固定规则，不开放编辑）：AI 命令包含即硬拒绝，输出命中即脱敏。
 struct LeakGuard {
+    env_word: Regex,
+    systemd_env_read: Regex,
     cmd_blockers: Vec<Regex>,
     out_scrubbers: Vec<(Regex, &'static str)>,
     writeish: Regex,
@@ -219,9 +225,6 @@ struct LeakGuard {
 impl LeakGuard {
     fn build() -> Self {
         let cmd_blockers = [
-            // env 泄露：按**命令词**锚定（段首/sudo 后），不再误伤路径组件里的 env
-            // （如 /etc/systemd/env 这类 systemd EnvironmentFile）
-            r"(?im)(?:^|[;&|]\s*|\bsudo\s+)env(?:\s|$)",
             r"\bprintenv\b",
             r"(^|[|;&])\s*set\s*(\s|$)",
             r"\bid_rsa\b",
@@ -232,7 +235,7 @@ impl LeakGuard {
             r"/etc/shadow",
             r"authorized_keys",
             r"\bhistory\b",
-            // R9：敏感映射库探测——句柄明文所在目录与进程环境嗅探，一律硬拒
+            // 旧版凭据副本探测——句柄明文所在目录与进程环境嗅探，一律硬拒
             r"serverdesk-secrets",
             r"strings\s+/proc",
         ]
@@ -273,7 +276,13 @@ impl LeakGuard {
             ),
         ];
         let writeish = Regex::new(&format!("(?i){WRITEISH_RE}")).expect("writeish regex");
-        Self { cmd_blockers, out_scrubbers, writeish }
+        Self {
+            env_word: Regex::new(r"(?i)\benv\b").expect("env regex"),
+            systemd_env_read: Regex::new(
+                r"(?i)^(?:cat|head|tail)[ \t]+/etc/systemd/(?:[a-z0-9_-]+(?:\.[a-z0-9_-]+)*/)*(?:env|[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.env)$",
+            ).expect("systemd env regex"),
+            cmd_blockers, out_scrubbers, writeish,
+        }
     }
 }
 
@@ -343,8 +352,7 @@ const READ_PATH_DENY: &[&str] = &[
     ".pem",
     "/etc/shadow",
     "authorized_keys",
-    // 注意：`.env` 家族不在本子串表里——由 evaluate_read_path 按 basename 精确拦截，
-    // 避免子串匹配误伤 /etc 下 `app.env` 这类 systemd EnvironmentFile 常规配置
+    // .env 规则单独保留 systemd 路径例外（见 evaluate_read_path）。
     "credential",
     "secret",
     ".gnupg",
@@ -353,7 +361,7 @@ const READ_PATH_DENY: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".docker/config.json",
-    // R9：敏感映射库明文副本目录（tmpfs），读取一律硬拒
+    // 旧版凭据副本目录（tmpfs），读取一律硬拒
     "/run/serverdesk-secrets",
 ];
 
@@ -379,7 +387,7 @@ const WRITE_PATH_DENY: &[&str] = &[
     "/usr/sbin",
     "/usr/local/bin",
     ".pem",
-    // R9：敏感映射库目录不得写入/覆盖
+    // 旧版凭据目录不得写入/覆盖
     "/run/serverdesk-secrets",
 ];
 
@@ -567,9 +575,7 @@ impl Guard {
 
     /// AI 读取远程路径的判定：命中泄露黑名单即拒绝，否则放行。
     ///
-    /// `.env` 家族（dotenv：`.env`、`.env.local`、`.env.production`…）按**文件名**精确拦截
-    /// ——只拦 basename，不误伤 /etc 下 `app.env` 这类 systemd EnvironmentFile 常规配置
-    /// （其内容读取后仍过输出脱敏）。
+    /// 仅对 /etc/systemd 下的常规 EnvironmentFile 放宽 .env 路径规则。
     pub fn evaluate_read_path(&self, path: &str) -> Decision {
         let lower = path.to_lowercase();
         for p in READ_PATH_DENY {
@@ -579,11 +585,13 @@ impl Guard {
                 ));
             }
         }
-        let basename = lower.rsplit('/').next().unwrap_or("");
-        if basename == ".env" || basename.starts_with(".env.") {
-            return Decision::Blocked(
-                "路径命中凭据/敏感文件保护规则「.env」——AI 不得读取该文件".to_string(),
-            );
+        if lower.contains(".env") {
+            let systemd_config = self.read().leak.systemd_env_read.is_match(&format!("cat {path}"));
+            if !systemd_config {
+                return Decision::Blocked(
+                    "路径命中凭据/敏感文件保护规则「.env」——AI 不得读取该文件".to_string(),
+                );
+            }
         }
         Decision::Allow
     }
@@ -709,9 +717,9 @@ mod tests {
     }
 
     #[test]
-    fn blocks_secret_ref_probing() {
+    fn blocks_legacy_credential_directory_probing() {
         let g = guard();
-        // R9：句柄明文所在目录与进程环境嗅探必须硬拒
+        // 旧版凭据目录与进程环境嗅探必须硬拒
         assert!(matches!(
             g.evaluate("cat /run/serverdesk-secrets/SD_SEC_a7b3c9d2"),
             Decision::Blocked(_)
@@ -748,6 +756,14 @@ mod tests {
             guard().evaluate("sudo env"),
             Decision::Blocked(_)
         ));
+    }
+
+    #[test]
+    fn systemd_exception_preserves_credential_guards() {
+        let g = guard();
+        assert!(matches!(g.evaluate("cat /etc/systemd/system/app.env"), Decision::Allow));
+        assert!(matches!(g.evaluate("cat /opt/app/app.env"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate_read_path("/opt/app/app.env"), Decision::Blocked(_)));
     }
 
     #[test]

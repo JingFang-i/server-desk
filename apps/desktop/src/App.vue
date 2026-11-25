@@ -17,6 +17,7 @@ import {
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type VaultStatus } from "./api";
+import { useActivityStore } from "./stores/activity";
 import ApprovalAlert from "./components/ApprovalAlert.vue";
 import UpdatePrompt from "./components/UpdatePrompt.vue";
 import ServersView from "./views/ServersView.vue";
@@ -29,6 +30,7 @@ import LockGate from "./views/LockGate.vue";
 
 type PageKey = "servers" | "approvals" | "audit" | "changes" | "backup" | "settings";
 const page = ref<PageKey>("servers");
+const activity = useActivityStore();
 const vault = ref<VaultStatus | null>(null);
 const booted = ref(false);
 /** 待审批数量：菜单角标，由 ApprovalAlert 轮询维护 */
@@ -95,6 +97,7 @@ let unlistenMenuLock: UnlistenFn | undefined;
 let pollTimer: number | undefined;
 
 onMounted(async () => {
+  void activity.init().catch(() => {});
   await refreshVault();
   booted.value = true;
   unlisten = await listen("vault-locked", () => refreshVault());

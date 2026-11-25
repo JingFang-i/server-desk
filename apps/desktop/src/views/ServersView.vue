@@ -31,7 +31,7 @@ import { EllipsisVertical, FolderOpenOutline } from "@vicons/ionicons5";
 import { api, type SaveServerInput, type ServerConfig } from "../api";
 import { open, save as save$ } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
-import { useActivityStore, outcomeKind, prettyTool } from "../stores/activity";
+import { useActivityStore } from "../stores/activity";
 
 const store = useServersStore();
 const activity = useActivityStore();
@@ -108,7 +108,6 @@ onMounted(() => {
   store.load().catch((e) => message.error(String(e)));
   refreshConnStatus();
   statusTimer = window.setInterval(refreshConnStatus, 5000);
-  void activity.init();
 });
 onUnmounted(() => {
   if (statusTimer) window.clearInterval(statusTimer);
@@ -1015,7 +1014,7 @@ const selectedConnState = computed<ConnState>(() =>
           size="small"
           description="暂无 AI 调用（AI 通过 MCP 操作服务器时会实时显示在这里）"
         />
-        <div v-for="(e, i) in activity.entries.slice(0, 12)" :key="e.key + i" class="activity-row">
+        <div v-for="e in activity.entries.slice(0, 12)" :key="e.id" class="activity-row">
           <n-tag
             size="small"
             :bordered="false"
@@ -1024,7 +1023,7 @@ const selectedConnState = computed<ConnState>(() =>
             {{ e.running ? "执行中…" : e.ok ? "完成" : "失败/拦截" }}
           </n-tag>
           <span class="act-server">{{ e.server || "全局" }}</span>
-          <span class="act-tool">{{ prettyTool(e.tool) }}</span>
+          <span class="act-tool">{{ e.tool }}</span>
           <span class="act-time">{{ new Date(e.ts).toLocaleTimeString("zh-CN", { hour12: false }) }}</span>
         </div>
       </div>

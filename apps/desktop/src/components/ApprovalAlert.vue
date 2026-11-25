@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref } from "vue";
+import { computed, h, onMounted, onUnmounted } from "vue";
 import { NButton, NTag, useMessage, useNotification } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type PendingApproval } from "../api";
-import { audioState, ensureAudio, playApprovalChime, primeAlertSound } from "../alert";
-import { notifyPermission, requestNotifyPermission, type NotifyPermission } from "../notifyStatus";
+import { alertAudioState, ensureAudio, playApprovalChime, primeAlertSound } from "../alert";
+import { notifyPermission, notifyPermissionState } from "../notifyStatus";
 
 /**
  * 全局审批提醒：新审批到达 → 提示音 + 应用内通知 + 菜单角标；
@@ -22,13 +22,13 @@ const POLL_MS = 3000;
 const REMIND_MS = 30000;
 
 /** 提示音是否已可出声（自动播放策略要求用户手势后才能响） */
-const audioReady = ref(audioState() === "running");
-/** 系统通知授权状态：granted / denied / unknown */
-const notifyPerm = ref<NotifyPermission>("unknown");
+const audioReady = computed(() => alertAudioState.value === "running");
+/** 系统通知授权状态由设置页和横幅共享 */
+const notifyPerm = notifyPermissionState;
 
 /** 横幅是否显示：提示音未就绪，或系统通知明确被拒（unknown 不算缺失，避免误报） */
 const bannerVisible = computed(
-  () => !audioReady.value || notifyPerm.value === "denied"
+  () => !audioReady.value || notifyPerm.value === "denied" || notifyPerm.value === "prompt"
 );
 
 let pollTimer: number | undefined;
@@ -36,15 +36,9 @@ let remindTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
 let pendingCount = 0;
 
-/** 手势后复查：被动解锁成功即收起横幅 */
-function checkAudio() {
-  audioReady.value = audioState() === "running";
-}
-
 /** 用户点击「开启提示音」：显式 resume + 试听一声 */
 async function enableAudio() {
   const ok = await ensureAudio();
-  audioReady.value = ok;
   if (ok) {
     message.success("审批提示音已启用（刚才那声就是试听）");
   } else {
@@ -53,12 +47,11 @@ async function enableAudio() {
 }
 
 async function checkPerm() {
-  notifyPerm.value = await notifyPermission();
+  await notifyPermission();
 }
 
 async function requestPerm() {
-  const r = await requestNotifyPermission();
-  notifyPerm.value = r;
+  const r = await notifyPermission(true);
   if (r === "granted") {
     message.success("系统通知已授权：应用在后台也会弹出审批提醒并带提示音");
   } else if (r === "denied") {
@@ -130,20 +123,11 @@ function alertOnce(item: PendingApproval) {
   });
 }
 
-function onPointerDown() {
-  primeAlertSound();
-  checkAudio();
-}
-function onKeyDown() {
-  primeAlertSound();
-  checkAudio();
-}
-
 onMounted(async () => {
-  // 首次用户交互时解锁音频（自动播放策略），并复查横幅状态
-  window.addEventListener("pointerdown", onPointerDown, { once: true, capture: true });
-  window.addEventListener("keydown", onKeyDown, { once: true, capture: true });
-  checkPerm();
+  window.addEventListener("pointerdown", primeAlertSound, { once: true, capture: true });
+  window.addEventListener("keydown", primeAlertSound, { once: true, capture: true });
+  window.addEventListener("focus", checkPerm);
+  void checkPerm();
 
   await refresh();
   try {
@@ -161,8 +145,9 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  window.removeEventListener("pointerdown", onPointerDown, true);
-  window.removeEventListener("keydown", onKeyDown, true);
+  window.removeEventListener("pointerdown", primeAlertSound, true);
+  window.removeEventListener("keydown", primeAlertSound, true);
+  window.removeEventListener("focus", checkPerm);
   if (pollTimer) window.clearInterval(pollTimer);
   if (remindTimer) window.clearInterval(remindTimer);
   unlisten?.();
@@ -177,10 +162,10 @@ onUnmounted(() => {
       <span class="banner-text">审批到达时将没有声音（浏览器自动播放策略）</span>
       <n-button size="tiny" type="primary" @click="enableAudio">开启提示音并试听</n-button>
     </div>
-    <div v-if="notifyPerm === 'denied'" class="banner-row">
+    <div v-if="(notifyPerm === 'denied' || notifyPerm === 'prompt')" class="banner-row">
       <n-tag size="small" type="error" :bordered="false">系统通知未授权</n-tag>
-      <span class="banner-text">应用在后台时收不到审批提醒与提示音</span>
-      <n-button size="tiny" type="error" ghost @click="requestPerm">申请授权</n-button>
+      <span class="banner-text">请在系统通知设置中允许 ServerDesk 的后台提醒</span>
+      <n-button v-if="notifyPerm === 'prompt'" size="tiny" type="error" ghost @click="requestPerm">申请授权</n-button>
       <n-button size="tiny" quaternary @click="emit('settings')">去设置</n-button>
     </div>
   </div>

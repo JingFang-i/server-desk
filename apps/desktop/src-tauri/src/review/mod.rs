@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// 审查调用独立限流（次/分钟）：与工具调用限流分开，保护审查 API 成本。
-/// 超限时跳过审查、维持静态判定（审计记 skipped:rate_limited）。
+/// 超限时应用配置的失败策略，并标记降级审计。
 const REVIEW_RATE_PER_MIN: u32 = 60;
 /// 熔断：连续失败 N 次后冷却（已拍板 D2 的一部分）。
 const BREAKER_THRESHOLD: u32 = 3;
@@ -74,8 +74,9 @@ impl Breaker {
 /// 审查器运行时：配置热更新 + 复用 HTTP 连接池 + 缓存 + 熔断 + 并发闸门。
 /// API Key 不在此常驻——每次使用时经 `vault.dek()` 现解（见 config.rs 模块注释）。
 pub struct Reviewer {
-    cfg: RwLock<ReviewConfig>,
-    http: reqwest::Client,
+    cfg: RwLock<(ReviewConfig, u64)>,
+    http: Option<reqwest::Client>,
+    local_http: Option<reqwest::Client>,
     cache: Mutex<VerdictCache>,
     breaker: Mutex<Breaker>,
     sem: Arc<Semaphore>,
@@ -85,13 +86,13 @@ impl Reviewer {
     /// 启动时从 meta 加载；未配置 = 审查关闭（行为与 R7 完全一致）。
     pub fn load(store: &Store) -> Self {
         let cfg = load_config(store);
-        let http = reqwest::Client::builder()
+        let builder = || reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(1500))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .redirect(reqwest::redirect::Policy::none());
         Self {
-            cfg: RwLock::new(cfg),
-            http,
+            cfg: RwLock::new((cfg, 0)),
+            http: builder().build().ok(),
+            local_http: builder().no_proxy().build().ok(),
             cache: Mutex::new(VerdictCache::new(CACHE_CAP)),
             breaker: Mutex::new(Breaker::default()),
             sem: Arc::new(Semaphore::new(REVIEW_CONCURRENCY)),
@@ -99,26 +100,58 @@ impl Reviewer {
     }
 
     pub fn config(&self) -> ReviewConfig {
-        self.cfg.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.cfg.read().unwrap_or_else(|p| p.into_inner()).0.clone()
     }
 
-    /// 保存并热生效（无需重启）。模型/策略/超时变更后旧结论不可复用：
-    /// 同步清空缓存并复位熔断。
-    pub fn set_config(&self, store: &Store, cfg: ReviewConfig) -> Result<(), String> {
-        save_config(store, &cfg)?;
-        *self.cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg;
+    /// 配置和凭据来自同一次读取，防止热更新时混用不同供应商的设置。
+    pub fn request_settings(
+        &self,
+        store: &Store,
+        vault: &crate::vault::Vault,
+    ) -> (ReviewConfig, u64, Result<Option<zeroize::Zeroizing<String>>, String>) {
+        let settings = self.cfg.read().unwrap_or_else(|p| p.into_inner());
+        let key = if settings.0.enabled { config::load_api_key(store, vault) } else { Ok(None) };
+        (settings.0.clone(), settings.1, key)
+    }
+
+    pub fn set_config(
+        &self,
+        store: &Store,
+        vault: &crate::vault::Vault,
+        cfg: ReviewConfig,
+        key: Option<&str>,
+    ) -> Result<(), String> {
+        let mut settings = self.cfg.write().unwrap_or_else(|p| p.into_inner());
+        let previous_endpoint = settings.0.endpoint().ok();
+        let same_endpoint = settings.0.base_url == cfg.base_url
+            || (previous_endpoint.is_some() && previous_endpoint == cfg.endpoint().ok());
+        let key_blob = match key.map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => {
+                cfg.endpoint()?;
+                let dek = vault.dek().map_err(|e| e.to_string())?;
+                Some(config::encode_key_blob(&dek, key)?)
+            }
+            None if !same_endpoint => Some(String::new()),
+            None => None,
+        };
+        save_config(store, &cfg, key_blob.as_deref())?;
+        settings.0 = cfg;
+        settings.1 += 1;
         self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
         *self.breaker.lock().unwrap_or_else(|p| p.into_inner()) = Breaker::default();
         Ok(())
     }
 
     pub fn info(&self, store: &Store, vault: &crate::vault::Vault) -> ReviewInfo {
-        ReviewInfo::of(store, vault, &self.config())
+        let settings = self.cfg.read().unwrap_or_else(|p| p.into_inner());
+        ReviewInfo::of(store, vault, &settings.0)
     }
 
     /// 复用的 HTTP 连接池（连接超时 1.5s；总超时按每次请求的配置）。
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
+    pub fn http(&self, cfg: &ReviewConfig) -> Result<&reqwest::Client, String> {
+        let url = cfg.endpoint()?;
+        let client = if config::is_loopback(&url) { &self.local_http } else { &self.http };
+        client.as_ref().ok_or_else(|| "无法初始化审查 HTTP 客户端".to_string())
     }
 
     async fn permit(&self) -> tokio::sync::SemaphorePermit<'_> {
@@ -162,10 +195,30 @@ impl Reviewer {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn endpoint_change_clears_legacy_key_without_replacement() {
+    let path = std::path::Path::new(":memory:");
+    let store = Store::open(path).unwrap();
+    let vault = crate::vault::Vault::open(std::path::Path::new("."), path).unwrap();
+    let mut cfg = ReviewConfig {
+        base_url: "https://first.example.invalid/v1".into(),
+        ..ReviewConfig::default()
+    };
+    config::save_config(&store, &cfg, Some("fixture-blob")).unwrap();
+    let reviewer = Reviewer::load(&store);
+    reviewer.set_config(&store, &vault, cfg.clone(), None).unwrap();
+    assert!(config::has_key(&store));
+    cfg.base_url = "https://second.example.invalid/v1".into();
+    reviewer.set_config(&store, &vault, cfg.clone(), None).unwrap();
+    assert!(!config::has_key(&store));
+    assert_eq!(config::load_config(&store), cfg);
+}
+
 /// 审查步骤的结构化输出：合并后的最终判定 + 给审批卡展示的 AI 意见。
 pub struct ReviewOutcome {
     pub decision: Decision,
-    /// None = 审查未介入（关闭/静态硬拒跳过/限流跳过）；Some = 有意见可展示
+    /// None = 审查未介入（关闭或静态硬拒跳过）；Some = 有意见可展示
     pub ai_note: Option<String>,
 }
 
@@ -177,7 +230,7 @@ impl ReviewOutcome {
 
 /// AI 审查步骤：输入静态判定，输出合并结果（只会更严，见 verdict::merge）。
 ///
-/// 流程：关闭/Blocked 短路 → 独立限流 → 缓存 → 熔断 → Key → 并发闸门 →
+/// 流程：关闭/Blocked 短路 → 缓存 → 熔断 → Key → 并发闸门 → 独立限流 →
 /// 调模型（命令先过 `guard.sanitize`）→ 解析 → 记录（审计+日志）→ 合并。
 /// 任何失败都按 `failure_policy`（D2 默认 Escalate=转人工审批）兜底并写审计。
 pub(crate) async fn review_and_merge(
@@ -188,18 +241,16 @@ pub(crate) async fn review_and_merge(
     ctx: &ReviewContext<'_>,
     server_id: Option<&str>,
 ) -> ReviewOutcome {
-    let cfg = state.reviewer.config();
+    let (cfg, generation, api_key) = state.reviewer.request_settings(&state.store, &state.vault);
 
-    // 1) 静态硬拒：不送审（模型无权否决硬规则）
+    if !cfg.enabled {
+        return ReviewOutcome::plain(static_decision);
+    }
     if matches!(static_decision, Decision::Blocked(_)) {
         return record_review(
             state, server_id, tool, command, "blocked", "skipped",
             &static_decision, None, "blocked_by_static", false, &cfg, ctx,
         );
-    }
-    // 2) 审查关闭：零开销直通（行为与 R7 完全一致），不留痕
-    if !cfg.enabled {
-        return ReviewOutcome::plain(static_decision);
     }
     let static_str = if matches!(static_decision, Decision::NeedsApproval(_)) {
         "approval"
@@ -207,16 +258,13 @@ pub(crate) async fn review_and_merge(
         "allow"
     };
 
-    // 3) 独立限流：超限跳过审查、维持静态判定（静态规则仍在保护）
-    if state.review_rate.check(REVIEW_RATE_PER_MIN).is_err() {
-        return record_review(
-            state, server_id, tool, command, static_str, "skipped",
-            &static_decision, None, "rate_limited", false, &cfg, ctx,
-        );
-    }
-
-    // 4) 缓存命中：结论可复用，无需调模型（仍完整记录）
-    let key = cache_key(tool, command, static_str, &cfg);
+    // 先用实际送审内容区分缓存。模型请求才占用供应商调用额度。
+    let safe_command = match &api_key {
+        Ok(Some(key)) if !key.is_empty() => client::redact(&state.guard, key, command),
+        _ => state.guard.sanitize(command),
+    };
+    let payload = prompt::build_payload(&cfg, tool, &safe_command, ctx, static_str);
+    let key = cache::request_key(tool, command, static_str, &cfg, &payload, generation);
     let ttl = Duration::from_secs(cfg.cache_ttl_secs);
     if ttl > Duration::ZERO {
         if let Some(mut hit) = state.reviewer.cache_get(&key, ttl) {
@@ -244,7 +292,7 @@ pub(crate) async fn review_and_merge(
     }
 
     // 6) Key（保险库锁定 → 与工具自身失败路径一致；未配置 → 降级）
-    let api_key = match config::load_api_key(&state.store, &state.vault) {
+    let api_key = match api_key {
         Ok(k) => k,
         Err(e) => {
             let ai = Err(format!("读取审查 API Key 失败：{e}"));
@@ -268,18 +316,36 @@ pub(crate) async fn review_and_merge(
         .with_note(note, decision);
     };
 
-    // 7) 送审（强制脱敏 + 限长 + 定界符）→ 调模型 → 解析
-    let payload = prompt::build_payload(&cfg, tool, &state.guard.sanitize(command), ctx, static_str);
-    let system = prompt::system_prompt();
-    let _permit = state.reviewer.permit().await;
-    let res = client::chat_json(state.reviewer.http(), &cfg, Some(&api_key), &system, &payload).await;
-    drop(_permit);
+    let permit = tokio::time::timeout(
+        Duration::from_millis(u64::from(cfg.timeout_ms)),
+        state.reviewer.permit(),
+    ).await;
+    let (res, failure_tag) = match permit {
+        Ok(_permit) if state.reviewer.breaker_open() => (
+            Err("审查熔断中：上游连续失败，冷却期内暂不调用模型".into()), "breaker",
+        ),
+        Ok(_permit) if state.review_rate.check(REVIEW_RATE_PER_MIN).is_err() => (
+            Err("审查速率已达上限".into()), "rate_limited",
+        ),
+        Ok(_permit) => (
+            match state.reviewer.http(&cfg) {
+                Ok(http) => client::chat_json(
+                    http, &cfg, Some(&api_key), &prompt::system_prompt(), &payload,
+                ).await,
+                Err(error) => Err(error),
+            },
+            "call_failed",
+        ),
+        Err(_) => (Err("等待审查并发额度超时".into()), "queue_timeout"),
+    };
 
     let ai: Result<verdict::AiReview, String> = match res {
-        Ok(out) => match verdict::parse(&out.content) {
+        Ok(out) => match verdict::parse_redacted(&out.content, |text| {
+            client::redact(&state.guard, &api_key, text)
+        }) {
             Ok(mut v) => {
                 v.latency_ms = out.latency_ms;
-                v.model = out.model;
+                v.model = client::redact(&state.guard, &api_key, &out.model);
                 v.tokens_in = out.tokens_in;
                 v.tokens_out = out.tokens_out;
                 state.reviewer.breaker_success();
@@ -294,13 +360,15 @@ pub(crate) async fn review_and_merge(
             }
         },
         Err(e) => {
-            state.reviewer.breaker_fail();
+            if failure_tag == "call_failed" {
+                state.reviewer.breaker_fail();
+            }
             Err(crate::text::summary(&e, 120))
         }
     };
     let (ai_verdict, error_tag) = match &ai {
         Ok(v) => (v.verdict.as_str().to_string(), String::new()),
-        Err(_) => ("error".to_string(), "call_failed".to_string()),
+        Err(_) => ("error".to_string(), failure_tag.to_string()),
     };
     let note = ai_note_of(&ai);
     let decision = verdict::merge(&static_decision, &ai, &cfg);
@@ -337,7 +405,8 @@ fn decision_str(d: &Decision) -> &'static str {
 fn skip_reason_text(tag: &str) -> String {
     match tag {
         "blocked_by_static" => "静态规则硬拒，未送审".to_string(),
-        "rate_limited" => "审查限流，本轮跳过".to_string(),
+        "rate_limited" => "审查限流，已应用失败策略".to_string(),
+        "queue_timeout" => "等待审查并发额度超时".to_string(),
         "breaker" => "熔断冷却中，未调用模型".to_string(),
         "key_error" => "读取审查 API Key 失败".to_string(),
         "no_key" => "未配置审查 API Key".to_string(),
@@ -391,7 +460,7 @@ fn record_review(
         ),
         None => (
             String::new(),
-            skip_reason_text(if ai_verdict == "error" { "call_failed" } else { error_tag }),
+            skip_reason_text(error_tag),
             Vec::new(),
             String::new(),
             0,
