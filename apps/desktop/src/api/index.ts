@@ -289,7 +289,7 @@ export const api = {
   vaultLock: () => invoke<void>("vault_lock"),
   vaultSetSettings: (autoLockMinutes: number, keychainAutoUnlock: boolean) =>
     invoke<VaultStatus>("vault_set_settings", { autoLockMinutes, keychainAutoUnlock }),
-  vaultReset: () => invoke<void>("vault_reset"),
+  vaultReset: () => invoke<string>("vault_reset"),
   // 服务器资产
   listServers: () => invoke<ListServersResult>("list_servers"),
   saveServer: (input: SaveServerInput) => invoke<ServerConfig>("save_server", { input }),

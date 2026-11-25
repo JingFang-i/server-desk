@@ -54,8 +54,8 @@ async function doReset() {
   }
   busy.value = true;
   try {
-    await api.vaultReset();
-    message.success("已重置。请重新设置主密码");
+    const snapshot = await api.vaultReset();
+    message.success(`已重置。重置前数据已快照到：${snapshot}`, { duration: 12000 });
     resetText.value = "";
     showReset.value = false;
     emit("unlocked"); // 重置后 status.initialized 变为 false，父组件会刷新
@@ -105,14 +105,16 @@ async function doReset() {
           <template #trigger>
             <button class="linklike">忘记主密码？</button>
           </template>
-          重置将删除所有服务器记录与凭据，且不可恢复。确定继续？
+          重置将删除所有服务器记录与凭据。重置前会自动保存一份数据库快照到数据目录
+          backups/，但请确认那确实是你要的操作。确定继续？
         </n-popconfirm>
       </div>
 
       <div v-if="showReset" class="resetbox">
         <p>
-          此操作将删除<b>全部</b>服务器资产与凭据，不可恢复。
-          输入大写 <code>RESET</code> 确认：
+          此操作将删除<b>全部</b>服务器资产与凭据。
+          重置前会自动保存一份数据库快照（可用旧主密码解密或直接替换回滚），
+          但界面上的数据仍会清空。输入大写 <code>RESET</code> 确认：
         </p>
         <n-input v-model:value="resetText" placeholder="RESET" />
         <n-button type="error" block :loading="busy" @click="doReset">

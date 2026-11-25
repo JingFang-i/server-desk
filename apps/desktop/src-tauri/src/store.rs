@@ -335,6 +335,20 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// 重置前快照：用 `VACUUM INTO` 生成一致性单文件备份（包含 WAL 中已提交的数据）。
+    /// 文件内含密文凭据与保险库元数据，可直接用文件替换方式回滚。
+    pub fn snapshot_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let conn = self.lock()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建备份目录失败: {e}"))?;
+        }
+        // VACUUM INTO 不支持绑定参数：路径按 SQLite 单引号规则转义
+        let escaped = path.display().to_string().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
+            .map_err(|e| format!("重置前快照失败: {e}"))?;
+        Ok(())
+    }
+
     /// 清空保险库关联的资产和审查数据。旧版远端副本记录继续用于恢复时的保护。
     pub fn wipe_all(&self) -> Result<(), String> {
         let mut conn = self.lock()?;
@@ -783,6 +797,30 @@ mod tests {
         assert!(store.recent_reviews(10).unwrap().is_empty());
         assert!(store.get_meta(crate::review::config::META_CONFIG).unwrap().is_none());
         assert!(store.get_meta(crate::review::config::META_KEY_BLOB).unwrap().is_none());
+    }
+
+    #[test]
+    fn pre_reset_snapshot_keeps_data() {
+        let db = std::env::temp_dir().join(format!("sd-snap-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+        store
+            .insert_audit("2026-11-25T00:00:00+00:00", "", "user", None, "", "ssh_exec", "d", "ok")
+            .unwrap();
+        let snap = std::env::temp_dir().join(format!("sd-snap-out-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&snap);
+        store.snapshot_to(&snap).expect("snapshot");
+
+        // 快照是独立文件：主库被清空后，快照仍保留数据
+        store.wipe_all().unwrap();
+        assert_eq!(store.audit_list(10, None, None, None).unwrap().len(), 0);
+        let restored = Store::open(&snap).expect("open snapshot");
+        assert_eq!(
+            restored.audit_list(10, None, None, None).unwrap().len(),
+            1,
+            "重置前快照必须保留数据"
+        );
+        let _ = std::fs::remove_file(&snap);
     }
 
     #[test]

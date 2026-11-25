@@ -95,12 +95,54 @@ pub async fn vault_set_settings(
     .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
-/// 危险操作：忘记主密码时的重置（清空全部数据，不可恢复）。
+/// 危险操作：忘记主密码时的重置（清空全部数据）。
+///
+/// 重置前先用 `VACUUM INTO` 落一份**数据库快照**（`backups/pre-reset-<时间>.db`）：
+/// 快照失败则中止重置（fail-closed），避免误点导致数据不可恢复。
+/// 快照内含保险库元数据与密文凭据，可用旧主密码解密，或直接文件替换回滚。
 #[tauri::command]
-pub fn vault_reset(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub fn vault_reset(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let dir = state.dir.join("backups");
+    let path = dir.join(format!(
+        "pre-reset-{}.db",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    state.store.snapshot_to(&path)?;
+    prune_pre_reset(&dir, 5);
     state.reviewer.reset(&state.store, &state.vault)?;
-    ops::audit(&state, "user", None, "vault_reset", "重置保险库并清空数据", "ok");
-    Ok(())
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "vault_reset",
+        &format!("重置保险库并清空数据；重置前快照：{}", path.display()),
+        "ok",
+    );
+    Ok(path.display().to_string())
+}
+
+/// 重置前快照只保留最近 N 份，避免无限增长（按文件名时间戳排序）。
+fn prune_pre_reset(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("pre-reset-") && n.ends_with(".db"))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let remove_count = files.len() - keep;
+    for p in files.into_iter().take(remove_count) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 // ---------- 服务器资产 ----------
