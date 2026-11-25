@@ -62,9 +62,29 @@ pub struct AiReview {
     pub verdict: AiVerdict,
     pub risk: Risk,
     pub reason: String,
+    /// 风险类别（模型输出，最多取 4 个）：destructive/credential/network/
+    /// privilege/service/data/unknown；缺失为空。仅展示与日志用，不参与合并序。
+    /// 消费方：R8.4 审批卡展示、R8.5 审查日志（当前先采集）。
+    #[allow(dead_code)]
+    pub categories: Vec<String>,
     pub cached: bool,
     pub latency_ms: u64,
     pub model: String,
+}
+
+/// 解析 categories：字符串数组，最多取 4 个，单项截断 24 字；缺失/类型错 → 空。
+fn parse_categories(v: &serde_json::Value) -> Vec<String> {
+    v.get("categories")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.as_str())
+                .map(|s| truncate(s.trim(), 24))
+                .filter(|s| !s.is_empty())
+                .take(4)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 从模型输出解析结论。
@@ -110,6 +130,7 @@ pub fn parse(content: &str) -> Result<AiReview, String> {
                 verdict,
                 risk: Risk::parse(v.get("risk").and_then(|x| x.as_str()).unwrap_or("")),
                 reason,
+                categories: parse_categories(&v),
                 cached: false,
                 latency_ms: 0,
                 model: String::new(),
@@ -126,6 +147,7 @@ pub fn parse(content: &str) -> Result<AiReview, String> {
             verdict: AiVerdict::Review,
             risk: Risk::Medium,
             reason: reason.to_string(),
+            categories: Vec::new(),
             cached: false,
             latency_ms: 0,
             model: String::new(),
@@ -255,6 +277,7 @@ mod tests {
             verdict,
             risk: Risk::Medium,
             reason: "测试理由".to_string(),
+            categories: Vec::new(),
             cached: false,
             latency_ms: 0,
             model: "m".into(),
@@ -359,6 +382,16 @@ mod tests {
     fn parse_fails_when_no_json() {
         assert!(parse("我觉得没问题").is_err());
         assert!(parse("{\"verdict\": truncated").is_err());
+    }
+
+    #[test]
+    fn parse_reads_categories_and_caps_them() {
+        let a = parse("{\"verdict\":\"deny\",\"risk\":\"critical\",\"reason\":\"x\",\"categories\":[\"network\",\"destructive\"]}").unwrap();
+        assert_eq!(a.categories, vec!["network", "destructive"]);
+        let b = parse("{\"verdict\":\"allow\",\"reason\":\"x\",\"categories\":[1,2,\"data\",\"a\",\"b\"]}").unwrap();
+        assert_eq!(b.categories, vec!["data", "a", "b"], "非字符串项被过滤，最多取 4 个");
+        let c = parse("{\"verdict\":\"review\",\"reason\":\"x\"}").unwrap();
+        assert!(c.categories.is_empty(), "缺失 categories 不报错");
     }
 
     #[test]

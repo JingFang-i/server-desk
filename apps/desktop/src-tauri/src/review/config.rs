@@ -130,7 +130,8 @@ impl Default for ReviewConfig {
             review_files: false,
             send_server_context: false,
             cache_ttl_secs: 1800,
-            prompt_version: "v1".to_string(),
+            // v2：few-shot 锚定判定粒度（R8.3）；缓存 key 含此版本，升版本即失效旧结论
+            prompt_version: "v2".to_string(),
         }
     }
 }

@@ -96,6 +96,7 @@ mod tests {
             verdict,
             risk: Risk::Medium,
             reason: "r".into(),
+            categories: Vec::new(),
             cached: false,
             latency_ms: 0,
             model: "m".into(),
@@ -136,7 +137,7 @@ mod tests {
         c1.model = "other".into();
         let k5 = cache_key("exec_command", "uptime", "allow", &c1);
         let mut c2 = c0.clone();
-        c2.prompt_version = "v2".into();
+        c2.prompt_version = "v3".into();
         let k6 = cache_key("exec_command", "uptime", "allow", &c2);
         let all = [k1, k2, k3, k4, k5, k6];
         for i in 0..all.len() {
