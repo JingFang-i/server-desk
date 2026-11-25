@@ -616,14 +616,13 @@ pub async fn ai_review_test(state: State<'_, Arc<AppState>>) -> Result<ReviewTes
     }
 }
 
-/// 最近审查记录（R8.5 接入 `ai_review_log` 表；当前返回空集供前端联调）。
+/// 最近审查记录（`ai_review_log` 表，新→旧），设置页展示。
 #[tauri::command]
 pub fn ai_review_recent(
     state: State<'_, Arc<AppState>>,
     limit: Option<i64>,
 ) -> Result<Vec<crate::review::ReviewEntry>, String> {
-    let _ = (state, limit);
-    Ok(Vec::new())
+    state.store.recent_reviews(limit.unwrap_or(20))
 }
 
 // ---------- 审批 ----------

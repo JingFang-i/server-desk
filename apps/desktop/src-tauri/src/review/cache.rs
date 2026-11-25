@@ -100,6 +100,8 @@ mod tests {
             cached: false,
             latency_ms: 0,
             model: "m".into(),
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 

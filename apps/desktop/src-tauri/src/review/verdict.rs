@@ -70,6 +70,9 @@ pub struct AiReview {
     pub cached: bool,
     pub latency_ms: u64,
     pub model: String,
+    /// 输出 token 统计（R8.5 落审查日志，用于成本观测）
+    pub tokens_in: u32,
+    pub tokens_out: u32,
 }
 
 /// 解析 categories：字符串数组，最多取 4 个，单项截断 24 字；缺失/类型错 → 空。
@@ -134,6 +137,8 @@ pub fn parse(content: &str) -> Result<AiReview, String> {
                 cached: false,
                 latency_ms: 0,
                 model: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
             });
         }
         degraded_reason = Some(if raw.is_empty() {
@@ -151,6 +156,8 @@ pub fn parse(content: &str) -> Result<AiReview, String> {
             cached: false,
             latency_ms: 0,
             model: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
         });
     }
     Err("响应中未找到可解析的 JSON 对象".to_string())
@@ -281,6 +288,8 @@ mod tests {
             cached: false,
             latency_ms: 0,
             model: "m".into(),
+            tokens_in: 0,
+            tokens_out: 0,
         })
     }
 

@@ -37,6 +37,29 @@ CREATE TABLE IF NOT EXISTS known_hosts (
     first_seen  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ai_review_log (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts             TEXT NOT NULL,
+  session        TEXT NOT NULL DEFAULT '',
+  tool           TEXT NOT NULL,
+  server_id      TEXT,
+  server_name    TEXT NOT NULL DEFAULT '',
+  command_hash   TEXT NOT NULL,
+  command_digest TEXT NOT NULL,
+  static_verdict  TEXT NOT NULL,
+  ai_verdict     TEXT NOT NULL,
+  final_verdict  TEXT NOT NULL,
+  risk           TEXT NOT NULL DEFAULT '',
+  reason         TEXT NOT NULL DEFAULT '',
+  categories     TEXT NOT NULL DEFAULT '[]',
+  model          TEXT NOT NULL DEFAULT '',
+  latency_ms     INTEGER NOT NULL DEFAULT 0,
+  tokens_in      INTEGER NOT NULL DEFAULT 0,
+  tokens_out     INTEGER NOT NULL DEFAULT 0,
+  cached         INTEGER NOT NULL DEFAULT 0,
+  error          TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ai_review_ts ON ai_review_log(ts DESC);
 ";
 
 #[derive(Debug, Clone)]
@@ -527,11 +550,154 @@ impl Store {
         };
         Ok(n)
     }
+
+    // ---------- AI 审查日志（R8.5） ----------
+
+    /// 写入一条审查记录。正文只存脱敏摘要与 hash，不落原始命令全文（设计 §3.3）。
+    pub fn insert_review_log(&self, r: &ReviewLogRow) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO ai_review_log (ts,session,tool,server_id,server_name,command_hash,\
+             command_digest,static_verdict,ai_verdict,final_verdict,risk,reason,categories,\
+             model,latency_ms,tokens_in,tokens_out,cached,error) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            params![
+                r.ts,
+                r.session,
+                r.tool,
+                r.server_id,
+                r.server_name,
+                r.command_hash,
+                r.command_digest,
+                r.static_verdict,
+                r.ai_verdict,
+                r.final_verdict,
+                r.risk,
+                r.reason,
+                serde_json::to_string(&r.categories).unwrap_or_else(|_| "[]".into()),
+                r.model,
+                r.latency_ms,
+                r.tokens_in,
+                r.tokens_out,
+                r.cached as i64,
+                r.error
+            ],
+        )
+        .map_err(|e| format!("写入审查日志失败: {e}"))?;
+        Ok(())
+    }
+
+    /// 最近审查记录（新→旧），设置页「最近审查记录」与排查用。
+    pub fn recent_reviews(&self, limit: i64) -> Result<Vec<crate::review::ReviewEntry>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,ts,tool,server_name,ai_verdict,final_verdict,risk,reason,categories,\
+                 model,latency_ms,cached,error FROM ai_review_log ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("查询审查日志失败: {e}"))?;
+        let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<crate::review::ReviewEntry> {
+            Ok(crate::review::ReviewEntry {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                tool: r.get(2)?,
+                server_name: r.get(3)?,
+                ai_verdict: r.get(4)?,
+                final_verdict: r.get(5)?,
+                risk: r.get(6)?,
+                reason: r.get(7)?,
+                categories: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+                model: r.get(9)?,
+                latency_ms: r.get(10)?,
+                cached: r.get::<_, i64>(11)? != 0,
+                error: r.get(12)?,
+            })
+        };
+        let rows = stmt
+            .query_map(params![limit.clamp(1, 100)], map)
+            .map_err(|e| format!("查询审查日志失败: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+}
+
+/// 一条审查日志的写入载荷（R8.5）。
+#[derive(Debug, Clone)]
+pub struct ReviewLogRow {
+    pub ts: String,
+    pub session: String,
+    pub tool: String,
+    pub server_id: Option<String>,
+    pub server_name: String,
+    /// sha256(tool|命令|静态判定|prompt 版本|模型) 的十六进制，用于命中率统计
+    pub command_hash: String,
+    /// 脱敏后的命令摘要（≤200 字），不落原始全文
+    pub command_digest: String,
+    pub static_verdict: String,
+    /// allow | review | deny | error | skipped
+    pub ai_verdict: String,
+    /// allow | approval | blocked
+    pub final_verdict: String,
+    pub risk: String,
+    pub reason: String,
+    pub categories: Vec<String>,
+    pub model: String,
+    pub latency_ms: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub cached: bool,
+    /// 降级/跳过的短标签（http/parse/breaker/key_error/no_key/blocked_by_static/rate_limited）
+    pub error: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_log_insert_and_recent() {
+        let db = std::env::temp_dir().join(format!("sd-review-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).expect("store");
+        let mk = |ts: &str, ai: &str, cached: bool| ReviewLogRow {
+            ts: ts.into(),
+            session: "s-x".into(),
+            tool: "exec_command".into(),
+            server_id: Some("srv".into()),
+            server_name: "web-01".into(),
+            command_hash: "ab12".into(),
+            command_digest: "uptime".into(),
+            static_verdict: "allow".into(),
+            ai_verdict: ai.into(),
+            final_verdict: "allow".into(),
+            risk: "low".into(),
+            reason: "r".into(),
+            categories: vec!["data".into(), "network".into()],
+            model: "mini".into(),
+            latency_ms: 42,
+            tokens_in: 300,
+            tokens_out: 24,
+            cached,
+            error: String::new(),
+        };
+        store
+            .insert_review_log(&mk("2026-11-25T01:00:00+00:00", "allow", false))
+            .unwrap();
+        store
+            .insert_review_log(&mk("2026-11-25T02:00:00+00:00", "deny", true))
+            .unwrap();
+        let all = store.recent_reviews(10).unwrap();
+        assert_eq!(all.len(), 2, "两条都应可查");
+        assert_eq!(all[0].ai_verdict, "deny", "新→旧排序");
+        assert!(all[0].cached, "cached 标志落库往返");
+        assert_eq!(all[0].categories, vec!["data", "network"], "categories JSON 往返");
+        assert_eq!(all[0].latency_ms, 42);
+        assert_eq!(all[0].server_name, "web-01");
+        assert_eq!(store.recent_reviews(1).unwrap().len(), 1, "limit 生效");
+    }
 
     #[test]
     fn purge_audit_respects_cutoff_and_source() {

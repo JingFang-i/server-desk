@@ -231,6 +231,8 @@ export interface ReviewEntry {
   finalVerdict: string;
   risk: string;
   reason: string;
+  /** 风险类别（destructive/credential/network/privilege/service/data/unknown） */
+  categories: string[];
   model: string;
   latencyMs: number;
   cached: boolean;

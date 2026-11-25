@@ -2,10 +2,11 @@
 //!
 //! 分期落地（见 docs/r8-ai-review-design.md）：
 //! - R8.1：配置/Key 存储、Reviewer 运行时、设置用 IPC 命令；
-//! - R8.2（本次）：`verdict::merge` 合并判定 + `ops.rs` 两条 AI 路径接入 +
-//!   缓存（LRU+TTL）+ 失败策略 + 熔断 + 独立限流 + 审计；
-//! - R8.3：审查 prompt few-shot 与解析增强（`prompt.rs` 已就位）；
-//! - R8.5：`ai_review_log` 审查日志（`ReviewEntry` 契约已定义）。
+//! - R8.2：`verdict::merge` 合并判定 + `ops.rs` 管线接入 + 缓存/熔断/限流；
+//! - R8.3：prompt v2（few-shot + categories）；
+//! - R8.4：AI 意见上审批卡（ReviewOutcome.ai_note）；
+//! - R8.5（本次）：`ai_review_log` 审查日志——审计之外再落一行结构化记录，
+//!   供设置页「最近审查记录」与后续命中率/降级率统计。
 //!
 //! 安全不变式（方案 §1，verdict.rs 的穷举测试守护）：
 //! 最终判定 = max(静态规则, AI 判定)，序关系 Allow < NeedsApproval < Blocked；
@@ -21,7 +22,7 @@ use crate::guard::Decision;
 use crate::review::cache::{cache_key, VerdictCache};
 use crate::review::config::{load_config, save_config};
 pub use crate::review::config::{ReviewConfig, ReviewInfo};
-use crate::store::Store;
+use crate::store::{ReviewLogRow, Store};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -177,7 +178,7 @@ impl ReviewOutcome {
 /// AI 审查步骤：输入静态判定，输出合并结果（只会更严，见 verdict::merge）。
 ///
 /// 流程：关闭/Blocked 短路 → 独立限流 → 缓存 → 熔断 → Key → 并发闸门 →
-/// 调模型（命令先过 `guard.sanitize`）→ 解析 → 审计 → 合并。
+/// 调模型（命令先过 `guard.sanitize`）→ 解析 → 记录（审计+日志）→ 合并。
 /// 任何失败都按 `failure_policy`（D2 默认 Escalate=转人工审批）兜底并写审计。
 pub(crate) async fn review_and_merge(
     state: &crate::state::AppState,
@@ -189,12 +190,14 @@ pub(crate) async fn review_and_merge(
 ) -> ReviewOutcome {
     let cfg = state.reviewer.config();
 
-    // 1) 静态硬拒：不送审（模型无权否决硬规则），审计一条 skip 便于追溯
+    // 1) 静态硬拒：不送审（模型无权否决硬规则）
     if matches!(static_decision, Decision::Blocked(_)) {
-        audit_review(state, server_id, tool, command, "ok:ai_review:skipped:blocked_by_static");
-        return ReviewOutcome::plain(static_decision);
+        return record_review(
+            state, server_id, tool, command, "blocked", "skipped",
+            &static_decision, None, "blocked_by_static", false, &cfg, ctx,
+        );
     }
-    // 2) 审查关闭：零开销直通（行为与 R7 完全一致）
+    // 2) 审查关闭：零开销直通（行为与 R7 完全一致），不留痕
     if !cfg.enabled {
         return ReviewOutcome::plain(static_decision);
     }
@@ -206,56 +209,63 @@ pub(crate) async fn review_and_merge(
 
     // 3) 独立限流：超限跳过审查、维持静态判定（静态规则仍在保护）
     if state.review_rate.check(REVIEW_RATE_PER_MIN).is_err() {
-        audit_review(state, server_id, tool, command, "ok:ai_review:skipped:rate_limited");
-        return ReviewOutcome::plain(static_decision);
+        return record_review(
+            state, server_id, tool, command, static_str, "skipped",
+            &static_decision, None, "rate_limited", false, &cfg, ctx,
+        );
     }
 
-    // 4) 缓存
+    // 4) 缓存命中：结论可复用，无需调模型（仍完整记录）
     let key = cache_key(tool, command, static_str, &cfg);
     let ttl = Duration::from_secs(cfg.cache_ttl_secs);
     if ttl > Duration::ZERO {
         if let Some(mut hit) = state.reviewer.cache_get(&key, ttl) {
-            audit_review(
-                state,
-                server_id,
-                tool,
-                command,
-                &format!("ok:ai_review:cached:{}", hit.verdict.as_str()),
-            );
             hit.cached = true;
             let note = ai_note_of(&Ok(hit.clone()));
-            let decision = verdict::merge(&static_decision, &Ok(hit), &cfg);
-            return ReviewOutcome { decision, ai_note: note };
+            let decision = verdict::merge(&static_decision, &Ok(hit.clone()), &cfg);
+            return record_review(
+                state, server_id, tool, command, static_str, hit.verdict.as_str(),
+                &decision, Some(&hit), "", true, &cfg, ctx,
+            )
+            .with_note(note, decision);
         }
     }
 
     // 5) 熔断：冷却期内不发起 HTTP，直接走失败策略
     if state.reviewer.breaker_open() {
-        audit_review(state, server_id, tool, command, "ai_review:degraded:breaker");
         let ai = Err("审查熔断中：上游连续失败，冷却期内暂不调用模型".to_string());
         let note = ai_note_of(&ai);
         let decision = verdict::merge(&static_decision, &ai, &cfg);
-        return ReviewOutcome { decision, ai_note: note };
+        return record_review(
+            state, server_id, tool, command, static_str, "error",
+            &decision, None, "breaker", false, &cfg, ctx,
+        )
+        .with_note(note, decision);
     }
 
     // 6) Key（保险库锁定 → 与工具自身失败路径一致；未配置 → 降级）
     let api_key = match config::load_api_key(&state.store, &state.vault) {
         Ok(k) => k,
         Err(e) => {
-            let msg = format!("读取审查 API Key 失败：{e}");
-            audit_review(state, server_id, tool, command, "ai_review:degraded:key_error");
-            let ai = Err(msg);
+            let ai = Err(format!("读取审查 API Key 失败：{e}"));
             let note = ai_note_of(&ai);
             let decision = verdict::merge(&static_decision, &ai, &cfg);
-            return ReviewOutcome { decision, ai_note: note };
+            return record_review(
+                state, server_id, tool, command, static_str, "error",
+                &decision, None, "key_error", false, &cfg, ctx,
+            )
+            .with_note(note, decision);
         }
     };
     let Some(api_key) = api_key.filter(|k| !k.trim().is_empty()) else {
-        audit_review(state, server_id, tool, command, "ai_review:degraded:no_key");
         let ai = Err("未配置审查 API Key".to_string());
         let note = ai_note_of(&ai);
         let decision = verdict::merge(&static_decision, &ai, &cfg);
-        return ReviewOutcome { decision, ai_note: note };
+        return record_review(
+            state, server_id, tool, command, static_str, "error",
+            &decision, None, "no_key", false, &cfg, ctx,
+        )
+        .with_note(note, decision);
     };
 
     // 7) 送审（强制脱敏 + 限长 + 定界符）→ 调模型 → 解析
@@ -270,34 +280,175 @@ pub(crate) async fn review_and_merge(
             Ok(mut v) => {
                 v.latency_ms = out.latency_ms;
                 v.model = out.model;
+                v.tokens_in = out.tokens_in;
+                v.tokens_out = out.tokens_out;
                 state.reviewer.breaker_success();
                 if ttl > Duration::ZERO {
                     state.reviewer.cache_put(key, v.clone());
                 }
-                audit_review(
-                    state,
-                    server_id,
-                    tool,
-                    command,
-                    &format!("ok:ai_review:{}", v.verdict.as_str()),
-                );
                 Ok(v)
             }
             Err(e) => {
                 state.reviewer.breaker_fail();
-                audit_review(state, server_id, tool, command, "ai_review:degraded:parse");
                 Err(e)
             }
         },
         Err(e) => {
             state.reviewer.breaker_fail();
-            audit_review(state, server_id, tool, command, "ai_review:degraded:http");
             Err(crate::text::summary(&e, 120))
         }
     };
+    let (ai_verdict, error_tag) = match &ai {
+        Ok(v) => (v.verdict.as_str().to_string(), String::new()),
+        Err(_) => ("error".to_string(), "call_failed".to_string()),
+    };
     let note = ai_note_of(&ai);
     let decision = verdict::merge(&static_decision, &ai, &cfg);
-    ReviewOutcome { decision, ai_note: note }
+    record_review(
+        state, server_id, tool, command, static_str, &ai_verdict,
+        &decision, ai.as_ref().ok(), &error_tag, false, &cfg, ctx,
+    )
+    .with_note(note, decision)
+}
+
+impl ReviewOutcome {
+    /// record_review 先落日志再回填审批卡意见（拆两步避免借用纠缠）。
+    fn with_note(mut self, note: Option<String>, decision: Decision) -> Self {
+        self.ai_note = note;
+        self.decision = decision;
+        self
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 最终判定的字符串形态（日志用）：allow | approval | blocked。
+fn decision_str(d: &Decision) -> &'static str {
+    match d {
+        Decision::Allow => "allow",
+        Decision::NeedsApproval(_) => "approval",
+        Decision::Blocked(_) => "blocked",
+    }
+}
+
+/// 跳过/失败场景的人读文案（日志 reason 字段）。
+fn skip_reason_text(tag: &str) -> String {
+    match tag {
+        "blocked_by_static" => "静态规则硬拒，未送审".to_string(),
+        "rate_limited" => "审查限流，本轮跳过".to_string(),
+        "breaker" => "熔断冷却中，未调用模型".to_string(),
+        "key_error" => "读取审查 API Key 失败".to_string(),
+        "no_key" => "未配置审查 API Key".to_string(),
+        "parse" => "模型输出无法解析为结论".to_string(),
+        "call_failed" => "模型调用失败（网络/超时/HTTP 错误）".to_string(),
+        other => format!("跳过/失败：{other}"),
+    }
+}
+
+/// 每次审查统一出口：写审计行 + 落 `ai_review_log` 结构化日志。
+/// 审计 outcome 约定：`ok:ai_review:*` 正常；`ai_review:degraded:*` 降级显红。
+#[allow(clippy::too_many_arguments)]
+fn record_review(
+    state: &crate::state::AppState,
+    server_id: Option<&str>,
+    tool: &str,
+    command: &str,
+    static_verdict: &str,
+    ai_verdict: &str,
+    final_decision: &Decision,
+    ai: Option<&verdict::AiReview>,
+    error_tag: &str,
+    cached: bool,
+    cfg: &ReviewConfig,
+    ctx: &ReviewContext<'_>,
+) -> ReviewOutcome {
+    // 审计行
+    let outcome = if ai_verdict == "skipped" {
+        format!("ok:ai_review:skipped:{error_tag}")
+    } else if ai_verdict == "error" {
+        format!("ai_review:degraded:{error_tag}")
+    } else {
+        format!(
+            "ok:ai_review:{}{}",
+            if cached { "cached:" } else { "" },
+            ai_verdict
+        )
+    };
+    audit_review(state, server_id, tool, command, &outcome);
+
+    // 结构化日志（正文只存脱敏摘要 + hash，不落原始命令全文）
+    let (risk, reason, categories, model, latency, tokens_in, tokens_out) = match ai {
+        Some(v) => (
+            v.risk.as_str().to_string(),
+            v.reason.clone(),
+            v.categories.clone(),
+            v.model.clone(),
+            v.latency_ms as i64,
+            v.tokens_in as i64,
+            v.tokens_out as i64,
+        ),
+        None => (
+            String::new(),
+            skip_reason_text(if ai_verdict == "error" { "call_failed" } else { error_tag }),
+            Vec::new(),
+            String::new(),
+            0,
+            0,
+            0,
+        ),
+    };
+    let digest = crate::text::summary(&state.guard.sanitize(command), 200);
+    let row = ReviewLogRow {
+        ts: chrono::Utc::now().to_rfc3339(),
+        session: crate::ops::current_session(),
+        tool: tool.to_string(),
+        server_id: server_id.map(|s| s.to_string()),
+        server_name: ctx.server_name.unwrap_or("").to_string(),
+        command_hash: to_hex(&cache_key(tool, command, static_verdict, cfg)),
+        command_digest: digest.clone(),
+        static_verdict: static_verdict.to_string(),
+        ai_verdict: ai_verdict.to_string(),
+        final_verdict: decision_str(final_decision).to_string(),
+        risk,
+        reason: reason.clone(),
+        categories,
+        model,
+        latency_ms: latency,
+        tokens_in,
+        tokens_out,
+        cached,
+        error: if ai_verdict == "error" || ai_verdict == "skipped" {
+            error_tag.to_string()
+        } else {
+            String::new()
+        },
+    };
+    if let Err(e) = state.store.insert_review_log(&row) {
+        // 日志写失败不阻断判定链路，但必须留痕（对齐审计失败计数的精神）
+        eprintln!("审查日志写入失败: {e}");
+    }
+    ReviewOutcome::plain(final_decision.clone())
+}
+
+/// 审计行：action=ai_review，detail=脱敏摘要。
+fn audit_review(
+    state: &crate::state::AppState,
+    server_id: Option<&str>,
+    tool: &str,
+    command: &str,
+    outcome: &str,
+) {
+    let digest = crate::text::summary(&state.guard.sanitize(command), 200);
+    crate::ops::audit(
+        state,
+        "ai",
+        server_id,
+        shared::action::AI_REVIEW,
+        &crate::text::truncate(&format!("{tool}: {digest}"), crate::text::AUDIT_DETAIL_MAX),
+        outcome,
+    );
 }
 
 /// 把 AI 结论转成审批卡可读的一行意见。
@@ -317,28 +468,7 @@ fn ai_note_of(ai: &Result<verdict::AiReview, String>) -> Option<String> {
     }
 }
 
-/// 审查步骤的独立审计行：action=ai_review，detail=脱敏摘要，
-/// outcome 约定：`ok:ai_review:*` 为正常路径；`ai_review:degraded:*` 为降级
-/// （审计页 ok 标志只认 ok 前缀，降级会显红——这是有意的：值得被看见）。
-fn audit_review(
-    state: &crate::state::AppState,
-    server_id: Option<&str>,
-    tool: &str,
-    command: &str,
-    outcome: &str,
-) {
-    let digest = crate::text::summary(&state.guard.sanitize(command), 200);
-    crate::ops::audit(
-        state,
-        "ai",
-        server_id,
-        shared::action::AI_REVIEW,
-        &crate::text::truncate(&format!("{tool}: {digest}"), crate::text::AUDIT_DETAIL_MAX),
-        outcome,
-    );
-}
-
-/// 审查日志条目。R8.5 由 `ai_review_log` 表填充；契约先行供前端联调。
+/// 审查日志条目（`ai_review_log` 的查询形态）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewEntry {
@@ -352,6 +482,7 @@ pub struct ReviewEntry {
     pub final_verdict: String,
     pub risk: String,
     pub reason: String,
+    pub categories: Vec<String>,
     pub model: String,
     pub latency_ms: i64,
     pub cached: bool,
