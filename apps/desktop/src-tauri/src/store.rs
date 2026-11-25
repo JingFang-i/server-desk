@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS ai_review_log (
   error          TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ai_review_ts ON ai_review_log(ts DESC);
+CREATE TABLE IF NOT EXISTS secret_refs (
+  id          TEXT PRIMARY KEY,      -- 句柄名，如 SD_SEC_a7b3c9d2
+  server_id   TEXT NOT NULL,         -- 绑定的服务器（跨服务器使用即拒绝）
+  source      TEXT NOT NULL DEFAULT '',
+  value_blob  BLOB NOT NULL,         -- AES-256-GCM(DEK, 明文值)，绝不明文落盘
+  created_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL          -- RFC3339；过期即失效并清扫
+);
 ";
 
 #[derive(Debug, Clone)]
@@ -551,6 +559,109 @@ impl Store {
         Ok(n)
     }
 
+    // ---------- 敏感引用（R9） ----------
+
+    /// 写入一条敏感引用。value_blob 必须已是 AES-GCM 密文（调用方用 DEK 加密）。
+    pub fn insert_secret_ref(&self, r: &SecretRefRow) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO secret_refs (id,server_id,source,value_blob,created_at,expires_at) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![r.id, r.server_id, r.source, r.value_blob, r.created_at, r.expires_at],
+        )
+        .map_err(|e| format!("写入敏感引用失败: {e}"))?;
+        Ok(())
+    }
+
+    /// 取句柄的密文与元数据（使用前校验服务器绑定 / 过期）；不存在返回 None。
+    pub fn get_secret_ref(&self, id: &str) -> Result<Option<(SecretRefMeta, Vec<u8>)>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,server_id,source,created_at,expires_at,value_blob \
+                 FROM secret_refs WHERE id = ?1",
+            )
+            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
+        let mut rows = stmt
+            .query_map(params![id], |r| {
+                Ok((
+                    SecretRefMeta {
+                        id: r.get(0)?,
+                        server_id: r.get(1)?,
+                        source: r.get(2)?,
+                        created_at: r.get(3)?,
+                        expires_at: r.get(4)?,
+                    },
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
+        match rows.next() {
+            Some(Ok(pair)) => Ok(Some(pair)),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Ok(None),
+        }
+    }
+
+    /// 全部敏感引用（新→旧，不含值），设置页管理列表用。
+    pub fn list_secret_refs(&self) -> Result<Vec<SecretRefMeta>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,server_id,source,created_at,expires_at \
+                 FROM secret_refs ORDER BY created_at DESC",
+            )
+            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SecretRefMeta {
+                    id: r.get(0)?,
+                    server_id: r.get(1)?,
+                    source: r.get(2)?,
+                    created_at: r.get(3)?,
+                    expires_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| format!("查询敏感引用失败: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// 撤销句柄：返回是否存在过。
+    pub fn delete_secret_ref(&self, id: &str) -> Result<bool, String> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute("DELETE FROM secret_refs WHERE id = ?1", params![id])
+            .map_err(|e| format!("删除敏感引用失败: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// 清扫过期句柄：删除本地映射并返回被删的 id 列表（远端 tmpfs 文件由 tmpfs
+    /// 生命周期兜底 + 下次在线清理；tmpfs 重启即失）。
+    pub fn delete_expired_secret_refs(&self, now_rfc3339: &str) -> Result<Vec<String>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM secret_refs WHERE expires_at < ?1")
+            .map_err(|e| format!("清扫敏感引用失败: {e}"))?;
+        let ids: Vec<String> = stmt
+            .query_map(params![now_rfc3339], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("清扫敏感引用失败: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        if !ids.is_empty() {
+            conn.execute(
+                "DELETE FROM secret_refs WHERE expires_at < ?1",
+                params![now_rfc3339],
+            )
+            .map_err(|e| format!("清扫敏感引用失败: {e}"))?;
+        }
+        Ok(ids)
+    }
+
     // ---------- AI 审查日志（R8.5） ----------
 
     /// 写入一条审查记录。正文只存脱敏摘要与 hash，不落原始命令全文（设计 §3.3）。
@@ -622,6 +733,28 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// 一条敏感引用的写入载荷（R9）。`value_blob` 必须已是 AES-GCM 密文（调用方用 DEK 加密）。
+#[derive(Debug, Clone)]
+pub struct SecretRefRow {
+    pub id: String,
+    pub server_id: String,
+    pub source: String,
+    pub value_blob: Vec<u8>,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// 敏感引用的查询形态（绝不含明文/密文）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRefMeta {
+    pub id: String,
+    pub server_id: String,
+    pub source: String,
+    pub created_at: String,
+    pub expires_at: String,
 }
 
 /// 一条审查日志的写入载荷（R8.5）。

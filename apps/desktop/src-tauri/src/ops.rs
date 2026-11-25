@@ -394,9 +394,29 @@ pub async fn run_command(
     }
 
     // ---- 执行 ----
+    // R9：敏感引用解引用——AI 命令含 $SD_SEC_x 时校验（存在/绑定服务器/未过期）
+    // 并注入 export 前缀；审计 detail 始终记录原命令（句柄可见，明文永不出现）。
+    let mut exec_text = command.clone();
+    if source == "ai" {
+        match crate::secrets::resolve_for_command(state, &cfg.id, &command) {
+            Ok(Some(wrapped)) => exec_text = wrapped,
+            Ok(None) => {}
+            Err(e) => {
+                audit(
+                    state,
+                    source,
+                    Some(&cfg.id),
+                    shared::action::MCP_EXEC_COMMAND,
+                    &command,
+                    &format!("blocked:secret_ref:{}", crate::text::summary(&e, 80)),
+                );
+                return Err(e);
+            }
+        }
+    }
     let res = state
         .ssh
-        .exec(&state.store, &cfg.id, &conn_params(&cfg), &command, timeout)
+        .exec(&state.store, &cfg.id, &conn_params(&cfg), &exec_text, timeout)
         .await;
 
     let out = match res {
@@ -1063,6 +1083,22 @@ pub async fn exec_batch(
             audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_GRANTED, &command, "batch");
         }
         Decision::Allow => {}
+    }
+
+    // R9：批量命令不支持敏感引用——句柄绑定单台服务器，批量语义下无法逐台校验
+    if crate::secrets::scan_handles(&command).len() > 0 {
+        audit_named(
+            state,
+            "ai",
+            None,
+            &batch_label,
+            shared::action::MCP_EXEC_BATCH,
+            &command,
+            "blocked:secret_ref:batch_not_supported",
+        );
+        return Err(
+            "批量执行不支持敏感引用（$SD_SEC_*）：请改用单服务器的 exec_command".into(),
+        );
     }
 
     // 并发执行（信号量限流 5）

@@ -117,7 +117,9 @@ export type AuditAction =
   | "ssh_test"
   | "ai_review"
   | "ai_review_save"
-  | "ai_review_test";
+  | "ai_review_test"
+  | "secret_ref"
+  | "secret_ref_config";
 
 export interface AuditPage {
   entries: AuditEntry[];
@@ -239,6 +241,22 @@ export interface ReviewEntry {
   error: string;
 }
 
+// ---------- 敏感引用（R9） ----------
+
+export interface SecretConfigInfo {
+  enabled: boolean;
+  ttlMinutes: number;
+}
+
+export interface SecretRefMeta {
+  /** 句柄名：SD_SEC_xxxxxxxx */
+  id: string;
+  serverId: string;
+  source: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
 export interface BackupSettings {
   enabled: boolean;
   keep: number;
@@ -319,6 +337,14 @@ export const api = {
     invoke<ReviewInfo>("ai_review_save", { config, apiKey: apiKey ?? null }),
   aiReviewTest: () => invoke<ReviewTestResult>("ai_review_test"),
   aiReviewRecent: (limit?: number) => invoke<ReviewEntry[]>("ai_review_recent", { limit }),
+  // 敏感引用（R9）
+  secretConfigInfo: () => invoke<SecretConfigInfo>("secret_config_info"),
+  secretConfigSave: (enabled: boolean, ttlMinutes: number) =>
+    invoke<SecretConfigInfo>("secret_config_save", { enabled, ttlMinutes }),
+  secretRefsList: () => invoke<SecretRefMeta[]>("secret_refs_list"),
+  secretRefsCreate: (serverId: string, source: string, value: string) =>
+    invoke<string>("secret_refs_create", { serverId, source, value }),
+  secretRefsRevoke: (handle: string) => invoke<void>("secret_refs_revoke", { handle }),
   // 备份与恢复
   backupInfo: () => invoke<BackupInfo>("backup_info"),
   backupExport: (path: string, password: string) =>

@@ -14,7 +14,7 @@ import {
 } from "naive-ui";
 import { getVersion } from "@tauri-apps/api/app";
 import UpdatePrompt from "../components/UpdatePrompt.vue";
-import { api, type GuardInfo, type GuardRules, type McpInfo, type ReviewConfig, type ReviewEntry, type ReviewInfo, type ReviewTestResult, type VaultStatus } from "../api";
+import { api, type GuardInfo, type GuardRules, type McpInfo, type ReviewConfig, type ReviewEntry, type ReviewInfo, type ReviewTestResult, type SecretConfigInfo, type SecretRefMeta, type VaultStatus } from "../api";
 import { CHIME_OPTIONS, currentChime, playApprovalChime, audioState, ensureAudio, setChime, type AudioState } from "../alert";
 import { notifyPermission, requestNotifyPermission, type NotifyPermission } from "../notifyStatus";
 import { useServersStore } from "../stores/servers";
@@ -43,6 +43,7 @@ const sections = [
   { id: "sec-alerts", label: "审批提醒与声音" },
   { id: "sec-mcp", label: "AI 管线（MCP 接入）" },
   { id: "sec-review", label: "AI 智能审查" },
+  { id: "sec-secrets", label: "敏感引用" },
   { id: "sec-policy", label: "AI 高级策略" },
   { id: "sec-rules", label: "命令安全规则" },
   { id: "sec-update", label: "应用更新" },
@@ -205,6 +206,84 @@ async function testReview() {
   }
 }
 
+// ---------- 敏感引用（R9） ----------
+const secretCfg = ref<SecretConfigInfo | null>(null);
+const secretEnabled = ref(false);
+const secretTtl = ref(15);
+const secretSaving = ref(false);
+const secretRefs = ref<SecretRefMeta[]>([]);
+const secretServer = ref<string | null>(null);
+const secretSource = ref("");
+const secretValue = ref("");
+const secretCreating = ref(false);
+
+const secretTtlOptions = [
+  { label: "5 分钟", value: 5 },
+  { label: "15 分钟（推荐）", value: 15 },
+  { label: "30 分钟", value: 30 },
+  { label: "60 分钟", value: 60 },
+];
+
+const serverOptions = computed(() =>
+  serversStore.servers.map((s) => ({ label: s.name, value: s.id }))
+);
+
+async function loadSecrets() {
+  try {
+    secretCfg.value = await api.secretConfigInfo();
+    secretEnabled.value = secretCfg.value.enabled;
+    secretTtl.value = secretCfg.value.ttlMinutes;
+    secretRefs.value = await api.secretRefsList();
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+async function saveSecretConfig() {
+  try {
+    secretCfg.value = await api.secretConfigSave(secretEnabled.value, secretTtl.value);
+    message.success("敏感引用配置已保存");
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+async function createSecretRef() {
+  if (!secretServer.value) {
+    message.warning("请选择服务器");
+    return;
+  }
+  if (!secretValue.value.trim()) {
+    message.warning("请填写敏感值");
+    return;
+  }
+  secretCreating.value = true;
+  try {
+    const h = await api.secretRefsCreate(
+      secretServer.value,
+      secretSource.value.trim() || "手动登记",
+      secretValue.value
+    );
+    message.success(`已登记 ${h}——AI 命令中用 $${h} 引用，明文不会展示给 AI`);
+    secretValue.value = "";
+    await loadSecrets();
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    secretCreating.value = false;
+  }
+}
+
+async function revokeSecret(h: string) {
+  try {
+    await api.secretRefsRevoke(h);
+    message.success(`已撤销 ${h}`);
+    await loadSecrets();
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
 // ---------- 应用内更新 ----------
 const appVersion = ref("");
 const updatePromptRef = ref<{ check: (manual: boolean) => Promise<void>; checking: boolean } | null>(null);
@@ -263,6 +342,7 @@ onMounted(async () => {
   loadGuard();
   loadReview();
   loadAlertStatus();
+  loadSecrets();
 });
 
 // IntersectionObserver 挂在 DOM 就绪后（卡片 id 存在于模板）
@@ -470,6 +550,63 @@ async function copy(text: string, label: string) {
         <n-button size="small" @click="copy(mcpInfo?.configJson ?? '', '配置 JSON')">复制配置</n-button>
       </div>
       <pre class="pre">{{ mcpInfo?.configJson ?? "（应用启动后生成）" }}</pre>
+    </n-card>
+
+    <n-card id="sec-secrets" title="敏感引用（实验性）" size="small" style="max-width: 720px; margin-top: 16px">
+      <p class="hint" style="margin: 0 0 6px">
+        AI 永远看不到明文：敏感值登记为句柄（$SD_SEC_xxxx），AI 在命令中引用句柄，
+        执行时由 ServerDesk 在服务器侧解引用（环境变量注入，ps 不可见）。
+        明文只落在服务器 /run（tmpfs、0600、重启即失），到期自动失效，可随时撤销。
+        AI 探测句柄目录 / 进程环境的命令会被硬拒。
+      </p>
+      <div class="row">
+        <div class="label">
+          <div>启用句柄注入</div>
+          <div class="desc">开启后 AI 命令中的 $SD_SEC_* 才会被解引用；关闭时含句柄的命令维持现状</div>
+        </div>
+        <n-switch v-model:value="secretEnabled" />
+      </div>
+      <div class="row">
+        <div class="label">
+          <div>句柄有效期（TTL）</div>
+          <div class="desc">到期自动失效并清扫；AI 使用过期句柄会收到明确的重新登记提示</div>
+        </div>
+        <n-select v-model:value="secretTtl" :options="secretTtlOptions" style="width: 190px" />
+      </div>
+      <template #footer>
+        <n-button type="primary" :loading="secretSaving" @click="saveSecretConfig">保存敏感引用配置</n-button>
+      </template>
+      <div class="rv-recent-title" style="margin-top: 14px">登记新句柄</div>
+      <div class="row">
+        <div class="label"><div>服务器</div><div class="desc">句柄绑定单台服务器，跨服务器使用会被拒绝</div></div>
+        <n-select v-model:value="secretServer" :options="serverOptions" placeholder="选择服务器" style="width: 240px" />
+      </div>
+      <div class="row">
+        <div class="label"><div>来源说明</div><div class="desc">可选，如「/opt/app/config.yaml 的 api_key」</div></div>
+        <n-input v-model:value="secretSource" placeholder="可选" style="width: 340px" />
+      </div>
+      <div class="row">
+        <div class="label"><div>敏感值</div><div class="desc">加密落库（保险库密钥）+ SFTP 写入服务器 tmpfs；不进日志与审计</div></div>
+        <n-input
+          v-model:value="secretValue"
+          type="password"
+          show-password-on="click"
+          placeholder="token / key / password"
+          style="width: 340px"
+        />
+      </div>
+      <div style="margin-top: 6px">
+        <n-button size="small" type="primary" :loading="secretCreating" @click="createSecretRef">登记句柄</n-button>
+      </div>
+      <div class="rv-recent-title" style="margin-top: 14px">当前句柄</div>
+      <n-empty v-if="!secretRefs.length" size="small" description="暂无句柄" />
+      <div v-for="r in secretRefs" :key="r.id" class="activity-row">
+        <n-tag size="small" type="info" :bordered="false">$ {{ r.id }}</n-tag>
+        <span class="act-server">{{ serversStore.servers.find((s) => s.id === r.serverId)?.name ?? r.serverId }}</span>
+        <span class="act-tool">{{ r.source || "—" }}</span>
+        <span class="act-time">至 {{ new Date(r.expiresAt).toLocaleString("zh-CN", { hour12: false }) }}</span>
+        <n-button size="tiny" type="error" ghost @click="revokeSecret(r.id)">撤销</n-button>
+      </div>
     </n-card>
 
     <n-card id="sec-policy" title="AI 高级策略" size="small" style="max-width: 720px; margin-top: 16px">

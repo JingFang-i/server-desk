@@ -231,6 +231,9 @@ impl LeakGuard {
             r"/etc/shadow",
             r"authorized_keys",
             r"\bhistory\b",
+            // R9：敏感映射库探测——句柄明文所在目录与进程环境嗅探，一律硬拒
+            r"serverdesk-secrets",
+            r"strings\s+/proc",
         ]
         .iter()
         .map(|p| Regex::new(&format!("(?i){p}")).expect("leak regex"))
@@ -348,6 +351,8 @@ const READ_PATH_DENY: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".docker/config.json",
+    // R9：敏感映射库明文副本目录（tmpfs），读取一律硬拒
+    "/run/serverdesk-secrets",
 ];
 
 /// AI 写入远程文件的路径黑名单（写入会破坏系统安全基线的位置）。
@@ -372,6 +377,8 @@ const WRITE_PATH_DENY: &[&str] = &[
     "/usr/sbin",
     "/usr/local/bin",
     ".pem",
+    // R9：敏感映射库目录不得写入/覆盖
+    "/run/serverdesk-secrets",
 ];
 
 struct GuardInner {
@@ -678,6 +685,32 @@ mod tests {
     fn allows_readonly_commands() {
         assert!(matches!(guard().evaluate("uptime && df -h /"), Decision::Allow));
         assert!(matches!(guard().evaluate("tail -n 50 /var/log/syslog"), Decision::Allow));
+    }
+
+    #[test]
+    fn blocks_secret_ref_probing() {
+        let g = guard();
+        // R9：句柄明文所在目录与进程环境嗅探必须硬拒
+        assert!(matches!(
+            g.evaluate("cat /run/serverdesk-secrets/SD_SEC_a7b3c9d2"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            g.evaluate("ls -la /run/serverdesk-secrets"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            g.evaluate("strings /proc/1/environ | grep -i key"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            g.evaluate_read_path("/run/serverdesk-secrets/SD_SEC_a7b3c9d2"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            g.evaluate_write_path("/run/serverdesk-secrets/evil"),
+            Decision::Blocked(_)
+        ));
     }
 
     #[test]
