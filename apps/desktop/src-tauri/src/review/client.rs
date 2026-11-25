@@ -42,7 +42,7 @@ pub async fn chat_json(
         let mut body = json!({
             "model": cfg.model,
             "temperature": 0,
-            "max_tokens": 120,
+            "max_tokens": cfg.max_tokens,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user },
@@ -83,15 +83,26 @@ pub async fn chat_json(
     Err(last_err)
 }
 
-/// 解析成功响应：choices[0].message.content + model + usage。
+/// 解析成功响应：取模型输出 + model + usage。
+///
+/// 输出字段回退链（推理模型兼容，实测 openbmb/minicpm5-2b 经 Ollama 时
+/// `content` 在思维链结束前恒为空、正文在 `reasoning` 字段）：
+/// `content` → `reasoning_content`（DeepSeek-R1 风格）→ `reasoning`（Ollama 风格）。
+/// 审查解析器（verdict::parse）扫描全部 JSON 对象，思维链里的最终结论同样可解析。
 fn parse_ok(text: &str, latency_ms: u64) -> Result<ChatOutcome, String> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| format!("响应不是合法 JSON：{e}"))?;
-    let content = v
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| "响应缺少 choices[0].message.content".to_string())?
+    let choice = v
+        .pointer("/choices/0/message")
+        .ok_or_else(|| "响应缺少 choices[0].message".to_string())?;
+    let content = ["content", "reasoning_content", "reasoning"]
+        .iter()
+        .find_map(|k| choice.get(*k).and_then(|c| c.as_str()))
+        .unwrap_or_default()
         .to_string();
+    if content.trim().is_empty() {
+        return Err("模型输出为空（可能被 max_tokens 截断，可调大输出预算）".to_string());
+    }
     let model = v
         .get("model")
         .and_then(|m| m.as_str())

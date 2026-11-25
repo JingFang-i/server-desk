@@ -228,6 +228,7 @@ fn main() {
                 reviewer,
                 approvals: approvals::Approvals::default(),
                 ai_rate: guard::AiRate::new(),
+                review_rate: guard::AiRate::new(),
                 handle: app.handle().clone(),
                 dir: dir.clone(),
                 audit_failures: std::sync::atomic::AtomicU64::new(0),

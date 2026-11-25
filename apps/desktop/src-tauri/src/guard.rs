@@ -320,6 +320,8 @@ impl Default for AiRate {
     }
 }
 
+/// 判定结论。`Clone` 供 AI 审查层（R8.2）按值合并：final = max(static, ai)。
+#[derive(Debug, Clone)]
 pub enum Decision {
     Allow,
     /// 硬拒绝（附命中规则说明）

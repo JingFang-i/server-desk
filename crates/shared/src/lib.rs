@@ -167,6 +167,9 @@ pub mod action {
     pub const MCP_APPROVAL_REQUESTED: &str = "mcp_approval_requested";
     pub const MCP_APPROVAL_GRANTED: &str = "mcp_approval_granted";
     pub const MCP_SET_ENABLED: &str = "mcp_set_enabled";
+    /// AI 智能审查（R8）：审查步骤本身的审计动作，结论写在 outcome
+    /// （约定：ok:ai_review:{verdict} 为正常路径；ai_review:degraded:* 为降级）
+    pub const AI_REVIEW: &str = "ai_review";
 
     /// 全部已登记动作（可用于校验/导出）
     pub const ALL: &[&str] = &[
@@ -189,5 +192,6 @@ pub mod action {
         MCP_APPROVAL_REQUESTED,
         MCP_APPROVAL_GRANTED,
         MCP_SET_ENABLED,
+        AI_REVIEW,
     ];
 }

@@ -99,6 +99,10 @@ pub struct ReviewConfig {
     pub timeout_ms: u32,
     /// 送审文本（脱敏后）长度上限（字节），保存时钳制到 1024–65536
     pub max_input_bytes: usize,
+    /// 单次审查的输出 token 预算，保存时钳制到 64–4096。
+    /// 推理模型（如 DeepSeek-R1、openbmb MiniCPM）需要更大预算——
+    /// 预算太小会截断思维链，content 恒为空，审查永远失败。
+    pub max_tokens: u32,
     pub failure_policy: FailurePolicy,
     pub deny_mode: DenyMode,
     /// Phase 2 预留：文件类工具（write/append/upload）是否送审
@@ -120,6 +124,7 @@ impl Default for ReviewConfig {
             protocol: Protocol::default(),
             timeout_ms: 4000,
             max_input_bytes: 8192,
+            max_tokens: 120,
             failure_policy: FailurePolicy::default(),
             deny_mode: DenyMode::default(),
             review_files: false,
@@ -137,6 +142,7 @@ impl ReviewConfig {
         self.model = self.model.trim().to_string();
         self.timeout_ms = self.timeout_ms.clamp(1000, 15000);
         self.max_input_bytes = self.max_input_bytes.clamp(1024, 65536);
+        self.max_tokens = self.max_tokens.clamp(64, 4096);
         self.cache_ttl_secs = self.cache_ttl_secs.min(86400);
         self
     }
@@ -330,12 +336,14 @@ mod tests {
         c.model = " deepseek-chat ".into();
         c.timeout_ms = 50;
         c.max_input_bytes = 1;
+        c.max_tokens = 1;
         c.cache_ttl_secs = 999_999;
         let n = c.normalized();
         assert_eq!(n.base_url, "https://api.deepseek.com/v1");
         assert_eq!(n.model, "deepseek-chat");
         assert_eq!(n.timeout_ms, 1000);
         assert_eq!(n.max_input_bytes, 1024);
+        assert_eq!(n.max_tokens, 64);
         assert_eq!(n.cache_ttl_secs, 86400);
     }
 

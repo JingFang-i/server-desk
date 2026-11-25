@@ -325,6 +325,20 @@ pub async fn run_command(
                 cfg.group.as_deref().unwrap_or("")
             ));
         }
+        // R8.2：AI 审查层——只能收紧判定（静态 Blocked 不送审），失败按策略兜底
+        let decision = crate::review::review_and_merge(
+            state,
+            shared::action::MCP_EXEC_COMMAND,
+            &command,
+            decision,
+            &crate::review::ReviewContext {
+                group: cfg.group.as_deref(),
+                server_name: Some(&cfg.name),
+                batch_size: None,
+            },
+            Some(&cfg.id),
+        )
+        .await;
         match decision {
             Decision::Blocked(reason) => {
                 audit(state, source, Some(&cfg.id), shared::action::MCP_EXEC_COMMAND, &command, "blocked");
@@ -995,6 +1009,20 @@ pub async fn exec_batch(
             "批量目标包含严格分组服务器：整批需人工审批".to_string(),
         );
     }
+    // R8.2：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
+    let decision = crate::review::review_and_merge(
+        state,
+        shared::action::MCP_EXEC_BATCH,
+        &command,
+        decision,
+        &crate::review::ReviewContext {
+            group: None,
+            server_name: None,
+            batch_size: Some(rows.len()),
+        },
+        None,
+    )
+    .await;
     match decision {
         Decision::Blocked(reason) => {
             audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, &format!("blocked:{reason}"));

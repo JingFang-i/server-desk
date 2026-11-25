@@ -1,6 +1,15 @@
 # R8 — AI 智能审查（AI Reviewer）设计方案与开发计划
 
-> 状态：已确认（D1–D3 已拍板，2026-11-25）· R8.1 已完成（编译通过，11 项单测）· R8.2 待开工
+> 状态：已确认（D1–D3 已拍板，2026-11-25）· R8.1、R8.2 已完成（65+1 单测全绿，本地 Ollama 真机冒烟通过）· R8.3 待开工
+>
+> **R8.2 实测记录（openbmb/minicpm5-2b @ 本地 Ollama，零出网）**：
+> - 推理模型兼容：正文在 `reasoning` 字段，`content` 在思维链结束前恒为空——客户端已实现
+>   `content → reasoning_content → reasoning` 回退链，且 `max_tokens` 改为可配置（默认 120，
+>   推理模型建议 ≥512，过小会截断思维链导致审查恒失败）；
+> - 判定质量：`uptime && df -h /` → allow/low（4.0s）；`curl|bash` + 注入话术 → deny/high，
+>   注入文本被正确忽略（4.0s）；模糊命令（`find -delete`）推理超预算 → 被 4s 超时切断 →
+>   走失败策略转人工审批——链路符合设计（fail-closed）；
+> - 该 2B 模型对模糊 case 推理时间不可控（17s+），上线建议 timeout 8000ms、max_tokens 1024。
 > 前置：R1–R7 已交付（`guard.rs` 七层静态管线、审批流、审计、脱敏）
 > 交付物：`docs/r8-ai-review-design.md`（本文）+ `docs/r8-acceptance.md`（验收）
 
