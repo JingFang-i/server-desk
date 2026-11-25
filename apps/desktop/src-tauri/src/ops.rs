@@ -571,17 +571,51 @@ async fn resolve_remote_path(state: &AppState, cfg: &ServerConfig, path: &str) -
 }
 
 /// AI 读取远端路径的完整判定：原路径与解析后的真实路径都必须过泄露黑名单。
+/// 任一路径判定为「需审批」（`.env` 等）时，整体返回审批（不降级为放行）。
 pub(crate) async fn evaluate_remote_read(state: &AppState, cfg: &ServerConfig, path: &str) -> Decision {
-    if let Decision::Blocked(reason) = state.guard.evaluate_read_path(path) {
-        return Decision::Blocked(reason);
+    let mut approval: Option<String> = None;
+    match state.guard.evaluate_read_path(path) {
+        Decision::Blocked(reason) => return Decision::Blocked(reason),
+        Decision::NeedsApproval(reason) => approval = Some(reason),
+        Decision::Allow => {}
     }
     let real = resolve_remote_path(state, cfg, path).await;
     if real != path {
-        if let Decision::Blocked(reason) = state.guard.evaluate_read_path(&real) {
-            return Decision::Blocked(format!("{reason}（解析后真实路径：{real}）"));
+        match state.guard.evaluate_read_path(&real) {
+            Decision::Blocked(reason) => {
+                return Decision::Blocked(format!("{reason}（解析后真实路径：{real}）"));
+            }
+            Decision::NeedsApproval(reason) => {
+                approval.get_or_insert(format!("{reason}（解析后真实路径：{real}）"));
+            }
+            Decision::Allow => {}
         }
     }
-    Decision::Allow
+    match approval {
+        Some(reason) => Decision::NeedsApproval(reason),
+        None => Decision::Allow,
+    }
+}
+
+/// 读取类工具遇到「需审批」时的处理：弹审批卡，批准后继续读（内容仍会脱敏）。
+pub(crate) async fn ensure_read_approved(
+    state: &AppState,
+    cfg: &ServerConfig,
+    action: &str,
+    path: &str,
+    decision: Decision,
+) -> Result<(), String> {
+    match decision {
+        Decision::Blocked(reason) => {
+            audit(state, "ai", Some(&cfg.id), action, path, "blocked");
+            Err(format!("已拦截：{reason}"))
+        }
+        Decision::NeedsApproval(reason) => {
+            let summary = format!("读取 {path}（{reason}）");
+            request_approval(state, cfg, &summary, "read_env").await
+        }
+        Decision::Allow => Ok(()),
+    }
 }
 
 /// AI 写入远端路径的完整判定：原路径与解析后的真实路径都必须过禁写名单。
@@ -609,10 +643,8 @@ pub async fn remote_read_file(
     let cfg = load_server_config(state, server_ref)?;
     if source == "ai" {
         ai_gate(state, &cfg, shared::action::MCP_READ_FILE, path)?;
-        if let Decision::Blocked(reason) = evaluate_remote_read(state, &cfg, path).await {
-            audit(state, source, Some(&cfg.id), shared::action::MCP_READ_FILE, path, "blocked");
-            return Err(format!("已拦截：{reason}"));
-        }
+        let decision = evaluate_remote_read(state, &cfg, path).await;
+        ensure_read_approved(state, &cfg, shared::action::MCP_READ_FILE, path, decision).await?;
     }
     let res = state
         .ssh
@@ -806,13 +838,27 @@ pub async fn sftp_download_manual(
 // ---------- R2：AI 文件能力（上传/下载/追加/回滚） ----------
 
 /// 本地（ServerDesk 所在机器）读取防护：防止 AI 把本机敏感文件推到服务器。
-fn gate_local_read(state: &AppState, cfg: &ServerConfig, action: &str, local_path: &str) -> Result<(), String> {
+/// 本地（ServerDesk 所在机器）读取防护：防止 AI 把本机敏感文件推到服务器。
+/// `.env` 家族转人工审批；私钥等敏感路径仍硬拒。
+async fn gate_local_read(
+    state: &AppState,
+    cfg: &ServerConfig,
+    action: &str,
+    local_path: &str,
+) -> Result<(), String> {
     ai_gate(state, cfg, action, local_path)?;
-    if let Decision::Blocked(reason) = state.guard.evaluate_read_path(local_path) {
-        audit(state, "ai", Some(&cfg.id), action, local_path, "blocked:local_read");
-        return Err(format!("已拦截：{reason}（本地路径）"));
+    let decision = state.guard.evaluate_read_path(local_path);
+    match decision {
+        Decision::Blocked(reason) => {
+            audit(state, "ai", Some(&cfg.id), action, local_path, "blocked:local_read");
+            Err(format!("已拦截：{reason}（本地路径）"))
+        }
+        Decision::NeedsApproval(reason) => {
+            let summary = format!("上传本地文件 {local_path}（{reason}）");
+            request_approval(state, cfg, &summary, "read_env").await
+        }
+        Decision::Allow => Ok(()),
     }
-    Ok(())
 }
 
 /// AI 写远端路径的前置校验：解析真实路径后判定；被拦截即 Err，其余交给调用方的审批流。
@@ -839,7 +885,7 @@ pub async fn ai_upload_file(
         audit(state, "ai", Some(&cfg.id), shared::action::MCP_UPLOAD_FILE, local_path, "blocked:readonly");
         return Err("只读模式已开启：AI 不得上传文件".into());
     }
-    gate_local_read(state, &cfg, shared::action::MCP_UPLOAD_FILE, local_path)?;
+    gate_local_read(state, &cfg, shared::action::MCP_UPLOAD_FILE, local_path).await?;
     remote_write_rules(state, &cfg, shared::action::MCP_UPLOAD_FILE, remote_path).await?;
     let summary = format!(
         "上传文件 {} → {}:{}",
@@ -865,10 +911,15 @@ pub async fn ai_download_file(
 ) -> Result<String, String> {
     let cfg = load_server_config(state, server_ref)?;
     ai_gate(state, &cfg, shared::action::MCP_DOWNLOAD_FILE, remote_path)?;
-    if let Decision::Blocked(reason) = evaluate_remote_read(state, &cfg, remote_path).await {
-        audit(state, "ai", Some(&cfg.id), shared::action::MCP_DOWNLOAD_FILE, remote_path, "blocked");
-        return Err(format!("已拦截：{reason}"));
-    }
+    let decision = evaluate_remote_read(state, &cfg, remote_path).await;
+    ensure_read_approved(
+        state,
+        &cfg,
+        shared::action::MCP_DOWNLOAD_FILE,
+        remote_path,
+        decision,
+    )
+    .await?;
     let downloads = state.dir.join("ai_downloads");
     std::fs::create_dir_all(&downloads).map_err(|e| format!("创建下载目录失败: {e}"))?;
     let base = remote_path.rsplit('/').next().unwrap_or("download");

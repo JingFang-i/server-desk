@@ -129,14 +129,10 @@ async fn gate_path(
     path: &str,
 ) -> Result<(), String> {
     ai_gate(state, cfg, action, path)?;
-    // 解析真实路径后再判定：符号链接别名不能把受保护文件带进来
-    if let crate::guard::Decision::Blocked(reason) =
-        crate::ops::evaluate_remote_read(state, cfg, path).await
-    {
-        audit(state, "ai", Some(&cfg.id), action, path, "blocked");
-        return Err(format!("已拦截：{reason}"));
-    }
-    Ok(())
+    // 解析真实路径后再判定：符号链接别名不能把受保护文件带进来；
+    // `.env` 等需审批的路径走统一审批入口，其余受限路径仍拦截。
+    let decision = crate::ops::evaluate_remote_read(state, cfg, path).await;
+    crate::ops::ensure_read_approved(state, cfg, action, path, decision).await
 }
 
 // ---------- 对外入口 ----------

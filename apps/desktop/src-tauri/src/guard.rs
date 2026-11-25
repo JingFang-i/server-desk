@@ -374,7 +374,8 @@ const READ_PATH_DENY: &[&str] = &[
     ".pem",
     "/etc/shadow",
     "authorized_keys",
-    ".env",
+    // 注意：`.env` 不在子串表里——由 evaluate_read_path 按 basename 判定为「转人工审批」，
+    // 避免子串匹配把 /etc 下 `app.env` 之类也一并硬拒
     "credential",
     "secret",
     ".gnupg",
@@ -603,7 +604,11 @@ impl Guard {
         Decision::Allow
     }
 
-    /// AI 读取远程路径的判定：命中泄露黑名单即拒绝，否则放行。
+    /// AI 读取远程路径的判定。
+    ///
+    /// - 凭据/敏感文件（私钥、`/etc/shadow`、`authorized_keys` 等）→ **硬拒**；
+    /// - `.env` 家族与 systemd 环境文件 → **转人工审批**（可能含凭据，但用户可决定是否放行，
+    ///   内容仍由输出脱敏兜底）。
     pub fn evaluate_read_path(&self, path: &str) -> Decision {
         let lower = path.to_lowercase();
         for p in READ_PATH_DENY {
@@ -613,8 +618,19 @@ impl Guard {
                 ));
             }
         }
-        if lower.starts_with("/etc/systemd/") && lower.ends_with("/env") {
-            return Decision::Blocked("systemd 环境文件可能包含凭据，AI 不得读取".into());
+        // `.env` 家族：按 basename 精确匹配（`.env` / `.env.local` / `.env.production`）
+        let basename = lower.rsplit('/').next().unwrap_or("");
+        if basename == ".env" || basename.starts_with(".env.") {
+            return Decision::NeedsApproval(
+                "读取 .env 环境文件（可能含凭据）需人工确认".to_string(),
+            );
+        }
+        if lower.starts_with("/etc/systemd/")
+            && (lower.ends_with("/env") || lower.ends_with(".env"))
+        {
+            return Decision::NeedsApproval(
+                "读取 systemd 环境文件（可能含凭据）需人工确认".to_string(),
+            );
         }
         Decision::Allow
     }
@@ -705,18 +721,24 @@ mod tests {
             guard().evaluate_read_path("/etc/shadow"),
             Decision::Blocked(_)
         ));
+        // .env 家族：转人工审批（不再硬拒）
         assert!(matches!(
             guard().evaluate_read_path("/home/u/app/.env"),
-            Decision::Blocked(_)
+            Decision::NeedsApproval(_)
         ));
         // systemd 环境文件同样可能存放凭据。
         assert!(matches!(
             guard().evaluate_read_path("/opt/app/.env.production"),
-            Decision::Blocked(_)
+            Decision::NeedsApproval(_)
         ));
         assert!(matches!(
             guard().evaluate_read_path("/etc/systemd/system/app.env"),
-            Decision::Blocked(_)
+            Decision::NeedsApproval(_)
+        ));
+        // 普通 unit 文件不受影响
+        assert!(matches!(
+            guard().evaluate_read_path("/etc/systemd/system/app.service"),
+            Decision::Allow
         ));
         assert!(matches!(
             guard().evaluate_read_path("/var/log/app.log"),
@@ -838,8 +860,16 @@ mod tests {
         ));
         assert!(matches!(g.evaluate("systemctl status example.service"), Decision::Allow));
         assert!(matches!(g.evaluate("cat /opt/app/app.env"), Decision::NeedsApproval(_)));
-        // 文件工具级：read_file 等仍硬拒，不给审批逃生口
-        assert!(matches!(g.evaluate_read_path("/opt/app/app.env"), Decision::Blocked(_)));
+        // 文件工具级：`.env` 家族同样转人工审批（与命令执行策略一致）
+        assert!(matches!(
+            g.evaluate_read_path("/opt/app/.env"),
+            Decision::NeedsApproval(_)
+        ));
+        // 其它凭据文件仍然硬拒
+        assert!(matches!(
+            g.evaluate_read_path("/root/.ssh/id_rsa"),
+            Decision::Blocked(_)
+        ));
     }
 
     #[test]
