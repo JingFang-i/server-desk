@@ -10,11 +10,12 @@ import {
   NSwitch,
   NTag,
   useMessage,
+  type SelectOption,
 } from "naive-ui";
 import { getVersion } from "@tauri-apps/api/app";
 import UpdatePrompt from "../components/UpdatePrompt.vue";
 import { api, type GuardInfo, type GuardRules, type McpInfo, type ReviewConfig, type ReviewEntry, type ReviewInfo, type ReviewTestResult, type VaultStatus } from "../api";
-import { audioState, ensureAudio, type AudioState } from "../alert";
+import { CHIME_OPTIONS, currentChime, playApprovalChime, audioState, ensureAudio, setChime, type AudioState } from "../alert";
 import { notifyPermission, requestNotifyPermission, type NotifyPermission } from "../notifyStatus";
 import { useServersStore } from "../stores/servers";
 
@@ -42,6 +43,17 @@ const mcpInfo = ref<McpInfo | null>(null);
 // 2) 系统通知（后台可达、带声音）：macOS 需用户授权，未授权时给出申请入口
 const notifyPerm = ref<NotifyPermission>("unknown");
 const audio = ref<AudioState>("unavailable");
+const chime = ref(currentChime());
+const chimeOptions: SelectOption[] = CHIME_OPTIONS.map((o) => ({
+  label: o.label,
+  value: o.value,
+}));
+
+/** 切换提示音风格：立即生效并试听一声 */
+function changeChime(v: string) {
+  setChime(v);
+  playApprovalChime(true);
+}
 
 async function loadAlertStatus() {
   notifyPerm.value = await notifyPermission();
@@ -352,15 +364,20 @@ async function copy(text: string, label: string) {
       <div class="row">
         <div class="label">
           <div>提示音（应用内）</div>
-          <div class="desc">受浏览器自动播放策略约束：需要点击「启用」完成一次授权并试听</div>
+          <div class="desc">受浏览器自动播放策略约束：需要点击「启用」完成一次授权并试听；切换风格会立即播一声当前音色</div>
         </div>
         <div style="display: flex; gap: 8px; align-items: center">
           <n-tag size="small" :type="audio === 'running' ? 'success' : 'warning'" :bordered="false">
             {{ audio === "running" ? "已启用" : "未启用" }}
           </n-tag>
-          <n-button size="small" @click="enableSound">
-            {{ audio === "running" ? "试听" : "启用并试听" }}
-          </n-button>
+          <n-select
+            v-model:value="chime"
+            :options="chimeOptions"
+            size="small"
+            style="width: 170px"
+            @update:value="changeChime"
+          />
+          <n-button size="small" @click="playApprovalChime(true)">试听</n-button>
         </div>
       </div>
       <div class="row">
