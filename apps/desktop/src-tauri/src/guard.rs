@@ -209,7 +209,6 @@ fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
     }
     None
 }
-
 /// 凭据泄露防护（固定规则，不开放编辑）：AI 命令包含即硬拒绝，输出命中即脱敏。
 struct LeakGuard {
     cmd_blockers: Vec<Regex>,
@@ -220,7 +219,9 @@ struct LeakGuard {
 impl LeakGuard {
     fn build() -> Self {
         let cmd_blockers = [
-            r"\benv\b",
+            // env 泄露：按**命令词**锚定（段首/sudo 后），不再误伤路径组件里的 env
+            // （如 /etc/systemd/env 这类 systemd EnvironmentFile）
+            r"(?im)(?:^|[;&|]\s*|\bsudo\s+)env(?:\s|$)",
             r"\bprintenv\b",
             r"(^|[|;&])\s*set\s*(\s|$)",
             r"\bid_rsa\b",
@@ -342,7 +343,8 @@ const READ_PATH_DENY: &[&str] = &[
     ".pem",
     "/etc/shadow",
     "authorized_keys",
-    ".env",
+    // 注意：`.env` 家族不在本子串表里——由 evaluate_read_path 按 basename 精确拦截，
+    // 避免子串匹配误伤 /etc 下 `app.env` 这类 systemd EnvironmentFile 常规配置
     "credential",
     "secret",
     ".gnupg",
@@ -564,6 +566,10 @@ impl Guard {
     }
 
     /// AI 读取远程路径的判定：命中泄露黑名单即拒绝，否则放行。
+    ///
+    /// `.env` 家族（dotenv：`.env`、`.env.local`、`.env.production`…）按**文件名**精确拦截
+    /// ——只拦 basename，不误伤 /etc 下 `app.env` 这类 systemd EnvironmentFile 常规配置
+    /// （其内容读取后仍过输出脱敏）。
     pub fn evaluate_read_path(&self, path: &str) -> Decision {
         let lower = path.to_lowercase();
         for p in READ_PATH_DENY {
@@ -572,6 +578,12 @@ impl Guard {
                     "路径命中凭据/敏感文件保护规则「{p}」——AI 不得读取该文件"
                 ));
             }
+        }
+        let basename = lower.rsplit('/').next().unwrap_or("");
+        if basename == ".env" || basename.starts_with(".env.") {
+            return Decision::Blocked(
+                "路径命中凭据/敏感文件保护规则「.env」——AI 不得读取该文件".to_string(),
+            );
         }
         Decision::Allow
     }
@@ -655,6 +667,15 @@ mod tests {
             guard().evaluate_read_path("/home/u/app/.env"),
             Decision::Blocked(_)
         ));
+        // dotenv 家族按 basename 精确拦截；/etc 下 app.env 这类常规配置放行
+        assert!(matches!(
+            guard().evaluate_read_path("/opt/app/.env.production"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_read_path("/etc/systemd/system/app.env"),
+            Decision::Allow
+        ));
         assert!(matches!(
             guard().evaluate_read_path("/var/log/app.log"),
             Decision::Allow
@@ -718,6 +739,15 @@ mod tests {
         assert!(matches!(guard().evaluate("env | grep TOKEN"), Decision::Blocked(_)));
         assert!(matches!(guard().evaluate("cat ~/.ssh/id_rsa"), Decision::Blocked(_)));
         assert!(matches!(guard().evaluate("printenv"), Decision::Blocked(_)));
+        // R9.4 修正：env 按命令词锚定——路径组件里的 env 不再误伤
+        assert!(matches!(
+            guard().evaluate("cat /etc/systemd/env"),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            guard().evaluate("sudo env"),
+            Decision::Blocked(_)
+        ));
     }
 
     #[test]
