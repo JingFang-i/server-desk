@@ -13,6 +13,7 @@ import { notifyPermission, requestNotifyPermission, type NotifyPermission } from
  * 顶部横幅（R8 后置增强）：提示音未启用 / 系统通知未授权时显式提示，一键修复——
  * 「提示音一定会响」的两个前提（音频上下文已解锁、系统通知已授权）不再靠运气。
  */
+const props = defineProps<{ /** 当前页面：已在审批中心时不再弹卡，只保留声音提醒 */ currentPage?: string }>();
 const emit = defineEmits<{ (e: "count", n: number): void; (e: "open"): void; (e: "settings"): void }>();
 
 const notification = useNotification();
@@ -83,7 +84,10 @@ function summarize(item: PendingApproval): string {
 }
 
 function alertOnce(item: PendingApproval) {
+  // 声音永远播放（三音 + 后续 30 秒重复）；已在审批中心时人正盯着列表，
+  // 不再弹应用内通知卡遮挡视线（系统通知不受影响，后台场景仍有）。
   playApprovalChime(true);
+  if (props.currentPage === "approvals") return;
   // 接住通知句柄：点击「去审批中心」时立即销毁，而不是等 10s duration 自然过期
   const n = notification.warning({
     title: "AI 操作待审批",

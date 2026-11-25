@@ -105,7 +105,12 @@ onUnmounted(() => {
     <n-message-provider>
       <n-notification-provider placement="top-right" :max="3">
         <!-- 全局审批提醒：提示音 + 应用内通知 + 待审批角标；未授权/未启用时顶部横幅引导 -->
-        <ApprovalAlert @count="approvalCount = $event" @open="page = 'approvals'" @settings="page = 'settings'" />
+        <ApprovalAlert
+          :current-page="page"
+          @count="approvalCount = $event"
+          @open="page = 'approvals'"
+          @settings="page = 'settings'"
+        />
         <!-- 应用内更新：启动静默检查，发现新版本弹窗提示 -->
         <UpdatePrompt />
         <n-dialog-provider>
