@@ -133,7 +133,6 @@ onUnmounted(() => {
           :current-page="page"
           @count="approvalCount = $event"
           @open="page = 'approvals'"
-          @settings="page = 'settings'"
         />
         <!-- 应用内更新：启动静默检查，发现新版本弹窗提示 -->
         <UpdatePrompt />
