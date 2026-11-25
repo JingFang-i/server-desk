@@ -112,10 +112,20 @@ struct Pool {
     sessions: HashMap<String, Handle<HostKeyVerifier>>,
 }
 
+/// 手动连接的取消通道：key = server_id，value = (连接代号, 取消发送端)。
+/// 代号用于让「结束的连接」只清理自己那条登记，绝不误删后来者的。
+type CancelMap = HashMap<String, (u64, tokio::sync::oneshot::Sender<()>)>;
+
 #[derive(Clone, Default)]
 pub struct SshPool {
     pool: Arc<AsyncMutex<Pool>>,
+    cancels: Arc<AsyncMutex<CancelMap>>,
+    /// 连接代号发号器（AtomicU64 不便 derive Default，由 new() 初始化）
+    seq: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// 用户主动取消连接时的统一错误文案（前端据此区分「失败」与「取消」）。
+pub const CONNECT_CANCELLED: &str = "连接已取消";
 
 fn make_config() -> Arc<russh::client::Config> {
     Arc::new(russh::client::Config {
@@ -127,7 +137,11 @@ fn make_config() -> Arc<russh::client::Config> {
 
 impl SshPool {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            pool: Arc::new(AsyncMutex::new(Pool::default())),
+            cancels: Arc::new(AsyncMutex::new(CancelMap::new())),
+            seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        }
     }
 
     fn take(
@@ -186,19 +200,65 @@ impl SshPool {
     }
 
     /// 连接并纳入连接池管理（保持 30s keepalive）。
+    ///
+    /// 支持取消：连接进行中调用 [`cancel_connect`] 会立刻中断握手（返回
+    /// [`CONNECT_CANCELLED`]）。握手期间**不持有连接池锁**，避免状态轮询被阻塞。
     pub async fn connect(
         &self,
         store: &Arc<Store>,
         server_id: &str,
         p: ConnParams,
     ) -> Result<(), String> {
+        // 重建前先丢弃旧会话（短暂持锁，随后释放）
+        {
+            let mut pool = self.pool.lock().await;
+            let _ = self.take(&mut pool, server_id);
+        }
+
+        // 注册取消通道：同一服务器重复发起连接时，旧连接的取消信号先失效（视为被取消）
+        let my_id = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.cancels
+            .lock()
+            .await
+            .insert(server_id.to_string(), (my_id, tx));
+
+        let result = tokio::select! {
+            r = self.establish(store, server_id, &p) => r,
+            _ = rx => Err(CONNECT_CANCELLED.to_string()),
+        };
+
+        // 只清理本连接自己的登记：若已被新一轮连接覆盖（代号不同），保持不动
+        {
+            let mut cancels = self.cancels.lock().await;
+            if cancels.get(server_id).is_some_and(|(id, _)| *id == my_id) {
+                cancels.remove(server_id);
+            }
+        }
+
+        let session = result?;
         let mut pool = self.pool.lock().await;
-        let _ = self.take(&mut pool, server_id); // 重建前先丢弃旧会话
-        let session = self.establish(store, server_id, &p).await?;
         pool.sessions.insert(server_id.to_string(), session);
         Ok(())
     }
 
+    /// 取消进行中的手动连接；返回是否确有连接在进行（无可取消对象 → false）。
+    pub async fn cancel_connect(&self, server_id: &str) -> bool {
+        let mut cancels = self.cancels.lock().await;
+        match cancels.remove(server_id) {
+            Some((_, tx)) => {
+                // 接收方已被 drop（连接已结束）时发送会失败，仍视为「取消已发出」
+                let _ = tx.send(());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 是否有连接正在进行中（供前端/状态展示）。
+    pub async fn is_connecting(&self, server_id: &str) -> bool {
+        self.cancels.lock().await.contains_key(server_id)
+    }
     pub async fn disconnect(&self, server_id: &str) -> bool {
         let mut pool = self.pool.lock().await;
         match self.take(&mut pool, server_id) {

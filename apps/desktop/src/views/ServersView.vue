@@ -280,8 +280,14 @@ async function connectRow(row: ServerConfig) {
         connectFailures.delete(row.id);
         message.success(`「${row.name}」已连接（保活 30s）`);
       } catch (e) {
-        connectFailures.add(row.id); // 连接失败 → 红点保持
-        message.error(`「${row.name}」连接失败：${String(e)}`);
+        const msg = String(e);
+        if (msg.includes("连接已取消")) {
+          // 用户主动取消：不算失败，不标红点
+          message.info(`「${row.name}」已取消连接`);
+        } else {
+          connectFailures.add(row.id); // 连接失败 → 红点保持
+          message.error(`「${row.name}」连接失败：${msg}`);
+        }
       }
     }
   } catch (e) {
@@ -289,6 +295,16 @@ async function connectRow(row: ServerConfig) {
   } finally {
     connectingId.value = null;
     refreshConnStatus();
+  }
+}
+
+/** 取消进行中的连接：握手立即中断，connectRow 的 Promise 会以「连接已取消」结束 */
+async function cancelConnect(row: ServerConfig) {
+  try {
+    const ok = await api.sshConnectCancel(row.id);
+    if (!ok) message.info("连接已结束，无需取消");
+  } catch (e) {
+    message.error(String(e));
   }
 }
 
@@ -721,9 +737,17 @@ const selectedConnState = computed<ConnState>(() =>
           </div>
 
           <div class="detail-actions">
+            <!-- 连接进行中：按钮变为「取消连接」，握手可立即中断 -->
             <n-button
+              v-if="connectingId === selectedServer.id"
+              type="warning"
+              @click="cancelConnect(selectedServer)"
+            >
+              取消连接
+            </n-button>
+            <n-button
+              v-else
               :type="selectedConnState === 'connected' ? 'warning' : 'primary'"
-              :loading="connectingId === selectedServer.id"
               @click="connectRow(selectedServer)"
             >
               {{ selectedConnState === "connected" ? "断开连接" : "连接" }}

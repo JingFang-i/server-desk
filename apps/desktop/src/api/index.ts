@@ -293,6 +293,8 @@ export const api = {
   sshTest: (serverId: string) => invoke<TestResult>("ssh_test", { serverId }),
   // SSH 连接池
   sshConnect: (serverId: string) => invoke<void>("ssh_connect", { serverId }),
+  /** 取消进行中的连接（握手未完成时）：返回是否确有连接被取消 */
+  sshConnectCancel: (serverId: string) => invoke<boolean>("ssh_connect_cancel", { serverId }),
   sshDisconnect: (serverId: string) => invoke<void>("ssh_disconnect", { serverId }),
   sshStatus: () => invoke<ConnInfo[]>("ssh_status"),
   sshExec: (serverId: string, command: string, timeoutSecs?: number) =>

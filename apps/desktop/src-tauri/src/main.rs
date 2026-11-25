@@ -262,6 +262,7 @@ fn main() {
             commands::ssh_test,
             // SSH 连接池
             commands::ssh_connect,
+            commands::ssh_connect_cancel,
             commands::ssh_disconnect,
             commands::ssh_status,
             commands::ssh_exec,

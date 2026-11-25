@@ -381,6 +381,26 @@ pub async fn ssh_disconnect(state: State<'_, Arc<AppState>>, server_id: String) 
     Ok(())
 }
 
+/// 取消进行中的手动连接（握手未完成时）。返回是否确有连接被取消。
+#[tauri::command]
+pub async fn ssh_connect_cancel(
+    state: State<'_, Arc<AppState>>,
+    server_id: String,
+) -> Result<bool, String> {
+    let cancelled = state.ssh.cancel_connect(&server_id).await;
+    if cancelled {
+        ops::audit(
+            &state,
+            "user",
+            Some(&server_id),
+            "ssh_connect_cancel",
+            "用户取消连接",
+            "ok",
+        );
+    }
+    Ok(cancelled)
+}
+
 #[tauri::command]
 pub async fn ssh_status(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::ssh::ConnInfo>, String> {
     Ok(state.ssh.status().await)
