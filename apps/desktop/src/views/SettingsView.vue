@@ -14,6 +14,8 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import UpdatePrompt from "../components/UpdatePrompt.vue";
 import { api, type GuardInfo, type GuardRules, type McpInfo, type ReviewConfig, type ReviewEntry, type ReviewInfo, type ReviewTestResult, type VaultStatus } from "../api";
+import { audioState, ensureAudio, type AudioState } from "../alert";
+import { notifyPermission, requestNotifyPermission, type NotifyPermission } from "../notifyStatus";
 import { useServersStore } from "../stores/servers";
 
 const message = useMessage();
@@ -33,6 +35,31 @@ const ratePerMin = ref<number>(30);
 const strictGroups = ref<string[]>([]);
 const savingRules = ref(false);
 const mcpInfo = ref<McpInfo | null>(null);
+
+// ---------- 审批提醒与声音 ----------
+// 「提示音一定会响」的两个前提都在这里显式管理：
+// 1) 应用内提示音：受自动播放策略约束，需一次用户手势（点击启用并试听）
+// 2) 系统通知（后台可达、带声音）：macOS 需用户授权，未授权时给出申请入口
+const notifyPerm = ref<NotifyPermission>("unknown");
+const audio = ref<AudioState>("unavailable");
+
+async function loadAlertStatus() {
+  notifyPerm.value = await notifyPermission();
+  audio.value = audioState();
+}
+
+async function enableSound() {
+  audio.value = (await ensureAudio()) ? "running" : "suspended";
+  if (audio.value === "running") message.success("提示音已启用（刚才那声就是试听）");
+  else message.error("启用失败：请检查系统音量与输出设备后重试");
+}
+
+async function requestPerm() {
+  notifyPerm.value = await requestNotifyPermission();
+  if (notifyPerm.value === "granted") message.success("系统通知已授权");
+  else if (notifyPerm.value === "denied")
+    message.warning("授权被拒绝：请到系统设置 → 通知 → ServerDesk 手动允许");
+}
 
 // ---------- AI 智能审查（R8） ----------
 const rv = ref<ReviewInfo | null>(null);
@@ -204,6 +231,7 @@ onMounted(async () => {
   serversStore.load().catch(() => {});
   loadGuard();
   loadReview();
+  loadAlertStatus();
 });
 
 async function save() {
@@ -313,6 +341,47 @@ async function copy(text: string, label: string) {
       <template #footer>
         <n-button type="primary" :loading="saving" @click="save">保存设置</n-button>
       </template>
+    </n-card>
+
+    <n-card title="审批提醒与声音" size="small" style="max-width: 720px; margin-top: 16px">
+      <p class="hint" style="margin: 0 0 6px">
+        确保 AI 请求审批时你一定能听到。两条通道互为补充：
+        应用内提示音在窗口内响（三音提示，未处理每 30 秒重复）；
+        系统通知在后台也可达（带系统音效 + 程序坞/任务栏提醒）。
+      </p>
+      <div class="row">
+        <div class="label">
+          <div>提示音（应用内）</div>
+          <div class="desc">受浏览器自动播放策略约束：需要点击「启用」完成一次授权并试听</div>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center">
+          <n-tag size="small" :type="audio === 'running' ? 'success' : 'warning'" :bordered="false">
+            {{ audio === "running" ? "已启用" : "未启用" }}
+          </n-tag>
+          <n-button size="small" @click="enableSound">
+            {{ audio === "running" ? "试听" : "启用并试听" }}
+          </n-button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="label">
+          <div>系统通知（后台可达）</div>
+          <div class="desc">未授权时应用在后台收不到审批提醒；被拒后请到系统设置 → 通知 → ServerDesk 手动允许</div>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center">
+          <n-tag
+            size="small"
+            :type="notifyPerm === 'granted' ? 'success' : notifyPerm === 'denied' ? 'error' : 'default'"
+            :bordered="false"
+          >
+            {{ notifyPerm === "granted" ? "已授权" : notifyPerm === "denied" ? "未授权" : "无法确认" }}
+          </n-tag>
+          <n-button v-if="notifyPerm !== 'granted'" size="small" type="primary" ghost @click="requestPerm">
+            申请授权
+          </n-button>
+          <n-button v-else size="small" quaternary @click="loadAlertStatus">刷新状态</n-button>
+        </div>
+      </div>
     </n-card>
 
     <n-card title="AI 安全管线（MCP 接入）" size="small" style="max-width: 720px; margin-top: 16px">

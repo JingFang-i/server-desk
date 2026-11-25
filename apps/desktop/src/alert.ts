@@ -26,6 +26,34 @@ export function primeAlertSound() {
   if (c && c.state === "suspended") void c.resume().catch(() => {});
 }
 
+export type AudioState = "running" | "suspended" | "unavailable";
+
+/** 当前音频上下文状态：审批提示音能否立即出声。 */
+export function audioState(): AudioState {
+  const c = audioContext();
+  if (!c) return "unavailable";
+  return c.state === "running" ? "running" : "suspended";
+}
+
+/**
+ * 显式启用提示音（用户点击后调用）：恢复上下文并播放一声确认音，
+ * 返回是否已可出声。自动播放策略要求这一步必须在用户手势的调用栈里。
+ */
+export async function ensureAudio(): Promise<boolean> {
+  const c = audioContext();
+  if (!c) return false;
+  if (c.state === "suspended") {
+    try {
+      await c.resume();
+    } catch {
+      return false;
+    }
+  }
+  if (c.state !== "running") return false;
+  playApprovalChime(true);
+  return true;
+}
+
 /** 播放三声短促提示音（上行两音 + 回落），force 用于到点提醒。 */
 export function playApprovalChime(force = false) {
   const now = Date.now();
