@@ -84,7 +84,8 @@ function summarize(item: PendingApproval): string {
 
 function alertOnce(item: PendingApproval) {
   playApprovalChime(true);
-  notification.warning({
+  // 接住通知句柄：点击「去审批中心」时立即销毁，而不是等 10s duration 自然过期
+  const n = notification.warning({
     title: "AI 操作待审批",
     duration: 10000,
     keepAliveOnHover: true,
@@ -111,7 +112,14 @@ function alertOnce(item: PendingApproval) {
         ),
         h(
           NButton,
-          { size: "tiny", type: "primary", onClick: () => emit("open") },
+          {
+            size: "tiny",
+            type: "primary",
+            onClick: () => {
+              n.destroy();
+              emit("open");
+            },
+          },
           { default: () => "去审批中心" }
         ),
       ]),
