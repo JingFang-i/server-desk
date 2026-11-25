@@ -255,7 +255,8 @@ impl SshPool {
         }
     }
 
-    /// 是否有连接正在进行中（供前端/状态展示）。
+    /// 该服务器是否正有连接在进行中（供前端/状态展示）。
+    #[allow(dead_code)] // 前端已用 connectingId 自管；保留给后续「连接中」状态展示
     pub async fn is_connecting(&self, server_id: &str) -> bool {
         self.cancels.lock().await.contains_key(server_id)
     }
