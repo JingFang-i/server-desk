@@ -1,6 +1,7 @@
 # R8 — AI 智能审查（AI Reviewer）设计方案与开发计划
 
-> 状态：已确认（D1–D3 已拍板，2026-11-25）· R8.1–R8.5 已完成（67+1 单测、vue 导入检查、vue-tsc/vite 构建全绿）· R8.6（验收文档与真机走查）待开工
+> 状态：已确认并交付完成（R8.1–R8.6）· 67+1 单测、vue 导入检查、vue-tsc/vite 构建全绿 ·
+> 真机验收步骤见 [r8-acceptance.md](r8-acceptance.md)（8 个场景待人工执行）
 >
 > **R8.2/R8.3 实测记录（openbmb/minicpm5-2b @ 本地 Ollama，零出网）**：
 > - 推理模型兼容：正文在 `reasoning` 字段，`content` 在思维链结束前恒为空——客户端已实现

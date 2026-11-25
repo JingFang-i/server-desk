@@ -16,7 +16,7 @@ operations, but it can never see credentials or run dangerous commands.
 - 🗂️ **Server asset management** — hosts / ports / passwords / SSH keys in one place, one-click TCP reachability test
 - 🔐 **Master-password vault** — Argon2-derived keys + OS Keychain + auto-lock; credentials encrypted at rest with AES-256-GCM, never stored in plaintext
 - 🔌 **Stable SSH connections** — keep-alive, automatic reconnect, remote command execution
-- 🤖 **AI safety pipeline** — leak protection / black & white lists / approval for dangerous commands / full audit / output redaction, seven layers of defense
+- 🤖 **AI safety pipeline** — leak protection / black & white lists / approval for dangerous commands / full audit / output redaction, seven layers of defense; optional **AI review** (LLM-based semantic verdict that can only tighten decisions, works fully offline with local Ollama)
 - 🔔 **Approval alerts** — system notification + chime + sidebar badge when a dangerous command needs human approval; auto-rejected after 120s
 - 📦 **Encrypted backups** — manual export & restore (merge / overwrite) + scheduled automatic backups (keep N copies)
 - 🖥️ **Multi-platform** — native builds for macOS / Windows / Linux (Linux ships .deb / .rpm / AppImage)
@@ -30,7 +30,7 @@ operations, but it can never see credentials or run dangerous commands.
 │  ┌───────────────────────┐  │                           └──────────────────┘
 │  │ Vault (crypto/keychain)│  │
 │  │ Asset store (SQLite)   │  │
-│  │ Safety pipeline guard  │──┼──► black/white list → approval → audit → redaction
+│  │ Safety pipeline guard  │──┼──► black/white list → AI review (optional) → approval → audit → redaction
 │  │ SSH / SFTP channel     │  │
 │  └───────────────────────┘  │
 └─────────────┬───────────────┘
@@ -58,6 +58,12 @@ operations, but it can never see credentials or run dangerous commands.
 Every tool goes through the seven-layer pipeline in `guard.rs`:
 credential-leak protection → blacklist → whitelist → human approval →
 execution audit → output redaction → rate limiting.
+
+An optional **AI review** layer (the `review/` module) re-checks AI-issued commands
+with an LLM you configure (allow / send to human approval / recommend reject).
+Its verdict can only tighten the decision, never loosen it. Works fully offline
+with a local Ollama endpoint; command text is sanitized before leaving the app,
+and every verdict is logged. See [docs/r8-ai-review-design.md](docs/r8-ai-review-design.md).
 
 ## 🚀 Quick Start (development mode)
 

@@ -35,6 +35,7 @@ docs/                     # 方案与各里程碑验收文档（plan.md、m1~m5�
 | `text.rs` | 审计/审批/通知共用的文本截断与摘要预算 | 新增摘要必须用这里的 `truncate/summary`，不要另写一份 |
 | `crypto.rs` / `vault.rs` | AES-256-GCM 加密；主密码保险库（Argon2 + OS Keychain + 自动锁） | 加密逻辑改动需重新评估备份兼容性 |
 | `guard.rs` | AI 安全管线核心（泄露防护/黑名单拦截/审批/审计/脱敏，七层） | **新增任何 MCP 能力必须先过这里** |
+| `review/` | AI 智能审查（R8，可选层）：LLM 语义判定 → 三态（放行/转人工/建议拒绝），含缓存/熔断/限流/日志 | **合并判定必须维持「只收紧、永不放宽」不变式**（verdict.rs 穷举测试守护）；静态 Blocked 不送审；送审前必须过 `guard.sanitize` |
 | `approvals.rs` | 高危命令人工审批流（120s 超时自动拒绝） | |
 | `notify.rs` | 审批到达提醒：系统通知 + 声音 + 程序坞/任务栏注意力 | 只接收 `register_approval` 产出的脱敏摘要，禁止自行拼原始命令 |
 | `ssh.rs` | SSH 连接/保活/重连/命令执行（russh） | |
