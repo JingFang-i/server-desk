@@ -55,26 +55,31 @@ pub fn approval_requested(app: &AppHandle, pending: &PendingApproval) {
 }
 
 /// 查询或申请系统权限。没有可用平台查询时保留「未知」状态。
+///
+/// 返回：granted / denied / prompt（未申请）/ dev（开发模式无法查询）/ unknown。
 #[tauri::command]
 pub async fn approval_notification_permission(app: AppHandle, request: bool) -> &'static str {
     #[cfg(target_os = "macos")]
     {
+        // 开发模式（pnpm tauri dev）没有 .app 包身份，UNUserNotificationCenter
+        // 查询必然失败——返回专门状态让界面如实提示，而不是笼统的「无法确认」
         if tauri::is_dev() {
-            return "unknown";
+            return "dev";
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if app
-            .run_on_main_thread(move || macos_permission(request, tx))
-            .is_ok()
+        if let Err(e) = app.run_on_main_thread(move || macos_permission(request, tx)) {
+            eprintln!("通知权限查询调度失败: {e}");
+            return "unknown";
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(if request { 120 } else { 3 }),
+            rx,
+        )
+        .await
         {
-            if let Ok(Ok(status)) = tokio::time::timeout(
-                std::time::Duration::from_secs(if request { 120 } else { 3 }),
-                rx,
-            )
-            .await
-            {
-                return status;
-            }
+            Ok(Ok(status)) => return status,
+            Ok(Err(_)) => eprintln!("通知权限查询通道中断"),
+            Err(_) => eprintln!("通知权限查询超时（{}）", if request { "申请" } else { "查询" }),
         }
     }
     #[cfg(not(target_os = "macos"))]

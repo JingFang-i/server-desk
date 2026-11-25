@@ -429,15 +429,30 @@ async function copy(text: string, label: string) {
       <div class="row">
         <div class="label">
           <div>系统通知（后台可达）</div>
-          <div class="desc">后台提醒由系统通知设置控制。请在系统设置中确认 ServerDesk 的通知权限。</div>
+          <div class="desc">
+            后台提醒由系统通知设置控制。打包后的 ServerDesk.app 可在此查询/申请权限；
+            <template v-if="notifyPerm === 'dev'">
+              当前为<strong>开发模式</strong>——没有应用包身份，系统通知权限无法查询，请以打包版验证。
+            </template>
+          </div>
         </div>
         <div style="display: flex; gap: 8px; align-items: center">
           <n-tag
             size="small"
-            :type="notifyPerm === 'granted' ? 'success' : notifyPerm === 'denied' ? 'error' : 'default'"
+            :type="notifyPerm === 'granted' ? 'success' : notifyPerm === 'denied' ? 'error' : notifyPerm === 'prompt' ? 'warning' : 'default'"
             :bordered="false"
           >
-            {{ notifyPerm === "granted" ? "已授权" : notifyPerm === "denied" ? "未授权" : notifyPerm === "prompt" ? "待授权" : "无法确认" }}
+            {{
+              notifyPerm === "granted"
+                ? "已授权"
+                : notifyPerm === "denied"
+                  ? "已拒绝"
+                  : notifyPerm === "prompt"
+                    ? "待授权"
+                    : notifyPerm === "dev"
+                      ? "开发模式"
+                      : "无法确认"
+            }}
           </n-tag>
           <n-button v-if="notifyPerm === 'prompt'" size="small" type="primary" ghost @click="requestPerm">
             申请授权

@@ -2,7 +2,7 @@
 import { readonly, shallowRef } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
-type NotifyPermission = "granted" | "denied" | "prompt" | "unknown";
+type NotifyPermission = "granted" | "denied" | "prompt" | "dev" | "unknown";
 const permission = shallowRef<NotifyPermission>("unknown");
 export const notifyPermissionState = readonly(permission);
 let requesting = false;
