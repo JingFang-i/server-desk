@@ -71,11 +71,19 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 页面按内容自然增高，交给外层 layout-content 滚动（固定 height:100% 会让长内容滚不动） */
+.page {
+  height: auto;
+  min-height: 100%;
+}
 .approval-item {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
   padding: 12px;
   margin-top: 12px;
+  /* 单个审批项本身也能滚动，避免极端长内容撑爆整页 */
+  max-height: 70vh;
+  overflow-y: auto;
 }
 .meta {
   display: flex;
@@ -99,6 +107,9 @@ onUnmounted(() => {
   margin: 10px 0;
   white-space: pre-wrap;
   word-break: break-all;
+  /* 超长命令在自己的框里滚动，审批按钮始终可见 */
+  max-height: 28vh;
+  overflow-y: auto;
 }
 .ai-note {
   border-radius: 6px;
@@ -109,5 +120,12 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+  /* 吸底：即使审批项滚动，按钮也钉在可视区底部 */
+  position: sticky;
+  bottom: 0;
+  padding-top: 8px;
+  background: rgba(22, 22, 26, 0.92);
+  backdrop-filter: blur(4px);
+  border-top: 1px dashed rgba(255, 255, 255, 0.08);
 }
 </style>
