@@ -163,6 +163,12 @@ fn has_substitution(cmd: &str) -> bool {
     cmd.contains("$(") || cmd.contains("<(") || cmd.contains(">(") || cmd.contains('`')
 }
 
+/// 命令是否涉及 `.env` 环境文件（`.env` / `.env.local` / `--env-file=.env` 等）。
+/// 命中不硬拒，转人工审批——AI 排查配置时仍可读，但必须经过用户确认。
+fn mentions_dotenv(lower_cmd: &str) -> bool {
+    lower_cmd.contains(".env")
+}
+
 /// 规则匹配：普通规则按子串匹配；以 `/` 结尾的规则（如 `rm -rf /`）要求其后是边界，
 /// 否则 `rm -rf /tmp/build` 会被误判成「删根」而直接硬拒（它本该走审批）。
 fn matches_rule(haystack_lower: &str, rule: &str) -> bool {
@@ -198,8 +204,14 @@ fn is_echo_only(segment: &str) -> bool {
 }
 
 /// 凭据泄露防护：命令里出现读凭据的动作即硬拒绝（AI 与真实模板都过这一关）。
+///
+/// 例外：命令涉及 `.env` 环境文件时，`env` 关键字的硬拒让位给「转人工审批」
+/// （见 `evaluate` 的 dotenv 分支）——否则 `cat /opt/app/.env` 会被
+/// `\benv\b` 当环境变量导出拦死，永远到不了审批卡。文件里的凭据仍由
+/// 输出脱敏兜底，且用户必须在审批卡上确认。
 fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
-    if g.leak.env_word.is_match(command) {
+    let mentions_dotenv = command.to_lowercase().contains(".env");
+    if !mentions_dotenv && g.leak.env_word.is_match(command) {
         return Some(Decision::Blocked("命中凭据泄露防护规则「env」".into()));
     }
     for re in &g.leak.cmd_blockers {
@@ -529,6 +541,14 @@ impl Guard {
                 return Decision::Blocked(format!("命中高危命令黑名单「{}」", p.trim()));
             }
         }
+        // `.env` 环境文件：不硬拒（AI 可能需要排查配置），一律转人工审批。
+        // 放在白名单校验之前——白名单模式下也不该由「不在清单内」直接拒掉，
+        // 而是交给用户判断。
+        if mentions_dotenv(&lower) {
+            return Decision::NeedsApproval(
+                "命令涉及 .env 环境文件（可能含凭据），需人工确认".to_string(),
+            );
+        }
         // 白名单模式：每一条子命令都必须命中白名单（纯 echo 标签除外）
         if g.rules.whitelist_mode {
             for seg in split_segments(&normalized) {
@@ -632,6 +652,17 @@ mod tests {
         Guard {
             inner: Arc::new(RwLock::new(GuardInner {
                 rules: GuardRules::default(),
+                leak: LeakGuard::build(),
+                ai_enabled: true,
+            })),
+        }
+    }
+
+    /// 按给定规则构造 Guard（本模块测试用；r4_tests 里另有一份同名 guard_with）。
+    fn guard_rules(rules: GuardRules) -> Guard {
+        Guard {
+            inner: Arc::new(RwLock::new(GuardInner {
+                rules,
                 leak: LeakGuard::build(),
                 ai_enabled: true,
             })),
@@ -746,6 +777,43 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_command_requires_approval() {
+        let g = guard();
+        // 读、写、拷贝、指定 env 文件的命令都转人工审批（不硬拒）
+        for cmd in [
+            "cat /opt/app/.env",
+            "grep -i token /opt/app/.env.production",
+            "echo NEW=1 >> /opt/app/.env",
+            "cp .env .env.bak",
+            "docker run --env-file=.env alpine env",
+        ] {
+            assert!(
+                matches!(g.evaluate(cmd), Decision::NeedsApproval(_)),
+                "{cmd} 应转人工审批"
+            );
+        }
+        // 不含 .env 的普通命令不受影响
+        assert!(matches!(g.evaluate("uptime && df -h /"), Decision::Allow));
+        // 白名单模式：.env 命令仍走审批而不是「不在清单内」的硬拒
+        let mut r = GuardRules::default();
+        r.whitelist_mode = true;
+        r.whitelist = vec!["uptime".into()];
+        let gw = guard_rules(r);
+        assert!(matches!(
+            gw.evaluate("cat /opt/app/.env"),
+            Decision::NeedsApproval(_)
+        ));
+        // 只读模式：写 .env 仍被硬拒（只读无审批逃生口）
+        let mut ro = GuardRules::default();
+        ro.readonly = true;
+        let gro = guard_rules(ro);
+        assert!(matches!(
+            gro.evaluate("echo A=1 > /opt/app/.env"),
+            Decision::Blocked(_)
+        ));
+    }
+
+    #[test]
     fn blocks_credential_leak_commands() {
         assert!(matches!(guard().evaluate("env | grep TOKEN"), Decision::Blocked(_)));
         assert!(matches!(guard().evaluate("cat ~/.ssh/id_rsa"), Decision::Blocked(_)));
@@ -761,11 +829,16 @@ mod tests {
     }
 
     #[test]
-    fn systemd_service_inspection_does_not_open_environment_files() {
+    fn systemd_service_inspection_escalates_environment_files() {
         let g = guard();
-        assert!(matches!(g.evaluate("cat /etc/systemd/system/app.env"), Decision::Blocked(_)));
+        // 命令级：`.env` 不再硬拒，转人工审批（用户显式要求「不直接拒绝」）
+        assert!(matches!(
+            g.evaluate("cat /etc/systemd/system/app.env"),
+            Decision::NeedsApproval(_)
+        ));
         assert!(matches!(g.evaluate("systemctl status example.service"), Decision::Allow));
-        assert!(matches!(g.evaluate("cat /opt/app/app.env"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("cat /opt/app/app.env"), Decision::NeedsApproval(_)));
+        // 文件工具级：read_file 等仍硬拒，不给审批逃生口
         assert!(matches!(g.evaluate_read_path("/opt/app/app.env"), Decision::Blocked(_)));
     }
 
