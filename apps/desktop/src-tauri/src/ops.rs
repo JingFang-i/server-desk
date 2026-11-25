@@ -1038,6 +1038,9 @@ pub async fn ai_restore_file(
     if meta.server_id != cfg.id {
         return Err("备份不属于该服务器".into());
     }
+    // 回滚等价于一次覆盖写：必须同样过禁写名单，否则可借旧备份覆盖
+    // sshd_config / authorized_keys / .bashrc 等受保护路径。
+    remote_write_rules(state, &cfg, shared::action::MCP_RESTORE_FILE, &meta.path).await?;
     let summary = format!(
         "回滚文件 {} 至备份 {}（{} 字节，备份于 {}）",
         meta.path, meta.id, meta.size, meta.ts
