@@ -16,6 +16,9 @@ pub struct PendingApproval {
     pub server_id: String,
     pub server_name: String,
     pub command: String,
+    /// AI 审查意见（R8.4）：审查层给出的理由/降级说明，审批卡直接展示。
+    /// 静态规则触发且审查未介入时为 None——不占位、不误导。
+    pub ai_note: Option<String>,
     pub created_at: String,
     pub expires_at: String,
 }
@@ -38,6 +41,7 @@ impl Approvals {
         server_id: &str,
         server_name: &str,
         command: &str,
+        ai_note: Option<&str>,
         tx: oneshot::Sender<bool>,
     ) -> PendingApproval {
         let id = uuid::Uuid::new_v4().to_string();
@@ -47,6 +51,7 @@ impl Approvals {
             server_id: server_id.to_string(),
             server_name: server_name.to_string(),
             command: command.to_string(),
+            ai_note: ai_note.map(|s| s.to_string()),
             created_at: now.to_rfc3339(),
             expires_at: (now + chrono::Duration::seconds(APPROVAL_TTL.as_secs() as i64)).to_rfc3339(),
         };

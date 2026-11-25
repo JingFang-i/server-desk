@@ -418,9 +418,10 @@ impl Store {
         limit: i64,
         source: Option<&str>,
         session: Option<&str>,
+        action: Option<&str>,
     ) -> Result<Vec<AuditEntry>, String> {
         Ok(self
-            .audit_page(1, limit.min(1000), source, session)?
+            .audit_page(1, limit.min(1000), source, session, action)?
             .entries)
     }
 
@@ -432,12 +433,14 @@ impl Store {
         page_size: i64,
         source: Option<&str>,
         session: Option<&str>,
+        action: Option<&str>,
     ) -> Result<AuditPage, String> {
         let conn = self.lock()?;
         let page = page.max(1);
         let page_size = page_size.clamp(10, 500);
         let source = source.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
         let session = session.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
+        let action = action.filter(|s| !s.is_empty() && *s != "all").unwrap_or("");
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<AuditEntry> {
             Ok(AuditEntry {
                 id: r.get(0)?,
@@ -463,22 +466,23 @@ impl Store {
                         AND lower(a.outcome) NOT LIKE '%timed_out%') \
                   THEN 1 ELSE 0 END \
              FROM audit_log a LEFT JOIN servers s ON s.id = a.server_id";
-        const WHERE: &str = "WHERE (?1 = '' OR a.source = ?1) AND (?2 = '' OR a.session = ?2)";
+        const WHERE: &str = "WHERE (?1 = '' OR a.source = ?1) AND (?2 = '' OR a.session = ?2) \
+              AND (?3 = '' OR a.action = ?3)";
         let total: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM audit_log a LEFT JOIN servers s ON s.id = a.server_id {WHERE}"),
-                params![source, session],
+                params![source, session, action],
                 |r| r.get(0),
             )
             .map_err(|e| format!("查询审计失败: {e}"))?;
         let offset = (page - 1) * page_size;
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT} {WHERE} ORDER BY a.id DESC LIMIT ?3 OFFSET ?4"
+                "{SELECT} {WHERE} ORDER BY a.id DESC LIMIT ?4 OFFSET ?5"
             ))
             .map_err(|e| format!("查询审计失败: {e}"))?;
         let rows = stmt
-            .query_map(params![source, session, page_size, offset], map_row)
+            .query_map(params![source, session, action, page_size, offset], map_row)
             .map_err(|e| format!("查询审计失败: {e}"))?;
         let mut entries = Vec::new();
         for r in rows {
@@ -551,14 +555,14 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         // 旧的 manual 仍在；新的 ai 仍在
-        assert_eq!(store.audit_list(100, Some("manual"), None).unwrap().len(), 1);
-        assert_eq!(store.audit_list(100, Some("ai"), None).unwrap().len(), 1);
+        assert_eq!(store.audit_list(100, Some("manual"), None, None).unwrap().len(), 1);
+        assert_eq!(store.audit_list(100, Some("ai"), None, None).unwrap().len(), 1);
         // 全量清理剩余旧行（cutoff 覆盖 recent 前）
         let n = store
             .purge_audit_before("2026-11-15T00:00:00.000000+00:00", None)
             .unwrap();
         assert_eq!(n, 1);
-        assert_eq!(store.audit_list(100, None, None).unwrap().len(), 2);
+        assert_eq!(store.audit_list(100, None, None, None).unwrap().len(), 2);
 
         let _ = std::fs::remove_file(&db);
     }
@@ -579,17 +583,17 @@ mod tests {
         store.insert_audit(t4, "s-bbb", "ai", None, "", shared::action::MCP_EXEC_COMMAND, "d", "exit=Some(0) timed_out").unwrap();
 
         // 会话筛选在 SQL 层完成
-        let a = store.audit_list(100, Some("ai"), Some("s-aaa")).unwrap();
+        let a = store.audit_list(100, Some("ai"), Some("s-aaa"), None).unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].session, "s-aaa");
         assert!(a[0].ok);
 
-        let b = store.audit_list(100, None, Some("s-bbb")).unwrap();
+        let b = store.audit_list(100, None, Some("s-bbb"), None).unwrap();
         assert_eq!(b.len(), 2);
         // blocked / timed_out 不算成功，"exit=Some(0)" 算成功
         assert!(b.iter().all(|r| !r.ok));
 
-        let none = store.audit_list(100, Some("ai"), None).unwrap();
+        let none = store.audit_list(100, Some("ai"), None, None).unwrap();
         assert_eq!(none.len(), 4);
         assert_eq!(none.iter().filter(|r| r.ok).count(), 2);
 
@@ -612,16 +616,16 @@ mod tests {
                 .insert_audit(&ts, "s-p", "ai", None, "", "mcp_exec_command", "d", "ok")
                 .unwrap();
         }
-        let p1 = store.audit_page(1, 10, Some("ai"), Some("s-p")).unwrap();
+        let p1 = store.audit_page(1, 10, Some("ai"), Some("s-p"), None).unwrap();
         assert_eq!(p1.total, 25);
         assert_eq!(p1.entries.len(), 10);
-        let p3 = store.audit_page(3, 10, Some("ai"), Some("s-p")).unwrap();
+        let p3 = store.audit_page(3, 10, Some("ai"), Some("s-p"), None).unwrap();
         assert_eq!(p3.entries.len(), 5);
-        let empty = store.audit_page(9, 10, Some("ai"), Some("s-p")).unwrap();
+        let empty = store.audit_page(9, 10, Some("ai"), Some("s-p"), None).unwrap();
         assert!(empty.entries.is_empty());
         assert_eq!(empty.total, 25);
         // session 筛选影响 total
-        let none = store.audit_page(1, 10, Some("ai"), Some("other")).unwrap();
+        let none = store.audit_page(1, 10, Some("ai"), Some("other"), None).unwrap();
         assert_eq!(none.total, 0);
         let _ = std::fs::remove_file(&db);
     }
@@ -655,7 +659,7 @@ mod tests {
                 "ok",
             )
             .unwrap();
-        let rows = store.audit_list(10, None, None).unwrap();
+        let rows = store.audit_list(10, None, None, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].server_id.as_deref(), Some("srv-1"));
         assert_eq!(rows[0].server_name, "生产 A");

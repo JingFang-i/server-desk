@@ -654,10 +654,11 @@ pub fn audit_list(
     limit: Option<i64>,
     source: Option<String>,
     session: Option<String>,
+    action: Option<String>,
 ) -> Result<Vec<crate::store::AuditEntry>, String> {
     state
         .store
-        .audit_list(limit.unwrap_or(200), source.as_deref(), session.as_deref())
+        .audit_list(limit.unwrap_or(200), source.as_deref(), session.as_deref(), action.as_deref())
 }
 
 /// 审计页服务端分页：SQL 层 LIMIT/OFFSET，几百上千条不再一次拉全。
@@ -668,12 +669,14 @@ pub fn audit_page(
     page_size: Option<i64>,
     source: Option<String>,
     session: Option<String>,
+    action: Option<String>,
 ) -> Result<crate::store::AuditPage, String> {
     state.store.audit_page(
         page.unwrap_or(1),
         page_size.unwrap_or(50),
         source.as_deref(),
         session.as_deref(),
+        action.as_deref(),
     )
 }
 

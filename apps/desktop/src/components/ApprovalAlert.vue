@@ -49,6 +49,15 @@ function alertOnce(item: PendingApproval) {
           { style: "font-size:13px;line-height:1.6;word-break:break-all" },
           `「${item.serverName}」请求执行：${summarize(item)}`
         ),
+        ...(item.aiNote
+          ? [
+              h(
+                "div",
+                { style: "font-size:12px;line-height:1.6;color:#e88080;word-break:break-all" },
+                `AI 意见：${item.aiNote}`
+              ),
+            ]
+          : []),
         h(
           "div",
           { style: "font-size:12px;opacity:.6" },

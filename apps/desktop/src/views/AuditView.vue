@@ -26,6 +26,18 @@ const sourceOptions = [
   { label: "用户（界面操作）", value: "user" },
 ];
 
+/** 动作筛选（R8.4）：SQL 层 action = ?，覆盖高频排查场景 */
+const actionFilter = ref<string>("all");
+const actionOptions = [
+  { label: "全部动作", value: "all" },
+  { label: "AI 审查", value: "ai_review" },
+  { label: "AI 命令执行", value: "mcp_exec_command" },
+  { label: "AI 批量执行", value: "mcp_exec_batch" },
+  { label: "AI 文件写入", value: "mcp_write_file" },
+  { label: "AI 审批请求", value: "mcp_approval_requested" },
+  { label: "手动命令", value: "ssh_exec" },
+];
+
 const rowKey = (r: AuditEntry) => r.id;
 
 /** 会话筛选在 SQL 层完成；分页也在 SQL 层（LIMIT/OFFSET + COUNT），前端只渲染当前页 */
@@ -210,7 +222,8 @@ async function refresh() {
       pagination.page,
       pagination.pageSize,
       sourceFilter.value,
-      sessionFilter.value
+      sessionFilter.value,
+      actionFilter.value
     );
     rows.value = res.entries;
     pagination.itemCount = res.total;
@@ -235,6 +248,13 @@ onMounted(refresh);
             v-model:value="sourceFilter"
             :options="sourceOptions"
             style="width: 160px"
+            size="small"
+            @update:value="onFilterChange"
+          />
+          <n-select
+            v-model:value="actionFilter"
+            :options="actionOptions"
+            style="width: 150px"
             size="small"
             @update:value="onFilterChange"
           />

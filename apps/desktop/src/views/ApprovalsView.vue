@@ -59,6 +59,7 @@ onUnmounted(() => {
           <span class="ttl">剩余 {{ secondsLeft(it.expiresAt) }}s</span>
         </div>
         <pre class="cmd">{{ it.command }}</pre>
+        <div v-if="it.aiNote" class="ai-note">🤖 {{ it.aiNote }}</div>
         <div class="actions">
           <n-button size="small" type="error" ghost @click="decide(it, false)">拒绝</n-button>
           <n-button size="small" type="primary" @click="decide(it, true)">批准执行</n-button>
@@ -97,6 +98,16 @@ onUnmounted(() => {
   margin: 10px 0;
   white-space: pre-wrap;
   word-break: break-all;
+}
+.ai-note {
+  background: rgba(232, 128, 128, 0.08);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #e88080;
+  word-break: break-all;
+  margin-bottom: 10px;
 }
 .actions {
   display: flex;

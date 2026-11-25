@@ -188,6 +188,7 @@ fn register_approval(
     server_id: &str,
     server_name: &str,
     summary: &str,
+    ai_note: Option<&str>,
 ) -> tokio::sync::oneshot::Receiver<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let safe_command = truncate(
@@ -197,7 +198,7 @@ fn register_approval(
     let safe_name = truncate(&state.guard.sanitize(server_name), SERVER_NAME_MAX);
     let pending = state
         .approvals
-        .create(server_id, &safe_name, &safe_command, tx);
+        .create(server_id, &safe_name, &safe_command, ai_note, tx);
     let _ = state.handle.emit("approvals-updated", ());
     let _ = state.handle.emit("approval-requested", pending.clone());
     crate::notify::approval_requested(&state.handle, &pending);
@@ -325,8 +326,8 @@ pub async fn run_command(
                 cfg.group.as_deref().unwrap_or("")
             ));
         }
-        // R8.2：AI 审查层——只能收紧判定（静态 Blocked 不送审），失败按策略兜底
-        let decision = crate::review::review_and_merge(
+        // R8.2/R8.4：AI 审查层——只能收紧判定（静态 Blocked 不送审）；ai_note 附到审批卡
+        let outcome = crate::review::review_and_merge(
             state,
             shared::action::MCP_EXEC_COMMAND,
             &command,
@@ -339,13 +340,14 @@ pub async fn run_command(
             Some(&cfg.id),
         )
         .await;
+        let decision = outcome.decision;
         match decision {
             Decision::Blocked(reason) => {
                 audit(state, source, Some(&cfg.id), shared::action::MCP_EXEC_COMMAND, &command, "blocked");
                 return Err(format!("已拦截：{reason}"));
             }
             Decision::NeedsApproval(reason) => {
-                let rx = register_approval(state, &cfg.id, &cfg.name, &command);
+                let rx = register_approval(state, &cfg.id, &cfg.name, &command, outcome.ai_note.as_deref());
                 audit(
                     state,
                     source,
@@ -430,7 +432,7 @@ pub(crate) async fn request_approval(
     summary: &str,
     kind: &str,
 ) -> Result<(), String> {
-    let rx = register_approval(state, &cfg.id, &cfg.name, summary);
+    let rx = register_approval(state, &cfg.id, &cfg.name, summary, None);
     audit(
         state,
         "ai",
@@ -1009,8 +1011,8 @@ pub async fn exec_batch(
             "批量目标包含严格分组服务器：整批需人工审批".to_string(),
         );
     }
-    // R8.2：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
-    let decision = crate::review::review_and_merge(
+    // R8.2/R8.4：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
+    let outcome = crate::review::review_and_merge(
         state,
         shared::action::MCP_EXEC_BATCH,
         &command,
@@ -1023,13 +1025,14 @@ pub async fn exec_batch(
         None,
     )
     .await;
+    let decision = outcome.decision;
     match decision {
         Decision::Blocked(reason) => {
             audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, &format!("blocked:{reason}"));
             return Err(format!("已拦截：{reason}"));
         }
         Decision::NeedsApproval(reason) => {
-            let rx = register_approval(state, "", &batch_label, &command);
+            let rx = register_approval(state, "", &batch_label, &command, outcome.ai_note.as_deref());
             audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_REQUESTED, &command, &format!("batch:{reason}"));
             let decided = tokio::time::timeout(
                 Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),

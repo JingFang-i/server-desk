@@ -707,7 +707,7 @@ mod tests {
     async fn approval_decide_flow() {
         let q = Approvals::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let pending = q.create("s1", "srv-01", "dd if=/dev/zero of=/tmp/x", tx);
+        let pending = q.create("s1", "srv-01", "dd if=/dev/zero of=/tmp/x", None, tx);
         assert_eq!(q.pending().len(), 1);
         assert!(q.decide(&pending.id, true));
         assert_eq!(rx.await, Ok(true));
@@ -718,7 +718,7 @@ mod tests {
     async fn approval_reject_flow() {
         let q = Approvals::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let pending = q.create("s1", "srv-01", "reboot", tx);
+        let pending = q.create("s1", "srv-01", "reboot", None, tx);
         assert!(q.decide(&pending.id, false));
         assert_eq!(rx.await, Ok(false));
     }

@@ -75,6 +75,8 @@ export interface PendingApproval {
   serverId: string;
   serverName: string;
   command: string;
+  /** AI 审查意见（R8.4）：审查未介入时为 null，不占位 */
+  aiNote: string | null;
   createdAt: string;
   expiresAt: string;
 }
@@ -112,7 +114,10 @@ export type AuditAction =
   | "mcp_set_enabled"
   | "vault_unlock"
   | "rate_limited"
-  | "ssh_test";
+  | "ssh_test"
+  | "ai_review"
+  | "ai_review_save"
+  | "ai_review_test";
 
 export interface AuditPage {
   entries: AuditEntry[];
@@ -172,6 +177,64 @@ export interface McpInfo {
   token: string;
   sidecarPath: string;
   configJson: string;
+}
+
+// ---------- AI 智能审查（R8） ----------
+
+export type ReviewProtocol = "openaicompat";
+export type ReviewFailurePolicy = "escalate" | "allow" | "block";
+export type ReviewDenyMode = "escalate" | "reject";
+
+export interface ReviewConfig {
+  enabled: boolean;
+  baseUrl: string;
+  model: string;
+  protocol: ReviewProtocol;
+  /** 单次审查请求总超时（毫秒） */
+  timeoutMs: number;
+  /** 送审文本（脱敏后）长度上限（字节） */
+  maxInputBytes: number;
+  /** 输出 token 预算（推理模型建议 ≥512） */
+  maxTokens: number;
+  failurePolicy: ReviewFailurePolicy;
+  denyMode: ReviewDenyMode;
+  reviewFiles: boolean;
+  /** 是否把服务器分组/名称一并发给模型（D3：默认 false） */
+  sendServerContext: boolean;
+  cacheTtlSecs: number;
+  promptVersion: string;
+}
+
+export interface ReviewInfo extends ReviewConfig {
+  hasKey: boolean;
+  /** sk-****abcd 形态掩码；明文 Key 永不出后端 */
+  keyMask: string;
+}
+
+export interface ReviewTestResult {
+  ok: boolean;
+  latencyMs: number;
+  model: string;
+  /** 模型原始输出（截断，仅诊断用） */
+  content: string;
+  error: string;
+}
+
+export interface ReviewEntry {
+  id: number;
+  ts: string;
+  tool: string;
+  serverName: string;
+  /** allow | review | deny | error | skipped */
+  aiVerdict: string;
+  /** allow | approval | blocked */
+  finalVerdict: string;
+  risk: string;
+  reason: string;
+  model: string;
+  latencyMs: number;
+  cached: boolean;
+  error: string;
 }
 
 export interface BackupSettings {
@@ -241,13 +304,19 @@ export const api = {
   approvalsPending: () => invoke<PendingApproval[]>("approvals_pending"),
   approvalDecide: (id: string, approve: boolean) =>
     invoke<void>("approval_decide", { id, approve }),
-  auditList: (limit?: number, source?: string, session?: string) =>
-    invoke<AuditEntry[]>("audit_list", { limit, source, session }),
-  auditPage: (page: number, pageSize: number, source?: string, session?: string) =>
-    invoke<AuditPage>("audit_page", { page, pageSize, source, session }),
+  auditList: (limit?: number, source?: string, session?: string, action?: string) =>
+    invoke<AuditEntry[]>("audit_list", { limit, source, session, action }),
+  auditPage: (page: number, pageSize: number, source?: string, session?: string, action?: string) =>
+    invoke<AuditPage>("audit_page", { page, pageSize, source, session, action }),
   auditSessions: () => invoke<string[]>("audit_sessions"),
   auditFailures: () => invoke<number>("audit_failures"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
+  // AI 智能审查（R8）
+  aiReviewInfo: () => invoke<ReviewInfo>("ai_review_info"),
+  aiReviewSave: (config: ReviewConfig, apiKey?: string) =>
+    invoke<ReviewInfo>("ai_review_save", { config, apiKey: apiKey ?? null }),
+  aiReviewTest: () => invoke<ReviewTestResult>("ai_review_test"),
+  aiReviewRecent: (limit?: number) => invoke<ReviewEntry[]>("ai_review_recent", { limit }),
   // 备份与恢复
   backupInfo: () => invoke<BackupInfo>("backup_info"),
   backupExport: (path: string, password: string) =>

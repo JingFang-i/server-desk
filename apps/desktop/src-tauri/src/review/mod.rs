@@ -161,7 +161,20 @@ impl Reviewer {
     }
 }
 
-/// AI 审查步骤：输入静态判定，输出最终判定（只会更严，见 verdict::merge）。
+/// 审查步骤的结构化输出：合并后的最终判定 + 给审批卡展示的 AI 意见。
+pub struct ReviewOutcome {
+    pub decision: Decision,
+    /// None = 审查未介入（关闭/静态硬拒跳过/限流跳过）；Some = 有意见可展示
+    pub ai_note: Option<String>,
+}
+
+impl ReviewOutcome {
+    fn plain(decision: Decision) -> Self {
+        Self { decision, ai_note: None }
+    }
+}
+
+/// AI 审查步骤：输入静态判定，输出合并结果（只会更严，见 verdict::merge）。
 ///
 /// 流程：关闭/Blocked 短路 → 独立限流 → 缓存 → 熔断 → Key → 并发闸门 →
 /// 调模型（命令先过 `guard.sanitize`）→ 解析 → 审计 → 合并。
@@ -173,17 +186,17 @@ pub(crate) async fn review_and_merge(
     static_decision: Decision,
     ctx: &ReviewContext<'_>,
     server_id: Option<&str>,
-) -> Decision {
+) -> ReviewOutcome {
     let cfg = state.reviewer.config();
 
     // 1) 静态硬拒：不送审（模型无权否决硬规则），审计一条 skip 便于追溯
     if matches!(static_decision, Decision::Blocked(_)) {
         audit_review(state, server_id, tool, command, "ok:ai_review:skipped:blocked_by_static");
-        return static_decision;
+        return ReviewOutcome::plain(static_decision);
     }
     // 2) 审查关闭：零开销直通（行为与 R7 完全一致）
     if !cfg.enabled {
-        return static_decision;
+        return ReviewOutcome::plain(static_decision);
     }
     let static_str = if matches!(static_decision, Decision::NeedsApproval(_)) {
         "approval"
@@ -194,14 +207,14 @@ pub(crate) async fn review_and_merge(
     // 3) 独立限流：超限跳过审查、维持静态判定（静态规则仍在保护）
     if state.review_rate.check(REVIEW_RATE_PER_MIN).is_err() {
         audit_review(state, server_id, tool, command, "ok:ai_review:skipped:rate_limited");
-        return static_decision;
+        return ReviewOutcome::plain(static_decision);
     }
 
     // 4) 缓存
     let key = cache_key(tool, command, static_str, &cfg);
     let ttl = Duration::from_secs(cfg.cache_ttl_secs);
     if ttl > Duration::ZERO {
-        if let Some(hit) = state.reviewer.cache_get(&key, ttl) {
+        if let Some(mut hit) = state.reviewer.cache_get(&key, ttl) {
             audit_review(
                 state,
                 server_id,
@@ -209,18 +222,20 @@ pub(crate) async fn review_and_merge(
                 command,
                 &format!("ok:ai_review:cached:{}", hit.verdict.as_str()),
             );
-            return verdict::merge(&static_decision, &Ok(hit), &cfg);
+            hit.cached = true;
+            let note = ai_note_of(&Ok(hit.clone()));
+            let decision = verdict::merge(&static_decision, &Ok(hit), &cfg);
+            return ReviewOutcome { decision, ai_note: note };
         }
     }
 
     // 5) 熔断：冷却期内不发起 HTTP，直接走失败策略
     if state.reviewer.breaker_open() {
         audit_review(state, server_id, tool, command, "ai_review:degraded:breaker");
-        return verdict::merge(
-            &static_decision,
-            &Err("审查熔断中：上游连续失败，冷却期内暂不调用模型".to_string()),
-            &cfg,
-        );
+        let ai = Err("审查熔断中：上游连续失败，冷却期内暂不调用模型".to_string());
+        let note = ai_note_of(&ai);
+        let decision = verdict::merge(&static_decision, &ai, &cfg);
+        return ReviewOutcome { decision, ai_note: note };
     }
 
     // 6) Key（保险库锁定 → 与工具自身失败路径一致；未配置 → 降级）
@@ -229,16 +244,18 @@ pub(crate) async fn review_and_merge(
         Err(e) => {
             let msg = format!("读取审查 API Key 失败：{e}");
             audit_review(state, server_id, tool, command, "ai_review:degraded:key_error");
-            return verdict::merge(&static_decision, &Err(msg), &cfg);
+            let ai = Err(msg);
+            let note = ai_note_of(&ai);
+            let decision = verdict::merge(&static_decision, &ai, &cfg);
+            return ReviewOutcome { decision, ai_note: note };
         }
     };
     let Some(api_key) = api_key.filter(|k| !k.trim().is_empty()) else {
         audit_review(state, server_id, tool, command, "ai_review:degraded:no_key");
-        return verdict::merge(
-            &static_decision,
-            &Err("未配置审查 API Key".to_string()),
-            &cfg,
-        );
+        let ai = Err("未配置审查 API Key".to_string());
+        let note = ai_note_of(&ai);
+        let decision = verdict::merge(&static_decision, &ai, &cfg);
+        return ReviewOutcome { decision, ai_note: note };
     };
 
     // 7) 送审（强制脱敏 + 限长 + 定界符）→ 调模型 → 解析
@@ -278,7 +295,26 @@ pub(crate) async fn review_and_merge(
             Err(crate::text::summary(&e, 120))
         }
     };
-    verdict::merge(&static_decision, &ai, &cfg)
+    let note = ai_note_of(&ai);
+    let decision = verdict::merge(&static_decision, &ai, &cfg);
+    ReviewOutcome { decision, ai_note: note }
+}
+
+/// 把 AI 结论转成审批卡可读的一行意见。
+/// Ok(allow) 也展示（"AI 复核未见额外风险"），让用户知道这单过过审查。
+fn ai_note_of(ai: &Result<verdict::AiReview, String>) -> Option<String> {
+    match ai {
+        Ok(r) => {
+            let verb = match r.verdict {
+                verdict::AiVerdict::Allow => "AI 复核未见额外风险",
+                verdict::AiVerdict::Review => "AI 建议人工确认",
+                verdict::AiVerdict::Deny => "AI 建议拒绝",
+            };
+            let cached = if r.cached { "（缓存结论）" } else { "" };
+            Some(format!("{verb}（{}）：{}{cached}", r.risk.as_str(), r.reason))
+        }
+        Err(e) => Some(format!("AI 审查降级：{e}")),
+    }
 }
 
 /// 审查步骤的独立审计行：action=ai_review，detail=脱敏摘要，
