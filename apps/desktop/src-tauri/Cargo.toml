@@ -24,6 +24,7 @@ keyring = { workspace = true }
 zeroize = { workspace = true }
 base64 = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
 russh-sftp = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

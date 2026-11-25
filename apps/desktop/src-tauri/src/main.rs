@@ -13,6 +13,7 @@ mod ipc;
 mod notify;
 mod observe;
 mod ops;
+mod review;
 mod ssh;
 mod state;
 mod store;
@@ -84,6 +85,8 @@ fn main() {
                 Err(e) => eprintln!("保险库：钥匙串自动解锁失败（{e}），需要手动解锁"),
             }
             let guard = guard::Guard::load(&store);
+            // AI 智能审查（R8）：未配置时审查关闭，行为与之前完全一致
+            let reviewer = review::Reviewer::load(&store);
             // AI 下载目录里的明文文件 7 天后自动清理（配置文件常带口令/令牌）
             ops::cleanup_downloads_on_startup(&dir);
 
@@ -222,6 +225,7 @@ fn main() {
                 vault,
                 ssh: ssh::SshPool::new(),
                 guard,
+                reviewer,
                 approvals: approvals::Approvals::default(),
                 ai_rate: guard::AiRate::new(),
                 handle: app.handle().clone(),
@@ -265,6 +269,11 @@ fn main() {
             commands::guard_info,
             commands::guard_set_rules,
             commands::mcp_set_enabled,
+            // AI 智能审查（R8）
+            commands::ai_review_info,
+            commands::ai_review_save,
+            commands::ai_review_test,
+            commands::ai_review_recent,
             // 审批
             commands::approvals_pending,
             commands::approval_decide,

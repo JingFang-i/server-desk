@@ -5,7 +5,7 @@
 use crate::guard::GuardRules;
 use crate::ops;
 use crate::state::AppState;
-use crate::text::{truncate, ERROR_MAX};
+use crate::text::{truncate, AUDIT_DETAIL_MAX, ERROR_MAX};
 use crate::vault::VaultStatus;
 use chrono::Utc;
 use shared::{AuthMethod, ServerConfig, TestResult};
@@ -484,6 +484,146 @@ pub fn mcp_set_enabled(
         "ok",
     );
     Ok(state.guard.info())
+}
+
+// ---------- AI 智能审查（R8） ----------
+
+/// 审查配置 + Key 掩码。绝无明文 Key（红线 1）。
+#[tauri::command]
+pub fn ai_review_info(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::review::ReviewInfo, String> {
+    Ok(state.reviewer.info(&state.store, &state.vault))
+}
+
+/// 保存审查配置并热生效；`api_key` 为空 / None 表示不修改已存 Key。
+/// Key 加密落盘；审计只记配置事实与「key 是否更新」，绝不记 Key 本体。
+#[tauri::command]
+pub fn ai_review_save(
+    state: State<'_, Arc<AppState>>,
+    config: crate::review::ReviewConfig,
+    api_key: Option<String>,
+) -> Result<crate::review::ReviewInfo, String> {
+    let cfg = config.normalized();
+    cfg.validate()?;
+    let key_changed = api_key
+        .as_deref()
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    if key_changed {
+        crate::review::config::save_api_key(
+            &state.store,
+            &state.vault,
+            api_key.as_deref().unwrap_or_default(),
+        )?;
+    }
+    state.reviewer.set_config(&state.store, cfg)?;
+    let saved = state.reviewer.config();
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "ai_review_save",
+        &truncate(
+            &format!(
+                "AI 审查配置：enabled={} model={} timeout={}ms 失败策略={} 拒绝策略={} key={}",
+                saved.enabled,
+                saved.model,
+                saved.timeout_ms,
+                saved.failure_policy.as_str(),
+                saved.deny_mode.as_str(),
+                if key_changed { "已更新" } else { "未变更" },
+            ),
+            AUDIT_DETAIL_MAX,
+        ),
+        "ok",
+    );
+    Ok(state.reviewer.info(&state.store, &state.vault))
+}
+
+/// 连通性测试结果：`ok=false` 时 error 带原因，前端直接展示。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTestResult {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub model: String,
+    /// 模型原始输出（截断展示，仅诊断用；R8.3 起由正式解析器消费）
+    pub content: String,
+    pub error: String,
+}
+
+/// 连通性测试：用一条固定的安全命令真实调用一次模型。
+/// 不产生审查日志（R8.5），但写审计；错误信息已单行化截断。
+#[tauri::command]
+pub async fn ai_review_test(state: State<'_, Arc<AppState>>) -> Result<ReviewTestResult, String> {
+    let state = state.inner().clone();
+    let cfg = state.reviewer.config();
+    if !cfg.enabled {
+        return Err("AI 审查未启用：请先开启并保存配置".into());
+    }
+    let key = crate::review::config::load_api_key(&state.store, &state.vault)?
+        .filter(|k| !k.trim().is_empty());
+    let Some(key) = key else {
+        return Err("未配置 API Key".into());
+    };
+    let outcome = crate::review::client::chat_json(
+        state.reviewer.http(),
+        &cfg,
+        Some(&key),
+        "你是服务器运维命令的安全审查员。只输出 JSON，不要解释。",
+        r#"{"tool":"exec_command","command":"uptime"}"#,
+    )
+    .await;
+    match outcome {
+        Ok(o) => {
+            ops::audit(
+                &state,
+                "user",
+                None,
+                "ai_review_test",
+                &truncate(
+                    &format!("AI 审查连通性测试：model={} {}ms", o.model, o.latency_ms),
+                    AUDIT_DETAIL_MAX,
+                ),
+                "ok",
+            );
+            Ok(ReviewTestResult {
+                ok: true,
+                latency_ms: o.latency_ms,
+                model: o.model,
+                content: truncate(&o.content, 120),
+                error: String::new(),
+            })
+        }
+        Err(e) => {
+            ops::audit(
+                &state,
+                "user",
+                None,
+                "ai_review_test",
+                &truncate(&format!("AI 审查连通性测试失败：{e}"), AUDIT_DETAIL_MAX),
+                "error",
+            );
+            Ok(ReviewTestResult {
+                ok: false,
+                latency_ms: 0,
+                model: cfg.model,
+                content: String::new(),
+                error: truncate(&e, ERROR_MAX),
+            })
+        }
+    }
+}
+
+/// 最近审查记录（R8.5 接入 `ai_review_log` 表；当前返回空集供前端联调）。
+#[tauri::command]
+pub fn ai_review_recent(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<i64>,
+) -> Result<Vec<crate::review::ReviewEntry>, String> {
+    let _ = (state, limit);
+    Ok(Vec::new())
 }
 
 // ---------- 审批 ----------

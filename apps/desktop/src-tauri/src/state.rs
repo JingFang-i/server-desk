@@ -10,6 +10,9 @@ pub struct AppState {
     pub vault: Arc<Vault>,
     pub ssh: SshPool,
     pub guard: Guard,
+    /// AI 智能审查器（R8）：配置热更新 + HTTP 连接池；
+    /// API Key 不常驻内存，使用时经 vault.dek() 现解（见 review/config.rs）。
+    pub reviewer: crate::review::Reviewer,
     pub approvals: Approvals,
     pub ai_rate: crate::guard::AiRate,
     pub handle: tauri::AppHandle,
