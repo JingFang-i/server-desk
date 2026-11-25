@@ -189,7 +189,7 @@ fn register_approval(
     server_id: &str,
     server_name: &str,
     summary: &str,
-    ai_note: Option<&str>,
+    ai_note: Option<&crate::approvals::ApprovalReview>,
 ) -> (String, tokio::sync::oneshot::Receiver<bool>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let safe_command = truncate(
@@ -333,6 +333,31 @@ pub async fn run_fixed_template(
     }
 }
 
+fn command_policy(guard: &crate::guard::Guard, command: &str, group: Option<&str>) -> Decision {
+    match guard.evaluate(command) {
+        Decision::Allow if guard.is_strict_group(group) => {
+            Decision::NeedsApproval("严格分组要求人工审批".into())
+        }
+        decision => decision,
+    }
+}
+
+fn validate_ai_dispatch(
+    state: &AppState,
+    command: &str,
+    group: Option<&str>,
+    approved: bool,
+) -> Result<(), String> {
+    if !state.guard.ai_enabled() || !state.vault.is_unlocked() {
+        return Err("AI 接入已关闭或保险库已锁定，命令未执行".into());
+    }
+    match command_policy(&state.guard, command, group) {
+        Decision::Blocked(_) => Err("当前安全规则已阻止该命令".into()),
+        Decision::NeedsApproval(_) if !approved => Err("当前安全规则要求审批，请重新提交".into()),
+        _ => Ok(()),
+    }
+}
+
 /// 执行一条命令。source: "manual"（用户）或 "ai"（MCP 管线）。
 pub async fn run_command(
     state: &Arc<AppState>,
@@ -345,20 +370,13 @@ pub async fn run_command(
     if command.is_empty() {
         return Err("命令不能为空".into());
     }
-    let cfg = load_server_config(state, server_ref)?;
+    let mut cfg = load_server_config(state, server_ref)?;
     let timeout = Duration::from_secs(timeout_secs.clamp(1, 300));
 
     // ---- AI 专属安全管线 ----
     if source == "ai" {
         ai_gate(state, &cfg, shared::action::MCP_EXEC_COMMAND, &command)?;
-        let mut decision = state.guard.evaluate(&command);
-        // 严格分组：命中分组的服务器，Allow 也强制审批
-        if matches!(decision, Decision::Allow) && state.guard.is_strict_group(cfg.group.as_deref()) {
-            decision = Decision::NeedsApproval(format!(
-                "严格分组「{}」：所有命令需人工审批",
-                cfg.group.as_deref().unwrap_or("")
-            ));
-        }
+        let decision = command_policy(&state.guard, &command, cfg.group.as_deref());
         // R8.2/R8.4：AI 审查层——只能收紧判定（静态 Blocked 不送审）；ai_note 附到审批卡
         let (outcome, pending) = review_command(
             state,
@@ -375,6 +393,7 @@ pub async fn run_command(
         )
         .await;
         let decision = outcome.decision;
+        let approved = matches!(decision, Decision::NeedsApproval(_));
         match decision {
             Decision::Blocked(reason) => {
                 audit(state, source, Some(&cfg.id), shared::action::MCP_EXEC_COMMAND, &command, "blocked");
@@ -382,7 +401,7 @@ pub async fn run_command(
             }
             Decision::NeedsApproval(reason) => {
                 let rx = pending.unwrap_or_else(|| {
-                    register_approval(state, &cfg.id, &cfg.name, &command, outcome.ai_note.as_deref()).1
+                    register_approval(state, &cfg.id, &cfg.name, &command, outcome.ai_note.as_ref()).1
                 });
                 audit(
                     state,
@@ -410,6 +429,18 @@ pub async fn run_command(
             }
             Decision::Allow => {}
         }
+        let current = load_server_config(state, &cfg.id)?;
+        ai_gate(state, &current, shared::action::MCP_EXEC_COMMAND, &command)?;
+        if current.id != cfg.id || current.host != cfg.host || current.port != cfg.port
+            || current.username != cfg.username || current.updated_at != cfg.updated_at
+        {
+            return Err("服务器配置已变化，请重新提交".into());
+        }
+        if let Err(reason) = validate_ai_dispatch(state, &command, current.group.as_deref(), approved) {
+            audit(state, "ai", Some(&current.id), shared::action::MCP_EXEC_COMMAND, &command, "blocked:policy_changed");
+            return Err(reason);
+        }
+        cfg = current;
     }
 
     let res = state
@@ -1032,58 +1063,62 @@ pub async fn exec_batch(
     }
     let (rows, missing) = resolve_batch_targets(&state.store, servers, group)?;
     let timeout = Duration::from_secs(timeout_secs.clamp(5, 120));
-    // 批量操作没有单一服务器：审计与审批卡都用「批量 ×N 台」作为服务器名快照
-    let batch_label = format!("批量 ×{} 台", rows.len());
+    let eligible_count = rows.iter().filter(|row| row.allow_ai).count();
+    let batch_label = format!("批量 ×{eligible_count} 台");
+    let mut approved = false;
+    if eligible_count > 0 {
 
-    // 命令安全判定一次（泄露防护/黑名单/审批）；严格分组目标存在则整批强制审批
-    let mut decision = state.guard.evaluate(&command);
-    if matches!(decision, Decision::Allow)
-        && rows
-            .iter()
-            .any(|r| state.guard.is_strict_group(r.group_name.as_deref()))
-    {
-        decision = Decision::NeedsApproval(
-            "批量目标包含严格分组服务器：整批需人工审批".to_string(),
-        );
-    }
-    // R8.2/R8.4：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
-    let (outcome, pending) = review_command(
-        state,
-        shared::action::MCP_EXEC_BATCH,
-        &command,
-        decision,
-        &crate::review::ReviewContext {
-            group: None,
-            server_name: None,
-            batch_size: Some(rows.len()),
-        },
-        None,
-        &batch_label,
-    )
-    .await;
-    let decision = outcome.decision;
-    match decision {
-        Decision::Blocked(reason) => {
-            audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, &format!("blocked:{reason}"));
-            return Err(format!("已拦截：{reason}"));
+        // 命令安全判定一次（泄露防护/黑名单/审批）；严格分组目标存在则整批强制审批
+        let mut decision = state.guard.evaluate(&command);
+        if matches!(decision, Decision::Allow)
+            && rows
+                .iter()
+                .any(|r| r.allow_ai && state.guard.is_strict_group(r.group_name.as_deref()))
+        {
+            decision = Decision::NeedsApproval(
+                "批量目标包含严格分组服务器：整批需人工审批".to_string(),
+            );
         }
-        Decision::NeedsApproval(reason) => {
-            let rx = pending.unwrap_or_else(|| {
-                register_approval(state, "", &batch_label, &command, outcome.ai_note.as_deref()).1
-            });
-            audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_REQUESTED, &command, &format!("batch:{reason}"));
-            let decided = tokio::time::timeout(
-                Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),
-                rx,
-            )
-            .await;
-            if !matches!(decided, Ok(Ok(true))) {
-                audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, "approval_denied_or_timeout");
-                return Err("审批被拒绝或已超时（120 秒），批量命令未执行".into());
+        // R8.2/R8.4：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
+        let (outcome, pending) = review_command(
+            state,
+            shared::action::MCP_EXEC_BATCH,
+            &command,
+            decision,
+            &crate::review::ReviewContext {
+                group: None,
+                server_name: None,
+                batch_size: Some(eligible_count),
+            },
+            None,
+            &batch_label,
+        )
+        .await;
+        let decision = outcome.decision;
+        match decision {
+            Decision::Blocked(reason) => {
+                audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, &format!("blocked:{reason}"));
+                return Err(format!("已拦截：{reason}"));
             }
-            audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_GRANTED, &command, "batch");
+            Decision::NeedsApproval(reason) => {
+                let rx = pending.unwrap_or_else(|| {
+                    register_approval(state, "", &batch_label, &command, outcome.ai_note.as_ref()).1
+                });
+                audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_REQUESTED, &command, &format!("batch:{reason}"));
+                let decided = tokio::time::timeout(
+                    Duration::from_secs(crate::guard::APPROVAL_TIMEOUT_SECS),
+                    rx,
+                )
+                .await;
+                if !matches!(decided, Ok(Ok(true))) {
+                    audit_named(state, "ai", None, &batch_label, shared::action::MCP_EXEC_BATCH, &command, "approval_denied_or_timeout");
+                    return Err("审批被拒绝或已超时（120 秒），批量命令未执行".into());
+                }
+                approved = true;
+                audit_named(state, "ai", None, &batch_label, shared::action::MCP_APPROVAL_GRANTED, &command, "batch");
+            }
+            Decision::Allow => {}
         }
-        Decision::Allow => {}
     }
 
     // 并发执行（信号量限流 5）
@@ -1114,7 +1149,29 @@ pub async fn exec_batch(
                 audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, "blocked:not_allow_ai");
                 return entry;
             }
-            let params = match conn_params_from_row(&st.vault, &r) {
+            let current = st.store.get(&r.id).and_then(|row| {
+                let row = row.ok_or("服务器已移除，请重新提交")?;
+                if !row.allow_ai {
+                    return Err("该服务器的 AI 操作已关闭".into());
+                }
+                if row.updated_at != r.updated_at || row.host != r.host || row.port != r.port
+                    || row.username != r.username || row.secret_blob != r.secret_blob
+                {
+                    return Err("服务器配置已变化，请重新提交".into());
+                }
+                validate_ai_dispatch(&st, &cmd, row.group_name.as_deref(), approved)?;
+                Ok(row)
+            });
+            let current = match current {
+                Ok(row) => row,
+                Err(reason) => {
+                    entry["ok"] = serde_json::json!(false);
+                    entry["error"] = serde_json::json!(reason);
+                    audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, "blocked:policy_changed");
+                    return entry;
+                }
+            };
+            let params = match conn_params_from_row(&st.vault, &current) {
                 Ok(p) => p,
                 Err(e) => {
                     entry["ok"] = serde_json::json!(false);
@@ -1126,8 +1183,8 @@ pub async fn exec_batch(
             let res = st.ssh.exec(&st.store, &r.id, &params, &cmd, timeout).await;
             match res {
                 Ok(x) => {
-                    let out = st.guard.sanitize(&truncate(&x.stdout, 4096));
-                    let errout = st.guard.sanitize(&truncate(&x.stderr, 2048));
+                    let out = truncate(&st.guard.sanitize(&x.stdout), 4096);
+                    let errout = truncate(&st.guard.sanitize(&x.stderr), 2048);
                     audit(&st, "ai", Some(&r.id), shared::action::MCP_EXEC_BATCH, &cmd, &format!("exit={:?} bytes={}{}", x.exit_code, out.len(), if x.timed_out { " timed_out" } else { "" }));
                     // 读超时不等于执行成功：ok 为 false，但保留已收到的部分输出供排查
                     entry["ok"] = serde_json::json!(!x.timed_out);

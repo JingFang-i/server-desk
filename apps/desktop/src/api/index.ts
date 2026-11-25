@@ -70,13 +70,20 @@ export interface ExecResult {
   timedOut?: boolean;
 }
 
+export interface ApprovalReview {
+  verdict: "allow" | "review" | "deny" | "error";
+  risk: "low" | "medium" | "high" | "critical" | null;
+  reason: string;
+  cached: boolean;
+}
+
 export interface PendingApproval {
   id: string;
   serverId: string;
   serverName: string;
   command: string;
   /** AI 审查意见（R8.4）：审查未介入时为 null，不占位 */
-  aiNote: string | null;
+  aiNote: ApprovalReview | null;
   createdAt: string;
   expiresAt: string;
 }

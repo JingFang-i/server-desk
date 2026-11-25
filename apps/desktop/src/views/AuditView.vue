@@ -66,18 +66,31 @@ function preview(text: string): string {
     : oneLine;
 }
 
-function outcomeTag(row: AuditEntry) {
+const reviewOutcomes = {
+  allow: { label: "AI 审查：放行", type: "success" },
+  review: { label: "AI 审查：建议转审批", type: "warning" },
+  deny: { label: "AI 审查：建议拒绝", type: "error" },
+  skipped: { label: "AI 审查：未送审", type: "default" },
+  degraded: { label: "AI 审查：降级", type: "error" },
+} as const;
+
+function displayOutcome(row: AuditEntry) {
   const lower = row.outcome.toLowerCase();
+  if (row.action === "ai_review") {
+    const match = /^(?:ok:)?ai_review:(?:cached:)?(allow|review|deny|skipped|degraded)(?:$|:)/.exec(lower);
+    if (match) return reviewOutcomes[match[1] as keyof typeof reviewOutcomes];
+  }
   const type = row.ok
     ? "success"
     : lower.includes("block") || lower.includes("denied") || lower.includes("timed_out")
       ? "error"
       : "default";
-  return h(
-    NTag,
-    { size: "small", type: type as "success" | "error" | "default", bordered: false },
-    { default: () => row.outcome }
-  );
+  return { label: row.outcome, type } as const;
+}
+
+function outcomeTag(row: AuditEntry) {
+  const { label, type } = displayOutcome(row);
+  return h(NTag, { size: "small", type, bordered: false, title: row.outcome }, { default: () => label });
 }
 
 // ---------- 详情弹窗 ----------
@@ -324,7 +337,7 @@ onMounted(refresh);
               {{ detailEntry.serverId }}
             </span>
           </template>
-          <span class="k">结果</span><span>{{ detailEntry.outcome }}</span>
+          <span class="k">结果</span><span>{{ displayOutcome(detailEntry).label }}</span>
           <template v-if="detailEntry.session">
             <span class="k">会话</span>
             <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px">{{ detailEntry.session }}</span>

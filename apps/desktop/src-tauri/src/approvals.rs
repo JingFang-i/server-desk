@@ -10,6 +10,14 @@ use tokio::sync::oneshot;
 pub const APPROVAL_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ApprovalReview {
+    pub verdict: &'static str,
+    pub risk: Option<&'static str>,
+    pub reason: String,
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingApproval {
     pub id: String,
@@ -18,7 +26,7 @@ pub struct PendingApproval {
     pub command: String,
     /// AI 审查意见（R8.4）：审查层给出的理由/降级说明，审批卡直接展示。
     /// 静态规则触发且审查未介入时为 None——不占位、不误导。
-    pub ai_note: Option<String>,
+    pub ai_note: Option<ApprovalReview>,
     pub created_at: String,
     pub expires_at: String,
 }
@@ -41,7 +49,7 @@ impl Approvals {
         server_id: &str,
         server_name: &str,
         command: &str,
-        ai_note: Option<&str>,
+        ai_note: Option<&ApprovalReview>,
         tx: oneshot::Sender<bool>,
     ) -> PendingApproval {
         let id = uuid::Uuid::new_v4().to_string();
@@ -51,7 +59,7 @@ impl Approvals {
             server_id: server_id.to_string(),
             server_name: server_name.to_string(),
             command: command.to_string(),
-            ai_note: ai_note.map(|s| s.to_string()),
+            ai_note: ai_note.cloned(),
             created_at: now.to_rfc3339(),
             expires_at: (now + chrono::Duration::seconds(APPROVAL_TTL.as_secs() as i64)).to_rfc3339(),
         };
@@ -65,7 +73,7 @@ impl Approvals {
     }
 
     /// 审批可能已被处理，只有有效待审批项才更新意见。
-    pub fn set_ai_note(&self, id: &str, note: String) -> bool {
+    pub fn set_ai_note(&self, id: &str, note: ApprovalReview) -> bool {
         let mut entries = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = entries.get_mut(id).filter(|e| e.deadline > Instant::now()) else {
             return false;
@@ -109,9 +117,15 @@ fn review_note_updates_pending_entry_only() {
     let (tx, mut rx) = oneshot::channel();
     let pending = approvals.create("server", "服务器", "uptime", None, tx);
     assert!(approvals.pending()[0].ai_note.is_none());
-    assert!(approvals.set_ai_note(&pending.id, "建议人工确认".into()));
-    assert_eq!(approvals.pending()[0].ai_note.as_deref(), Some("建议人工确认"));
+    let note = ApprovalReview {
+        verdict: "review",
+        risk: Some("medium"),
+        reason: "建议人工确认".into(),
+        cached: false,
+    };
+    assert!(approvals.set_ai_note(&pending.id, note.clone()));
+    assert_eq!(approvals.pending()[0].ai_note.as_ref().map(|note| note.reason.as_str()), Some("建议人工确认"));
     assert!(approvals.decide(&pending.id, true));
     assert_eq!(rx.try_recv(), Ok(true));
-    assert!(!approvals.set_ai_note(&pending.id, "结果晚于审批".into()));
+    assert!(!approvals.set_ai_note(&pending.id, note));
 }

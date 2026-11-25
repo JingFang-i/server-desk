@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { NButton, NCard, NEmpty, NTag, useMessage } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type PendingApproval } from "../api";
+import ApprovalReviewNote from "../components/ApprovalReviewNote.vue";
 
 const message = useMessage();
 const items = ref<PendingApproval[]>([]);
@@ -59,7 +60,7 @@ onUnmounted(() => {
           <span class="ttl">剩余 {{ secondsLeft(it.expiresAt) }}s</span>
         </div>
         <pre class="cmd">{{ it.command }}</pre>
-        <div v-if="it.aiNote" class="ai-note">🤖 {{ it.aiNote }}</div>
+        <approval-review-note v-if="it.aiNote" :note="it.aiNote" class="ai-note" />
         <div class="actions">
           <n-button size="small" type="error" ghost @click="decide(it, false)">拒绝</n-button>
           <n-button size="small" type="primary" @click="decide(it, true)">批准执行</n-button>
@@ -100,13 +101,8 @@ onUnmounted(() => {
   word-break: break-all;
 }
 .ai-note {
-  background: rgba(232, 128, 128, 0.08);
   border-radius: 6px;
   padding: 8px 12px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #e88080;
-  word-break: break-all;
   margin-bottom: 10px;
 }
 .actions {

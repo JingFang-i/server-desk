@@ -135,11 +135,22 @@ impl Reviewer {
             None => None,
         };
         save_config(store, &cfg, key_blob.as_deref())?;
+        self.replace_settings(&mut settings, cfg);
+        Ok(())
+    }
+
+    pub fn reset(&self, store: &Store, vault: &crate::vault::Vault) -> Result<(), String> {
+        let mut settings = self.cfg.write().unwrap_or_else(|p| p.into_inner());
+        store.wipe_all()?;
+        self.replace_settings(&mut settings, ReviewConfig::default());
+        vault.reset().map_err(|e| e.to_string())
+    }
+
+    fn replace_settings(&self, settings: &mut (ReviewConfig, u64), cfg: ReviewConfig) {
         settings.0 = cfg;
         settings.1 += 1;
         self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
         *self.breaker.lock().unwrap_or_else(|p| p.into_inner()) = Breaker::default();
-        Ok(())
     }
 
     pub fn info(&self, store: &Store, vault: &crate::vault::Vault) -> ReviewInfo {
@@ -219,7 +230,7 @@ fn endpoint_change_clears_legacy_key_without_replacement() {
 pub struct ReviewOutcome {
     pub decision: Decision,
     /// None = 审查未介入（关闭或静态硬拒跳过）；Some = 有意见可展示
-    pub ai_note: Option<String>,
+    pub ai_note: Option<crate::approvals::ApprovalReview>,
 }
 
 impl ReviewOutcome {
@@ -242,150 +253,123 @@ pub(crate) async fn review_and_merge(
     server_id: Option<&str>,
 ) -> ReviewOutcome {
     let (cfg, generation, api_key) = state.reviewer.request_settings(&state.store, &state.vault);
-
     if !cfg.enabled {
         return ReviewOutcome::plain(static_decision);
     }
-    if matches!(static_decision, Decision::Blocked(_)) {
-        return record_review(
-            state, server_id, tool, command, "blocked", "skipped",
-            &static_decision, None, "blocked_by_static", false, &cfg, ctx,
+    let redact = |text: &str| match &api_key {
+        Ok(Some(key)) if !key.is_empty() => client::redact(&state.guard, key, text),
+        _ => state.guard.sanitize(text),
+    };
+    let safe_command = redact(command);
+    let safe_group = ctx.group.map(redact);
+    let safe_name = ctx.server_name.map(redact);
+    let safe_ctx = ReviewContext {
+        group: safe_group.as_deref(),
+        server_name: safe_name.as_deref(),
+        batch_size: ctx.batch_size,
+    };
+    let static_str = decision_str(&static_decision);
+    let finish = |ai: Result<verdict::AiReview, String>, tag: &str| {
+        // 配置更新或重置后，旧任务不能回填审查日志、缓存或熔断状态。
+        let settings = state.reviewer.cfg.read().unwrap_or_else(|p| p.into_inner());
+        if settings.1 != generation {
+            return ReviewOutcome::plain(Decision::Blocked("审查配置已变化，请重新提交".into()));
+        }
+        let decision = verdict::merge(&static_decision, &ai, &cfg);
+        let (label, cached) = match &ai {
+            Ok(review) => (review.verdict.as_str(), review.cached),
+            Err(_) if tag == "blocked_by_static" => ("skipped", false),
+            Err(_) => ("error", false),
+        };
+        let mut outcome = record_review(
+            state, server_id, tool, command, &safe_command, static_str, label, &decision,
+            ai.as_ref().ok(), tag, cached, &cfg, &safe_ctx,
         );
+        if tag != "blocked_by_static" {
+            outcome.ai_note = Some(ai_note_of(&ai));
+        }
+        outcome
+    };
+    if matches!(static_decision, Decision::Blocked(_)) {
+        return finish(Err("静态规则硬拒".into()), "blocked_by_static");
     }
-    let static_str = if matches!(static_decision, Decision::NeedsApproval(_)) {
-        "approval"
-    } else {
-        "allow"
-    };
 
-    // 先用实际送审内容区分缓存。模型请求才占用供应商调用额度。
-    let safe_command = match &api_key {
-        Ok(Some(key)) if !key.is_empty() => client::redact(&state.guard, key, command),
-        _ => state.guard.sanitize(command),
-    };
-    let payload = prompt::build_payload(&cfg, tool, &safe_command, ctx, static_str);
+    if safe_command != command || api_key.as_ref().ok().and_then(Option::as_ref)
+        .is_some_and(|key| !key.is_empty() && cfg.model.contains(key.as_str()))
+    {
+        // 命中凭据规则的命令由本地人工判断，避免将部分脱敏的参数送出。
+        let reason = "识别到可能含凭据的命令或审查配置，需人工确认";
+        return finish(Ok(verdict::AiReview::manual_confirmation(reason)), "credential_input");
+    }
+    let payload = prompt::build_payload(&cfg, tool, &safe_command, &safe_ctx, static_str);
     let key = cache::request_key(tool, command, static_str, &cfg, &payload, generation);
     let ttl = Duration::from_secs(cfg.cache_ttl_secs);
-    if ttl > Duration::ZERO {
-        if let Some(mut hit) = state.reviewer.cache_get(&key, ttl) {
-            hit.cached = true;
-            let note = ai_note_of(&Ok(hit.clone()));
-            let decision = verdict::merge(&static_decision, &Ok(hit.clone()), &cfg);
-            return record_review(
-                state, server_id, tool, command, static_str, hit.verdict.as_str(),
-                &decision, Some(&hit), "", true, &cfg, ctx,
-            )
-            .with_note(note, decision);
-        }
-    }
-
-    // 5) 熔断：冷却期内不发起 HTTP，直接走失败策略
-    if state.reviewer.breaker_open() {
-        let ai = Err("审查熔断中：上游连续失败，冷却期内暂不调用模型".to_string());
-        let note = ai_note_of(&ai);
-        let decision = verdict::merge(&static_decision, &ai, &cfg);
-        return record_review(
-            state, server_id, tool, command, static_str, "error",
-            &decision, None, "breaker", false, &cfg, ctx,
-        )
-        .with_note(note, decision);
-    }
-
-    // 6) Key（保险库锁定 → 与工具自身失败路径一致；未配置 → 降级）
     let api_key = match api_key {
-        Ok(k) => k,
-        Err(e) => {
-            let ai = Err(format!("读取审查 API Key 失败：{e}"));
-            let note = ai_note_of(&ai);
-            let decision = verdict::merge(&static_decision, &ai, &cfg);
-            return record_review(
-                state, server_id, tool, command, static_str, "error",
-                &decision, None, "key_error", false, &cfg, ctx,
-            )
-            .with_note(note, decision);
+        Ok(Some(key)) if !key.trim().is_empty() => key,
+        Ok(_) => return finish(Err("未配置审查 API Key".into()), "no_key"),
+        Err(e) => return finish(Err(format!("读取审查 API Key 失败：{e}")), "key_error"),
+    };
+    if ttl > Duration::ZERO {
+        if let Some(hit) = state.reviewer.cache_get(&key, ttl) {
+            return finish(Ok(hit), "");
         }
-    };
-    let Some(api_key) = api_key.filter(|k| !k.trim().is_empty()) else {
-        let ai = Err("未配置审查 API Key".to_string());
-        let note = ai_note_of(&ai);
-        let decision = verdict::merge(&static_decision, &ai, &cfg);
-        return record_review(
-            state, server_id, tool, command, static_str, "error",
-            &decision, None, "no_key", false, &cfg, ctx,
-        )
-        .with_note(note, decision);
-    };
+    }
+    if state.reviewer.breaker_open() {
+        return finish(Err("审查熔断中，暂不调用模型".into()), "breaker");
+    }
 
-    let permit = tokio::time::timeout(
-        Duration::from_millis(u64::from(cfg.timeout_ms)),
-        state.reviewer.permit(),
-    ).await;
-    let (res, failure_tag) = match permit {
-        Ok(_permit) if state.reviewer.breaker_open() => (
-            Err("审查熔断中：上游连续失败，冷却期内暂不调用模型".into()), "breaker",
-        ),
-        Ok(_permit) if state.review_rate.check(REVIEW_RATE_PER_MIN).is_err() => (
-            Err("审查速率已达上限".into()), "rate_limited",
-        ),
-        Ok(_permit) => (
-            match state.reviewer.http(&cfg) {
-                Ok(http) => client::chat_json(
-                    http, &cfg, Some(&api_key), &prompt::system_prompt(), &payload,
-                ).await,
-                Err(error) => Err(error),
-            },
-            "call_failed",
-        ),
-        Err(_) => (Err("等待审查并发额度超时".into()), "queue_timeout"),
+    let deadline = Instant::now() + Duration::from_millis(u64::from(cfg.timeout_ms));
+    let Ok(_permit) = tokio::time::timeout_at(deadline.into(), state.reviewer.permit()).await else {
+        return finish(Err("等待审查并发额度超时".into()), "queue_timeout");
     };
-
-    let ai: Result<verdict::AiReview, String> = match res {
+    {
+        let settings = state.reviewer.cfg.read().unwrap_or_else(|p| p.into_inner());
+        if settings.1 != generation || !state.vault.is_unlocked() || !state.guard.ai_enabled() {
+            return ReviewOutcome::plain(Decision::Blocked("审查期间配置或访问权限已变化，请重新提交".into()));
+        }
+    }
+    if state.reviewer.breaker_open() {
+        return finish(Err("审查熔断中，暂不调用模型".into()), "breaker");
+    }
+    if state.review_rate.check(REVIEW_RATE_PER_MIN).is_err() {
+        return finish(Err("审查速率已达上限".into()), "rate_limited");
+    }
+    let response = match state.reviewer.http(&cfg) {
+        Ok(http) => client::chat_json(
+            http, &cfg, Some(&api_key), &prompt::system_prompt(), &payload, deadline,
+        ).await,
+        Err(e) => Err(e),
+    };
+    let (ai, tag) = match response {
         Ok(out) => match verdict::parse_redacted(&out.content, |text| {
             client::redact(&state.guard, &api_key, text)
         }) {
-            Ok(mut v) => {
-                v.latency_ms = out.latency_ms;
-                v.model = client::redact(&state.guard, &api_key, &out.model);
-                v.tokens_in = out.tokens_in;
-                v.tokens_out = out.tokens_out;
-                state.reviewer.breaker_success();
-                if ttl > Duration::ZERO {
-                    state.reviewer.cache_put(key, v.clone());
-                }
-                Ok(v)
+            Ok(mut review) => {
+                review.latency_ms = out.latency_ms;
+                review.model = client::redact(&state.guard, &api_key, &out.model);
+                review.tokens_in = out.tokens_in;
+                review.tokens_out = out.tokens_out;
+                (Ok(review), "")
             }
-            Err(e) => {
-                state.reviewer.breaker_fail();
-                Err(e)
-            }
+            Err(e) => (Err(e), "parse"),
         },
-        Err(e) => {
-            if failure_tag == "call_failed" {
-                state.reviewer.breaker_fail();
+        Err(e) => (Err(crate::text::summary(&e, 120)), "call_failed"),
+    };
+    {
+        let settings = state.reviewer.cfg.read().unwrap_or_else(|p| p.into_inner());
+        if settings.1 == generation {
+            match &ai {
+                Ok(review) => {
+                    state.reviewer.breaker_success();
+                    if ttl > Duration::ZERO {
+                        state.reviewer.cache_put(key, review.clone());
+                    }
+                }
+                Err(_) => state.reviewer.breaker_fail(),
             }
-            Err(crate::text::summary(&e, 120))
         }
-    };
-    let (ai_verdict, error_tag) = match &ai {
-        Ok(v) => (v.verdict.as_str().to_string(), String::new()),
-        Err(_) => ("error".to_string(), failure_tag.to_string()),
-    };
-    let note = ai_note_of(&ai);
-    let decision = verdict::merge(&static_decision, &ai, &cfg);
-    record_review(
-        state, server_id, tool, command, static_str, &ai_verdict,
-        &decision, ai.as_ref().ok(), &error_tag, false, &cfg, ctx,
-    )
-    .with_note(note, decision)
-}
-
-impl ReviewOutcome {
-    /// record_review 先落日志再回填审批卡意见（拆两步避免借用纠缠）。
-    fn with_note(mut self, note: Option<String>, decision: Decision) -> Self {
-        self.ai_note = note;
-        self.decision = decision;
-        self
     }
+    finish(ai, tag)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -405,6 +389,7 @@ fn decision_str(d: &Decision) -> &'static str {
 fn skip_reason_text(tag: &str) -> String {
     match tag {
         "blocked_by_static" => "静态规则硬拒，未送审".to_string(),
+        "credential_input" => "可能包含凭据，未送审".to_string(),
         "rate_limited" => "审查限流，已应用失败策略".to_string(),
         "queue_timeout" => "等待审查并发额度超时".to_string(),
         "breaker" => "熔断冷却中，未调用模型".to_string(),
@@ -424,6 +409,7 @@ fn record_review(
     server_id: Option<&str>,
     tool: &str,
     command: &str,
+    safe_command: &str,
     static_verdict: &str,
     ai_verdict: &str,
     final_decision: &Decision,
@@ -434,7 +420,9 @@ fn record_review(
     ctx: &ReviewContext<'_>,
 ) -> ReviewOutcome {
     // 审计行
-    let outcome = if ai_verdict == "skipped" {
+    let outcome = if error_tag == "credential_input" {
+        "ok:ai_review:skipped:credential_input".to_string()
+    } else if ai_verdict == "skipped" {
         format!("ok:ai_review:skipped:{error_tag}")
     } else if ai_verdict == "error" {
         format!("ai_review:degraded:{error_tag}")
@@ -445,7 +433,7 @@ fn record_review(
             ai_verdict
         )
     };
-    audit_review(state, server_id, tool, command, &outcome);
+    audit_review(state, server_id, tool, safe_command, &outcome);
 
     // 结构化日志（正文只存脱敏摘要 + hash，不落原始命令全文）
     let (risk, reason, categories, model, latency, tokens_in, tokens_out) = match ai {
@@ -455,8 +443,8 @@ fn record_review(
             v.categories.clone(),
             v.model.clone(),
             v.latency_ms as i64,
-            v.tokens_in as i64,
-            v.tokens_out as i64,
+            if cached { 0 } else { v.tokens_in as i64 },
+            if cached { 0 } else { v.tokens_out as i64 },
         ),
         None => (
             String::new(),
@@ -468,13 +456,13 @@ fn record_review(
             0,
         ),
     };
-    let digest = crate::text::summary(&state.guard.sanitize(command), 200);
+    let digest = crate::text::summary(safe_command, 200);
     let row = ReviewLogRow {
         ts: chrono::Utc::now().to_rfc3339(),
         session: crate::ops::current_session(),
         tool: tool.to_string(),
         server_id: server_id.map(|s| s.to_string()),
-        server_name: ctx.server_name.unwrap_or("").to_string(),
+        server_name: crate::text::summary(&state.guard.sanitize(ctx.server_name.unwrap_or("")), crate::text::SERVER_NAME_MAX),
         command_hash: to_hex(&cache_key(tool, command, static_verdict, cfg)),
         command_digest: digest.clone(),
         static_verdict: static_verdict.to_string(),
@@ -488,11 +476,7 @@ fn record_review(
         tokens_in,
         tokens_out,
         cached,
-        error: if ai_verdict == "error" || ai_verdict == "skipped" {
-            error_tag.to_string()
-        } else {
-            String::new()
-        },
+        error: error_tag.to_string(),
     };
     if let Err(e) = state.store.insert_review_log(&row) {
         // 日志写失败不阻断判定链路，但必须留痕（对齐审计失败计数的精神）
@@ -520,20 +504,21 @@ fn audit_review(
     );
 }
 
-/// 把 AI 结论转成审批卡可读的一行意见。
-/// Ok(allow) 也展示（"AI 复核未见额外风险"），让用户知道这单过过审查。
-fn ai_note_of(ai: &Result<verdict::AiReview, String>) -> Option<String> {
+/// 将结构化审查结论交给审批界面。
+fn ai_note_of(ai: &Result<verdict::AiReview, String>) -> crate::approvals::ApprovalReview {
     match ai {
-        Ok(r) => {
-            let verb = match r.verdict {
-                verdict::AiVerdict::Allow => "AI 复核未见额外风险",
-                verdict::AiVerdict::Review => "AI 建议人工确认",
-                verdict::AiVerdict::Deny => "AI 建议拒绝",
-            };
-            let cached = if r.cached { "（缓存结论）" } else { "" };
-            Some(format!("{verb}（{}）：{}{cached}", r.risk.as_str(), r.reason))
-        }
-        Err(e) => Some(format!("AI 审查降级：{e}")),
+        Ok(review) => crate::approvals::ApprovalReview {
+            verdict: review.verdict.as_str(),
+            risk: Some(review.risk.as_str()),
+            reason: review.reason.clone(),
+            cached: review.cached,
+        },
+        Err(reason) => crate::approvals::ApprovalReview {
+            verdict: "error",
+            risk: None,
+            reason: reason.clone(),
+            cached: false,
+        },
     }
 }
 

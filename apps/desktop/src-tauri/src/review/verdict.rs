@@ -18,13 +18,13 @@ pub enum Risk {
 }
 
 impl Risk {
-    fn parse(s: &str) -> Self {
+    fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
-            "low" => Self::Low,
-            "high" => Self::High,
-            "critical" => Self::Critical,
-            // 缺省 / 非法 → medium（偏保守，仅影响展示）
-            _ => Self::Medium,
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "critical" => Some(Self::Critical),
+            _ => None,
         }
     }
 
@@ -75,6 +75,22 @@ pub struct AiReview {
     pub tokens_out: u32,
 }
 
+impl AiReview {
+    pub(super) fn manual_confirmation(reason: &str) -> Self {
+        Self {
+            verdict: AiVerdict::Review,
+            risk: Risk::Medium,
+            reason: reason.to_owned(),
+            categories: Vec::new(),
+            cached: false,
+            latency_ms: 0,
+            model: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+        }
+    }
+}
+
 /// 解析 categories：字符串数组，最多取 4 个，单项截断 24 字；缺失/类型错 → 空。
 fn parse_categories(v: &serde_json::Value, redact: &impl Fn(&str) -> String) -> Vec<String> {
     v.get("categories")
@@ -93,7 +109,7 @@ fn parse_categories(v: &serde_json::Value, redact: &impl Fn(&str) -> String) -> 
 /// 从模型输出解析结论。
 /// - 找不到完整 JSON 对象 / 全部损坏 → `Err`（走失败策略，绝不默认放行）；
 /// - 存在 JSON 但没有合法 verdict（含「诱饵对象」在前的情况）→ 逐个扫描，
-///   取第一个含合法 verdict 的对象；全部不合法 → `Ok`（格式降级为 `Review`，绝不 allow）。
+///   合并为最严格的结论。只有格式完整的放行结论才能放行。
 #[cfg(test)]
 pub fn parse(content: &str) -> Result<AiReview, String> {
     parse_redacted(content, str::to_string)
@@ -107,7 +123,7 @@ pub(super) fn parse_redacted(
     if objects.is_empty() {
         return Err("模型未返回 JSON 对象".to_string());
     }
-    let mut degraded_reason: Option<&'static str> = None;
+    let mut selected: Option<AiReview> = None;
     for obj in &objects {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) else {
             continue;
@@ -125,21 +141,37 @@ pub(super) fn parse_redacted(
             "deny" | "reject" | "block" => Some(AiVerdict::Deny),
             _ => None,
         };
-        if let Some(verdict) = verdict {
-            let reason = v
-                .get("reason")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let reason = if reason.is_empty() {
-                "（模型未给出理由）".to_string()
+        // 推理文字可能包含不属于结论的对象。只有带判定字段的对象参与合并。
+        if v.get("verdict").is_none() && v.get("decision").is_none() {
+            continue;
+        }
+        let risk = v.get("risk").and_then(|x| x.as_str()).and_then(Risk::parse);
+        let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or("").trim();
+        let categories_valid = v.get("categories").and_then(|x| x.as_array()).is_some_and(|categories| {
+            categories.iter().all(|category| matches!(category.as_str(), Some(
+                "destructive" | "credential" | "network" | "privilege" | "service" | "data" | "unknown"
+            )))
+        });
+        let (verdict, reason) = match verdict {
+            Some(AiVerdict::Allow) if risk.is_none() || reason.is_empty() || !categories_valid => {
+                (AiVerdict::Review, "模型放行结论缺少必填字段或字段无效，需人工确认".into())
+            }
+            Some(verdict) => (verdict, if reason.is_empty() {
+                "模型未给出理由".into()
             } else {
-                truncate(&redact(&reason), 200)
-            };
-            return Ok(AiReview {
+                truncate(&redact(reason), 200)
+            }),
+            None => (AiVerdict::Review, "模型审查结论无效，需人工确认".into()),
+        };
+        let severity = |verdict| match verdict {
+            AiVerdict::Allow => 0,
+            AiVerdict::Review => 1,
+            AiVerdict::Deny => 2,
+        };
+        if selected.as_ref().is_none_or(|current| severity(verdict) >= severity(current.verdict)) {
+            selected = Some(AiReview {
                 verdict,
-                risk: Risk::parse(v.get("risk").and_then(|x| x.as_str()).unwrap_or("")),
+                risk: risk.unwrap_or(Risk::Medium),
                 reason,
                 categories: parse_categories(&v, &redact),
                 cached: false,
@@ -149,24 +181,12 @@ pub(super) fn parse_redacted(
                 tokens_out: 0,
             });
         }
-        degraded_reason = Some(if raw.is_empty() {
-            "模型输出缺少 verdict 字段，按需人工确认"
-        } else {
-            "模型输出 verdict 非法，按需人工确认"
-        });
     }
-    if let Some(reason) = degraded_reason {
-        return Ok(AiReview {
-            verdict: AiVerdict::Review,
-            risk: Risk::Medium,
-            reason: reason.to_string(),
-            categories: Vec::new(),
-            cached: false,
-            latency_ms: 0,
-            model: String::new(),
-            tokens_in: 0,
-            tokens_out: 0,
-        });
+    if let Some(review) = selected {
+        return Ok(review);
+    }
+    if objects.iter().any(|obj| serde_json::from_str::<serde_json::Value>(obj).is_ok()) {
+        return Ok(AiReview::manual_confirmation("模型输出缺少审查结论，需人工确认"));
     }
     Err("响应中未找到可解析的 JSON 对象".to_string())
 }
@@ -396,7 +416,7 @@ mod tests {
     fn parse_accepts_alias_fields_and_synonyms() {
         let a = parse("{\"decision\":\"reject\",\"risk\":\"critical\",\"reason\":\"x\"}").unwrap();
         assert_eq!(a.verdict, AiVerdict::Deny);
-        let b = parse("{\"verdict\":\"pass\"}").unwrap();
+        let b = parse(r#"{"verdict":"pass","risk":"low","reason":"只读","categories":[]}"#).unwrap();
         assert_eq!(b.verdict, AiVerdict::Allow);
     }
 
@@ -406,6 +426,22 @@ mod tests {
         assert_eq!(a.verdict, AiVerdict::Review);
         let b = parse("{\"risk\":\"low\"}").unwrap();
         assert_eq!(b.verdict, AiVerdict::Review);
+    }
+
+    #[test]
+    fn incomplete_or_conflicting_response_does_not_allow_execution() {
+        for bad in [
+            r#"{"verdict":"allow"}"#,
+            r#"{"verdict":"allow","risk":"invalid","reason":"只读","categories":[]}"#,
+            r#"{"verdict":"allow","risk":"low","reason":"只读","categories":[1]}"#,
+        ] {
+            let result = parse(bad).unwrap();
+            assert_eq!(result.verdict, AiVerdict::Review);
+            assert!(matches!(merge(&Decision::Allow, &Ok(result), &ReviewConfig::default()), Decision::NeedsApproval(_)));
+        }
+        let mixed = r#"{"verdict":"allow","risk":"low","reason":"只读","categories":[]}
+                       {"verdict":"deny","risk":"high","reason":"风险较高","categories":[]}"#;
+        assert_eq!(parse(mixed).unwrap().verdict, AiVerdict::Deny);
     }
 
     #[test]

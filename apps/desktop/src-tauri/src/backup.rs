@@ -196,17 +196,12 @@ pub fn restore_payload(
 ) -> Result<RestoreResult, String> {
     let rows = rows_from_payload(payload)?;
     verify_credentials(&rows, dek)?;
-    match mode {
-        "overwrite" => {
-            store.replace_all_servers(&rows)?;
-        }
-        "merge" => {
-            for r in &rows {
-                store.upsert_server(r)?;
-            }
-        }
+    let overwrite = match mode {
+        "overwrite" => true,
+        "merge" => false,
         other => return Err(format!("未知恢复模式: {other}")),
-    }
+    };
+    store.restore_servers(&rows, overwrite)?;
     Ok(RestoreResult {
         imported: rows.len(),
         mode: mode.to_string(),

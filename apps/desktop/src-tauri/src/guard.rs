@@ -199,8 +199,7 @@ fn is_echo_only(segment: &str) -> bool {
 
 /// 凭据泄露防护：命令里出现读凭据的动作即硬拒绝（AI 与真实模板都过这一关）。
 fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
-    // 只对单一的 systemd 配置读取放宽 env 规则，保留其他固定泄露保护。
-    if g.leak.env_word.is_match(command) && !g.leak.systemd_env_read.is_match(command) {
+    if g.leak.env_word.is_match(command) {
         return Some(Decision::Blocked("命中凭据泄露防护规则「env」".into()));
     }
     for re in &g.leak.cmd_blockers {
@@ -216,7 +215,6 @@ fn leak_block(g: &GuardInner, command: &str) -> Option<Decision> {
 /// 凭据泄露防护（固定规则，不开放编辑）：AI 命令包含即硬拒绝，输出命中即脱敏。
 struct LeakGuard {
     env_word: Regex,
-    systemd_env_read: Regex,
     cmd_blockers: Vec<Regex>,
     out_scrubbers: Vec<(Regex, &'static str)>,
     writeish: Regex,
@@ -250,7 +248,7 @@ impl LeakGuard {
             ),
             // URL 内嵌账号口令：https://user:pass@host
             (
-                Regex::new(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@").expect("url cred regex"),
+                Regex::new(r"(?i)((?:https?|rediss?)://)[^/\s:@]*:[^/\s@]+@").expect("url cred regex"),
                 "$1[REDACTED]@",
             ),
             // 键值形态：password=hunter2 / token: xxx / api_key=...
@@ -258,6 +256,21 @@ impl LeakGuard {
                 Regex::new(r"(?i)\b(pass(?:word)?|pwd|secret|api[_-]?key|access[_-]?key|token|credential)s?\b\s*[=:]\s*\S+")
                     .expect("cred regex"),
                 "$1=[REDACTED]",
+            ),
+            (
+                Regex::new(r#"(?i)(\bredis-cli\b[^\r\n]*?(?:\s-a(?:=|\s+)|\s--pass(?:=|\s+)))(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s;&|]+)"#)
+                    .expect("redis password regex"),
+                "$1[REDACTED]",
+            ),
+            (
+                Regex::new(r#"(?i)(\bredis-cli\b[^\r\n]*?\s--user(?:=|\s+))(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s;&|]+)"#)
+                    .expect("redis user regex"),
+                "$1[REDACTED]",
+            ),
+            (
+                Regex::new(r#"(?i)(\bREDISCLI_AUTH\s*=\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s;&|]+)"#)
+                    .expect("redis auth env regex"),
+                "$1[REDACTED]",
             ),
             // 短选项口令：mysql -pHunter2 / -p 'x' / --password xxx / --token=xxx
             (
@@ -278,9 +291,6 @@ impl LeakGuard {
         let writeish = Regex::new(&format!("(?i){WRITEISH_RE}")).expect("writeish regex");
         Self {
             env_word: Regex::new(r"(?i)\benv\b").expect("env regex"),
-            systemd_env_read: Regex::new(
-                r"(?i)^(?:cat|head|tail)[ \t]+/etc/systemd/(?:[a-z0-9_-]+(?:\.[a-z0-9_-]+)*/)*(?:env|[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.env)$",
-            ).expect("systemd env regex"),
             cmd_blockers, out_scrubbers, writeish,
         }
     }
@@ -352,7 +362,7 @@ const READ_PATH_DENY: &[&str] = &[
     ".pem",
     "/etc/shadow",
     "authorized_keys",
-    // .env 规则单独保留 systemd 路径例外（见 evaluate_read_path）。
+    ".env",
     "credential",
     "secret",
     ".gnupg",
@@ -574,8 +584,6 @@ impl Guard {
     }
 
     /// AI 读取远程路径的判定：命中泄露黑名单即拒绝，否则放行。
-    ///
-    /// 仅对 /etc/systemd 下的常规 EnvironmentFile 放宽 .env 路径规则。
     pub fn evaluate_read_path(&self, path: &str) -> Decision {
         let lower = path.to_lowercase();
         for p in READ_PATH_DENY {
@@ -585,13 +593,8 @@ impl Guard {
                 ));
             }
         }
-        if lower.contains(".env") {
-            let systemd_config = self.read().leak.systemd_env_read.is_match(&format!("cat {path}"));
-            if !systemd_config {
-                return Decision::Blocked(
-                    "路径命中凭据/敏感文件保护规则「.env」——AI 不得读取该文件".to_string(),
-                );
-            }
+        if lower.starts_with("/etc/systemd/") && lower.ends_with("/env") {
+            return Decision::Blocked("systemd 环境文件可能包含凭据，AI 不得读取".into());
         }
         Decision::Allow
     }
@@ -675,14 +678,14 @@ mod tests {
             guard().evaluate_read_path("/home/u/app/.env"),
             Decision::Blocked(_)
         ));
-        // dotenv 家族按 basename 精确拦截；/etc 下 app.env 这类常规配置放行
+        // systemd 环境文件同样可能存放凭据。
         assert!(matches!(
             guard().evaluate_read_path("/opt/app/.env.production"),
             Decision::Blocked(_)
         ));
         assert!(matches!(
             guard().evaluate_read_path("/etc/systemd/system/app.env"),
-            Decision::Allow
+            Decision::Blocked(_)
         ));
         assert!(matches!(
             guard().evaluate_read_path("/var/log/app.log"),
@@ -747,10 +750,9 @@ mod tests {
         assert!(matches!(guard().evaluate("env | grep TOKEN"), Decision::Blocked(_)));
         assert!(matches!(guard().evaluate("cat ~/.ssh/id_rsa"), Decision::Blocked(_)));
         assert!(matches!(guard().evaluate("printenv"), Decision::Blocked(_)));
-        // R9.4 修正：env 按命令词锚定——路径组件里的 env 不再误伤
         assert!(matches!(
             guard().evaluate("cat /etc/systemd/env"),
-            Decision::Allow
+            Decision::Blocked(_)
         ));
         assert!(matches!(
             guard().evaluate("sudo env"),
@@ -759,11 +761,28 @@ mod tests {
     }
 
     #[test]
-    fn systemd_exception_preserves_credential_guards() {
+    fn systemd_service_inspection_does_not_open_environment_files() {
         let g = guard();
-        assert!(matches!(g.evaluate("cat /etc/systemd/system/app.env"), Decision::Allow));
+        assert!(matches!(g.evaluate("cat /etc/systemd/system/app.env"), Decision::Blocked(_)));
+        assert!(matches!(g.evaluate("systemctl status example.service"), Decision::Allow));
         assert!(matches!(g.evaluate("cat /opt/app/app.env"), Decision::Blocked(_)));
         assert!(matches!(g.evaluate_read_path("/opt/app/app.env"), Decision::Blocked(_)));
+    }
+
+    #[test]
+    fn redacts_redis_authentication_values() {
+        let g = guard();
+        for text in [
+            r#"redis-cli -a "test value" ping"#,
+            "redis-cli -a fixture-password --user=fixture-user ping",
+            "REDISCLI_AUTH=fixture-password redis-cli ping",
+            "redis-cli -u rediss://fixture-user:fixture-password@localhost ping",
+        ] {
+            let redacted = g.sanitize(text);
+            assert_ne!(redacted, text);
+            assert!(!redacted.contains("test value"));
+            assert!(!redacted.contains("fixture-"));
+        }
     }
 
     #[test]

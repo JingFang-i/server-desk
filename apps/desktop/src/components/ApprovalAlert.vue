@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted } from "vue";
+import { computed, h, onMounted, onUnmounted, shallowRef } from "vue";
 import { NButton, NTag, useMessage, useNotification } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, type PendingApproval } from "../api";
+import { api, type ApprovalReview, type PendingApproval } from "../api";
+import ApprovalReviewNote from "./ApprovalReviewNote.vue";
 import { alertAudioState, ensureAudio, playApprovalChime, primeAlertSound } from "../alert";
 import { notifyPermission, notifyPermissionState } from "../notifyStatus";
 
@@ -34,6 +35,9 @@ const bannerVisible = computed(
 let pollTimer: number | undefined;
 let remindTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
+let unlistenUpdates: UnlistenFn | undefined;
+let refreshVersion = 0;
+const pending = shallowRef(new Map<string, PendingApproval>());
 let pendingCount = 0;
 
 /** 用户点击「开启提示音」：显式 resume + 试听一声 */
@@ -62,8 +66,11 @@ async function requestPerm() {
 }
 
 async function refresh() {
+  const version = ++refreshVersion;
   try {
     const list = await api.approvalsPending();
+    if (version !== refreshVersion) return;
+    pending.value = new Map(list.map((item) => [item.id, item]));
     pendingCount = list.length;
     emit("count", pendingCount);
   } catch {
@@ -82,6 +89,9 @@ function alertOnce(item: PendingApproval) {
   playApprovalChime(true);
   if (props.currentPage === "approvals") return;
   // 接住通知句柄：点击「去审批中心」时立即销毁，而不是等 10s duration 自然过期
+  const renderNote = (note: ApprovalReview | null) => note
+    ? h(ApprovalReviewNote, { note })
+    : null;
   const n = notification.warning({
     title: "AI 操作待审批",
     duration: 10000,
@@ -93,15 +103,7 @@ function alertOnce(item: PendingApproval) {
           { style: "font-size:13px;line-height:1.6;word-break:break-all" },
           `「${item.serverName}」请求执行：${summarize(item)}`
         ),
-        ...(item.aiNote
-          ? [
-              h(
-                "div",
-                { style: "font-size:12px;line-height:1.6;color:#e88080;word-break:break-all" },
-                `AI 意见：${item.aiNote}`
-              ),
-            ]
-          : []),
+        renderNote(pending.value.get(item.id)?.aiNote ?? item.aiNote),
         h(
           "div",
           { style: "font-size:12px;opacity:.6" },
@@ -133,8 +135,9 @@ onMounted(async () => {
   try {
     unlisten = await listen<PendingApproval>("approval-requested", (event) => {
       alertOnce(event.payload);
-      refresh();
+      void refresh();
     });
+    unlistenUpdates = await listen("approvals-updated", refresh);
   } catch {
     /* 事件通道不可用（如纯浏览器预览）时仍靠轮询更新角标 */
   }
@@ -151,6 +154,7 @@ onUnmounted(() => {
   if (pollTimer) window.clearInterval(pollTimer);
   if (remindTimer) window.clearInterval(remindTimer);
   unlisten?.();
+  unlistenUpdates?.();
 });
 </script>
 

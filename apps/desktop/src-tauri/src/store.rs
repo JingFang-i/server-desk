@@ -131,29 +131,48 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
-// 仅旧版数据库需要处理。保留历史记录供人工在原主机核对，避免按已改址的资产自动删除文件。
-fn retire_legacy_secret_refs(conn: &Connection) -> rusqlite::Result<()> {
-    let pending: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='secret_refs')
-         AND NOT EXISTS(SELECT 1 FROM meta WHERE key='legacy_secret_refs_retired')",
+// 保留旧记录供原主机核对。升级和备份恢复依据同一套规则判断受影响资产。
+fn legacy_secret_assets(conn: &Connection) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='secret_refs')",
         [],
         |row| row.get(0),
     )?;
-    if !pending {
-        return Ok(());
+    if !exists {
+        return Ok(Default::default());
     }
-    let tx = conn.unchecked_transaction()?;
-    let has_copy_flag: bool = tx.query_row(
+    let has_copy_flag: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('secret_refs') WHERE name='remote_copy')",
         [],
         |row| row.get(0),
     )?;
-    let disable_ai = if has_copy_flag {
-        "UPDATE servers SET allow_ai=0 WHERE id IN (SELECT server_id FROM secret_refs WHERE remote_copy=1)"
+    let query = if has_copy_flag {
+        "SELECT DISTINCT server_id FROM secret_refs WHERE remote_copy=1"
     } else {
-        "UPDATE servers SET allow_ai=0 WHERE id IN (SELECT server_id FROM secret_refs)"
+        "SELECT DISTINCT server_id FROM secret_refs"
     };
-    tx.execute(disable_ai, [])?;
+    let mut stmt = conn.prepare(query)?;
+    let ids = stmt.query_map([], |row| row.get(0))?;
+    ids.collect()
+}
+
+fn retire_legacy_secret_refs(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let retired: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_secret_refs_retired')",
+        [],
+        |row| row.get(0),
+    )?;
+    if retired {
+        return Ok(());
+    }
+    let assets = legacy_secret_assets(&tx)?;
+    if assets.is_empty() {
+        return Ok(());
+    }
+    for id in assets {
+        tx.execute("UPDATE servers SET allow_ai=0 WHERE id=?1", [id])?;
+    }
     tx.execute("INSERT INTO meta(key,value) VALUES ('legacy_secret_refs_retired','1')", [])?;
     tx.commit()
 }
@@ -316,74 +335,44 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// 危险操作：清空全部资产与审计（保险库重置时调用）。
+    /// 清空保险库关联的资产和审查数据。旧版远端副本记录继续用于恢复时的保护。
     pub fn wipe_all(&self) -> Result<(), String> {
-        let conn = self.lock()?;
-        conn.execute_batch("DELETE FROM servers; DELETE FROM known_hosts; DELETE FROM audit_log;")
-            .map_err(|e| format!("清空数据失败: {e}"))
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|e| format!("开启重置事务失败: {e}"))?;
+        tx.execute_batch("DELETE FROM servers; DELETE FROM known_hosts;
+                          DELETE FROM audit_log; DELETE FROM ai_review_log;")
+            .map_err(|e| format!("清空数据失败: {e}"))?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            [crate::review::config::META_CONFIG, crate::review::config::META_KEY_BLOB],
+        ).map_err(|e| format!("清除审查配置失败: {e}"))?;
+        tx.commit().map_err(|e| format!("提交重置失败: {e}"))
     }
 
-    /// 备份恢复-覆盖模式：事务内清空并重建服务器表（保留审计日志）。
-    pub fn replace_all_servers(&self, rows: &[ServerRow]) -> Result<(), String> {
+    /// 按资产 ID 恢复备份。历史备份中的开关不能解除旧版凭据副本保护。
+    pub fn restore_servers(&self, rows: &[ServerRow], overwrite: bool) -> Result<(), String> {
         let mut conn = self.lock()?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("开启事务失败: {e}"))?;
-        tx.execute_batch("DELETE FROM servers; DELETE FROM known_hosts;")
-            .map_err(|e| format!("清空服务器失败: {e}"))?;
-        for r in rows {
+        let tx = conn.transaction().map_err(|e| format!("开启恢复事务失败: {e}"))?;
+        let protected = legacy_secret_assets(&tx).map_err(|e| format!("查询旧版凭据资产失败: {e}"))?;
+        if overwrite {
+            tx.execute_batch("DELETE FROM servers; DELETE FROM known_hosts;")
+                .map_err(|e| format!("清空服务器失败: {e}"))?;
+        }
+        for row in rows {
             tx.execute(
                 &format!(
-                    "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+                    "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+                     ON CONFLICT(id) DO UPDATE SET name=?2, host=?3, port=?4, username=?5, auth_type=?6, \
+                     secret_blob=?7, group_name=?8, tags=?9, notes=?10, allow_ai=?11, updated_at=?13"
                 ),
                 params![
-                    r.id,
-                    r.name,
-                    r.host,
-                    r.port as i64,
-                    r.username,
-                    r.auth_type,
-                    r.secret_blob,
-                    r.group_name,
-                    r.tags,
-                    r.notes,
-                    r.allow_ai as i64,
-                    r.created_at,
-                    r.updated_at
+                    row.id, row.name, row.host, row.port as i64, row.username, row.auth_type,
+                    row.secret_blob, row.group_name, row.tags, row.notes,
+                    row.allow_ai && !protected.contains(&row.id), row.created_at, row.updated_at,
                 ],
-            )
-            .map_err(|e| format!("插入失败: {e}"))?;
+            ).map_err(|e| format!("恢复服务器失败: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("提交事务失败: {e}"))
-    }
-
-    /// 备份恢复-合并模式：按 id 存在则整体更新，不存在则插入。
-    pub fn upsert_server(&self, r: &ServerRow) -> Result<(), String> {
-        let conn = self.lock()?;
-        conn.execute(
-            &format!(
-                "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
-                 ON CONFLICT(id) DO UPDATE SET name=?2, host=?3, port=?4, username=?5, auth_type=?6, \
-                 secret_blob=?7, group_name=?8, tags=?9, notes=?10, allow_ai=?11, updated_at=?13"
-            ),
-            params![
-                r.id,
-                r.name,
-                r.host,
-                r.port as i64,
-                r.username,
-                r.auth_type,
-                r.secret_blob,
-                r.group_name,
-                r.tags,
-                r.notes,
-                r.allow_ai as i64,
-                r.created_at,
-                r.updated_at
-            ],
-        )
-        .map_err(|e| format!("合并失败: {e}"))?;
-        Ok(())
+        tx.commit().map_err(|e| format!("提交恢复失败: {e}"))
     }
 
     // ---------- known_hosts（TOFU） ----------
@@ -726,6 +715,29 @@ mod tests {
     }
 
     #[test]
+    fn restoring_a_backup_preserves_legacy_asset_protection() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store.lock().unwrap().execute_batch(
+            "CREATE TABLE secret_refs(server_id TEXT, remote_copy INTEGER);
+             INSERT INTO secret_refs VALUES ('remote',1), ('local',0);
+             INSERT INTO meta VALUES ('legacy_secret_refs_retired','1');",
+        ).unwrap();
+        let row = |id: &str| ServerRow {
+            id: id.into(), name: id.into(), host: "localhost".into(), port: 22,
+            username: "test".into(), auth_type: "password".into(), secret_blob: vec![],
+            group_name: None, tags: "[]".into(), notes: None, allow_ai: true,
+            created_at: "2026-11-25T00:00:00Z".into(), updated_at: "2026-11-25T00:00:00Z".into(),
+        };
+        let rows = [row("remote"), row("local"), row("other")];
+        for overwrite in [false, true] {
+            store.restore_servers(&rows, overwrite).unwrap();
+            assert!(!store.get("remote").unwrap().unwrap().allow_ai);
+            assert!(store.get("local").unwrap().unwrap().allow_ai);
+            assert!(store.get("other").unwrap().unwrap().allow_ai);
+        }
+    }
+
+    #[test]
     fn review_log_insert_and_recent() {
         let db = std::env::temp_dir().join(format!("sd-review-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
@@ -765,6 +777,12 @@ mod tests {
         assert_eq!(all[0].latency_ms, 42);
         assert_eq!(all[0].server_name, "web-01");
         assert_eq!(store.recent_reviews(1).unwrap().len(), 1, "limit 生效");
+        store.set_meta(crate::review::config::META_CONFIG, "fixture").unwrap();
+        store.set_meta(crate::review::config::META_KEY_BLOB, "fixture").unwrap();
+        store.wipe_all().unwrap();
+        assert!(store.recent_reviews(10).unwrap().is_empty());
+        assert!(store.get_meta(crate::review::config::META_CONFIG).unwrap().is_none());
+        assert!(store.get_meta(crate::review::config::META_KEY_BLOB).unwrap().is_none());
     }
 
     #[test]

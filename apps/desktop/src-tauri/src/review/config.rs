@@ -89,29 +89,39 @@ impl DenyMode {
 
 /// AI 审查配置。默认值即 D1–D3 的拍板结论（见 docs/r8-ai-review-design.md §8）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ReviewConfig {
     pub enabled: bool,
+    #[serde(alias = "base_url")]
     pub base_url: String,
     pub model: String,
     pub protocol: Protocol,
     /// 单次审查请求总超时（毫秒），保存时钳制到 1000–15000
+    #[serde(alias = "timeout_ms")]
     pub timeout_ms: u32,
     /// 送审文本（脱敏后）长度上限（字节），保存时钳制到 1024–65536
+    #[serde(alias = "max_input_bytes")]
     pub max_input_bytes: usize,
     /// 单次审查的输出 token 预算，保存时钳制到 64–4096。
     /// 推理模型（如 DeepSeek-R1、openbmb MiniCPM）需要更大预算——
     /// 预算太小会截断思维链，content 恒为空，审查永远失败。
+    #[serde(alias = "max_tokens")]
     pub max_tokens: u32,
+    #[serde(alias = "failure_policy")]
     pub failure_policy: FailurePolicy,
+    #[serde(alias = "deny_mode")]
     pub deny_mode: DenyMode,
     /// Phase 2 预留：文件类工具（write/append/upload）是否送审
+    #[serde(alias = "review_files")]
     pub review_files: bool,
     /// D3 已拍板：是否把服务器分组/名称一并发给模型，默认 false
+    #[serde(alias = "send_server_context")]
     pub send_server_context: bool,
     /// 审查结论缓存 TTL（秒），0 = 不缓存（R8.2 接入缓存）
+    #[serde(alias = "cache_ttl_secs")]
     pub cache_ttl_secs: u64,
     /// 提示词版本：改 prompt 必须一起升版本，缓存 key 与日志都带它
+    #[serde(alias = "prompt_version")]
     pub prompt_version: String,
 }
 
@@ -271,6 +281,7 @@ pub struct ReviewInfo {
     pub protocol: Protocol,
     pub timeout_ms: u32,
     pub max_input_bytes: usize,
+    pub max_tokens: u32,
     pub failure_policy: FailurePolicy,
     pub deny_mode: DenyMode,
     pub review_files: bool,
@@ -299,6 +310,7 @@ impl ReviewInfo {
             protocol: cfg.protocol,
             timeout_ms: cfg.timeout_ms,
             max_input_bytes: cfg.max_input_bytes,
+            max_tokens: cfg.max_tokens,
             failure_policy: cfg.failure_policy,
             deny_mode: cfg.deny_mode,
             review_files: cfg.review_files,
@@ -337,6 +349,24 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let back: ReviewConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn settings_wire_format_and_legacy_stored_config_match() {
+        let path = std::path::Path::new(":memory:");
+        let store = Store::open(path).unwrap();
+        let vault = Vault::open(std::path::Path::new("."), path).unwrap();
+        let legacy = r#"{"enabled":true,"base_url":"https://review.example.invalid/v1","model":"test","timeout_ms":8500,"max_tokens":940,"failure_policy":"block","deny_mode":"reject","send_server_context":true}"#;
+        store.set_meta(META_CONFIG, legacy).unwrap();
+        let saved = load_config(&store);
+        saved.validate().unwrap();
+        let info = serde_json::to_value(ReviewInfo::of(&store, &vault, &saved)).unwrap();
+        assert_eq!(info["maxTokens"], 940);
+        assert_eq!(info["timeoutMs"], 8500);
+        assert_eq!(info["failurePolicy"], "block");
+        assert_eq!(info["sendServerContext"], true);
+        let request: ReviewConfig = serde_json::from_value(info).unwrap();
+        assert_eq!(request, saved);
     }
 
     #[test]

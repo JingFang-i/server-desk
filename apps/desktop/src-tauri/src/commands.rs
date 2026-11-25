@@ -98,8 +98,7 @@ pub async fn vault_set_settings(
 /// 危险操作：忘记主密码时的重置（清空全部数据，不可恢复）。
 #[tauri::command]
 pub fn vault_reset(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.store.wipe_all()?;
-    state.vault.reset().map_err(|e| e.to_string())?;
+    state.reviewer.reset(&state.store, &state.vault)?;
     ops::audit(&state, "user", None, "vault_reset", "重置保险库并清空数据", "ok");
     Ok(())
 }
@@ -585,6 +584,7 @@ pub async fn ai_review_test(state: State<'_, Arc<AppState>>) -> Result<ReviewTes
         Some(&key),
         "你是服务器运维命令的安全审查员。只输出 JSON，不要解释。",
         r#"{"tool":"exec_command","command":"uptime"}"#,
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(cfg.timeout_ms)),
     )
     .await;
     match outcome {

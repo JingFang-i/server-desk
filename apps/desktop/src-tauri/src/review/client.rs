@@ -9,7 +9,7 @@
 
 use crate::review::config::{Protocol, ReviewConfig};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// 一次成功调用的产物。
 /// `tokens_in/out` 在 R8.1 仅采集不消费（R8.5 落入审查日志做成本观测），先显式豁免 dead_code。
@@ -32,14 +32,14 @@ pub async fn chat_json(
     api_key: Option<&str>,
     system: &str,
     user: &str,
+    deadline: Instant,
 ) -> Result<ChatOutcome, String> {
     debug_assert!(matches!(cfg.protocol, Protocol::OpenAiCompat));
     let url = cfg.endpoint()?;
-    let timeout = Duration::from_millis(u64::from(cfg.timeout_ms));
 
     let started = Instant::now();
     for with_response_format in [true, false] {
-        let remaining = timeout.saturating_sub(started.elapsed());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("审查请求超时".into());
         }
