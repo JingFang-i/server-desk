@@ -374,6 +374,9 @@ const READ_PATH_DENY: &[&str] = &[
     ".pem",
     "/etc/shadow",
     "authorized_keys",
+    // SSH 密钥目录整体硬拒：自建密钥名（deploy_key 等）不在具体文件名黑名单里，
+    // 读出来就是私钥泄漏（输出脱敏挡不住单行 base64 私钥）
+    ".ssh/",
     // 注意：`.env` 不在子串表里——由 evaluate_read_path 按 basename 判定为「转人工审批」，
     // 避免子串匹配把 /etc 下 `app.env` 之类也一并硬拒
     "credential",
@@ -550,6 +553,12 @@ impl Guard {
                 "命令涉及 .env 环境文件（可能含凭据），需人工确认".to_string(),
             );
         }
+        // SSH 密钥目录：读/写/拷贝都转审批（命令级不硬拒，可能与密钥生成等正常运维混用）
+        if lower.contains("/.ssh") || lower.starts_with(".ssh") {
+            return Decision::NeedsApproval(
+                "命令涉及 SSH 密钥目录（~/.ssh），需人工确认".to_string(),
+            );
+        }
         // 白名单模式：每一条子命令都必须命中白名单（纯 echo 标签除外）
         if g.rules.whitelist_mode {
             for seg in split_segments(&normalized) {
@@ -618,8 +627,14 @@ impl Guard {
                 ));
             }
         }
-        // `.env` 家族：按 basename 精确匹配（`.env` / `.env.local` / `.env.production`）
         let basename = lower.rsplit('/').next().unwrap_or("");
+        // 目录本身（如 list_files /root/.ssh）：子串 ".ssh/" 匹配不到，单独判一次
+        if basename == ".ssh" || lower == "~/.ssh" {
+            return Decision::Blocked(
+                "路径命中凭据保护规则「.ssh/」——AI 不得列出或读取 SSH 密钥目录".to_string(),
+            );
+        }
+        // `.env` 家族：按 basename 精确匹配（`.env` / `.env.local` / `.env.production`）
         if basename == ".env" || basename.starts_with(".env.") {
             return Decision::NeedsApproval(
                 "读取 .env 环境文件（可能含凭据）需人工确认".to_string(),
@@ -740,8 +755,46 @@ mod tests {
             guard().evaluate_read_path("/etc/systemd/system/app.service"),
             Decision::Allow
         ));
+        // SSH 密钥目录：文件名不在黑名单的自建密钥也硬拒，目录本身也拒
+        assert!(matches!(
+            guard().evaluate_read_path("/root/.ssh/deploy_key"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_read_path("/home/u/.ssh"),
+            Decision::Blocked(_)
+        ));
+        assert!(matches!(
+            guard().evaluate_read_path("/root/.ssh/known_hosts"),
+            Decision::Blocked(_)
+        ));
         assert!(matches!(
             guard().evaluate_read_path("/var/log/app.log"),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn ssh_dir_commands_require_approval() {
+        let g = guard();
+        for cmd in [
+            "cat ~/.ssh/deploy_key",
+            "cp ~/.ssh/deploy_key /tmp/x",
+            "ls -la /root/.ssh",
+        ] {
+            assert!(
+                matches!(g.evaluate(cmd), Decision::NeedsApproval(_)),
+                "{cmd} 应转人工审批"
+            );
+        }
+        // 明确命中私钥文件名的命令仍硬拒（泄露防护优先于审批）
+        assert!(matches!(
+            g.evaluate("cat ~/.ssh/id_rsa"),
+            Decision::Blocked(_)
+        ));
+        // 与密钥目录无关的 ssh 命令不受影响
+        assert!(matches!(
+            g.evaluate("systemctl status sshd"),
             Decision::Allow
         ));
     }
