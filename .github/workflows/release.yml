@@ -1,8 +1,9 @@
 name: release
 
+# 只在推送 tag（v*）或手动触发时运行：
+# 监听 main 会让「推 main + 推 tag」触发两次重复构建，而 main 的产物也不会发布。
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
