@@ -42,8 +42,8 @@ const sections = [
   { id: "sec-vault", label: "保险库安全" },
   { id: "sec-alerts", label: "审批提醒与声音" },
   { id: "sec-mcp", label: "AI 管线（MCP 接入）" },
-  { id: "sec-review", label: "AI 智能审查" },
   { id: "sec-policy", label: "AI 高级策略" },
+  { id: "sec-review", label: "AI 智能审查" },
   { id: "sec-rules", label: "命令安全规则" },
   { id: "sec-update", label: "应用更新" },
 ];
