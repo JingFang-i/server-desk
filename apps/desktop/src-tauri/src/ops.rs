@@ -1291,7 +1291,7 @@ mod r3_tests {
             username: "root".into(), auth_type: "password".into(), secret_blob: vec![0u8; 8],
             group_name: group.map(String::from), tags: "[]".into(), notes: None,
             allow_ai: true, created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(), sort_order: 0,
         }
     }
 
@@ -1357,6 +1357,7 @@ mod r6_tests {
             allow_ai: true,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            sort_order: 0,
         }
     }
 

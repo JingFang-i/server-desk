@@ -2,11 +2,13 @@
 import { defineStore } from "pinia";
 import { listen } from "@tauri-apps/api/event";
 
-interface ActivityItem {
+export interface ActivityItem {
   id: string;
   ts: string;
   tool: string;
   server: string;
+  /** 这条调用做了什么（脱敏后的命令/路径，点开记录时展示） */
+  detail: string;
   running: boolean;
   ok: boolean | null;
 }
@@ -16,6 +18,8 @@ interface ActivityEvent {
   phase: "start" | "done";
   tool: string;
   server: string;
+  /** 已脱敏的调用内容；done 事件也会带（与 start 相同） */
+  detail?: string;
   ok?: boolean;
 }
 
@@ -35,7 +39,7 @@ export const useActivityStore = defineStore("activity", {
       subscribed = true;
       try {
         await listen<ActivityEvent>("tool-activity", ({ payload }) => {
-          const { id, phase, tool, server, ok } = payload;
+          const { id, phase, tool, server, detail, ok } = payload;
           const ts = new Date().toISOString();
           const item = this.entries.find((entry) => entry.id === id);
           if (item) {
@@ -48,6 +52,7 @@ export const useActivityStore = defineStore("activity", {
           }
           this.entries.unshift({
             id, ts, tool, server,
+            detail: detail ?? "",
             running: phase === "start",
             ok: phase === "start" ? null : ok === true,
           });

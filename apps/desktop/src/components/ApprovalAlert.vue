@@ -4,7 +4,7 @@ import { NButton, useNotification } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type ApprovalReview, type PendingApproval } from "../api";
 import ApprovalReviewNote from "./ApprovalReviewNote.vue";
-import { playApprovalChime, primeAlertSound } from "../alert";
+import { armAlertSound, playApprovalChime } from "../alert";
 import { notifyPermission } from "../notifyStatus";
 
 /**
@@ -94,8 +94,8 @@ function alertOnce(item: PendingApproval) {
 }
 
 onMounted(async () => {
-  window.addEventListener("pointerdown", primeAlertSound, { once: true, capture: true });
-  window.addEventListener("keydown", primeAlertSound, { once: true, capture: true });
+  // 音频上下文持续尝试解锁，直到真的能出声（一次失败不再永久静音）
+  armAlertSound();
   window.addEventListener("focus", checkPerm);
   void checkPerm();
 
@@ -116,8 +116,6 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  window.removeEventListener("pointerdown", primeAlertSound, true);
-  window.removeEventListener("keydown", primeAlertSound, true);
   window.removeEventListener("focus", checkPerm);
   if (pollTimer) window.clearInterval(pollTimer);
   if (remindTimer) window.clearInterval(remindTimer);

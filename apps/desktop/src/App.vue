@@ -17,9 +17,8 @@ import {
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type VaultStatus } from "./api";
-import { useActivityStore } from "./stores/activity";
+import logoUrl from "./assets/logo.png";
 import ApprovalAlert from "./components/ApprovalAlert.vue";
-import ActivityWidget from "./components/ActivityWidget.vue";
 import UpdatePrompt from "./components/UpdatePrompt.vue";
 import ServersView from "./views/ServersView.vue";
 import SettingsView from "./views/SettingsView.vue";
@@ -31,7 +30,6 @@ import LockGate from "./views/LockGate.vue";
 
 type PageKey = "servers" | "approvals" | "audit" | "changes" | "backup" | "settings";
 const page = ref<PageKey>("servers");
-const activity = useActivityStore();
 const vault = ref<VaultStatus | null>(null);
 const booted = ref(false);
 /** 待审批数量：菜单角标，由 ApprovalAlert 轮询维护 */
@@ -95,15 +93,22 @@ async function lockVault() {
 
 let unlisten: UnlistenFn | undefined;
 let unlistenMenuLock: UnlistenFn | undefined;
+let unlistenNavigate: UnlistenFn | undefined;
 let pollTimer: number | undefined;
 
+const PAGE_KEYS: PageKey[] = ["servers", "approvals", "audit", "changes", "backup", "settings"];
+
 onMounted(async () => {
-  void activity.init().catch(() => {});
   await refreshVault();
   booted.value = true;
   unlisten = await listen("vault-locked", () => refreshVault());
   // 原生菜单「锁定保险库」（mac 应用菜单 / win 菜单栏，快捷键 Cmd/Ctrl+L）
   unlistenMenuLock = await listen("menu-lock-vault", () => void lockVault());
+  // 悬浮窗点「去处理审批」→ 主窗口已经由 Rust 侧唤起，这里只负责切页
+  unlistenNavigate = await listen<string>("navigate", (event) => {
+    const target = event.payload as PageKey;
+    if (PAGE_KEYS.includes(target)) page.value = target;
+  });
   pollTimer = window.setInterval(() => {
     if (vault.value?.unlocked) refreshVault();
   }, 20000);
@@ -115,6 +120,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.();
   unlistenMenuLock?.();
+  unlistenNavigate?.();
   if (pollTimer) window.clearInterval(pollTimer);
   if (connTimer) window.clearInterval(connTimer);
 });
@@ -150,9 +156,12 @@ onUnmounted(() => {
               :width="216"
               content-style="padding: 18px 12px 14px; display: flex; flex-direction: column; height: 100%"
             >
-              <div class="brand-title">ServerDesk</div>
-              <div class="brand-sub" style="margin-bottom: 14px">
-                本地服务器管理
+              <div class="brand" style="margin-bottom: 14px">
+                <img class="brand-logo" :src="logoUrl" alt="ServerDesk" />
+                <div>
+                  <div class="brand-title">ServerDesk</div>
+                  <div class="brand-sub">本地服务器管理</div>
+                </div>
               </div>
               <n-menu :value="page" :options="menuOptions" @update:value="onMenu" />
               <div style="flex: 1" />
@@ -170,8 +179,6 @@ onUnmounted(() => {
               <BackupView v-else-if="page === 'backup'" />
               <SettingsView v-else-if="page === 'settings'" />
             </n-layout-content>
-            <!-- AI 实时活动：全局可见（任何页面右下角悬浮） -->
-            <ActivityWidget />
           </n-layout>
         </n-dialog-provider>
       </n-notification-provider>

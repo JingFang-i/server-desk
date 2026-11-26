@@ -13,22 +13,30 @@ const META_MCP_ENABLED: &str = "mcp_enabled";
 pub const APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 /// 用户可维护的拦截/审批规则（子串匹配，大小写不敏感）。
+///
+/// 序列化统一 camelCase：前端 `GuardRules` 按 camelCase 提交（whitelistMode / ratePerMin /
+/// strictGroups），此前结构体是 snake_case 且开了 `serde(default)`，这些字段会被静默当成
+/// 未知字段丢弃——于是「白名单模式 / 速率限制 / 严格分组」永远存不进去（只读模式是单词，
+/// 恰好命中，才显得「有的能存有的不能」）。旧库里已存的 JSON 是 snake_case，靠 alias 兼容。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct GuardRules {
     /// 硬拒绝（AI 不可执行，也不可申请审批）
     pub deny: Vec<String>,
     /// 需人工审批（AI 提交 → 应用弹窗 → 用户批准后执行；超时自动拒绝）
     pub approval: Vec<String>,
     /// 白名单模式：true 时 AI 命令必须命中 whitelist 才放行
+    #[serde(alias = "whitelist_mode")]
     pub whitelist_mode: bool,
     /// 白名单条目（子串匹配）
     pub whitelist: Vec<String>,
     /// 只读模式：拦截 AI 的一切写入类命令
     pub readonly: bool,
     /// AI 调用速率限制（次/分钟，0 = 不限）
+    #[serde(alias = "rate_per_min")]
     pub rate_per_min: u32,
     /// 严格分组：这些分组的服务器上，AI 的一切 exec 都需审批
+    #[serde(alias = "strict_groups")]
     pub strict_groups: Vec<String>,
 }
 
@@ -698,6 +706,35 @@ mod tests {
                 ai_enabled: true,
             })),
         }
+    }
+
+    #[test]
+    fn guard_rules_accept_camel_case_and_legacy_snake_case() {
+        // 前端按 camelCase 提交：白名单模式 / 速率 / 严格分组再也不能被静默丢弃
+        let camel: GuardRules = serde_json::from_str(
+            r#"{"deny":[],"approval":[],"whitelistMode":true,"whitelist":["uptime"],
+                "readonly":true,"ratePerMin":7,"strictGroups":["prod"]}"#,
+        )
+        .unwrap();
+        assert!(camel.whitelist_mode);
+        assert!(camel.readonly);
+        assert_eq!(camel.rate_per_min, 7);
+        assert_eq!(camel.strict_groups, vec!["prod"]);
+
+        // 升级前写在 meta 里的 JSON 是 snake_case，仍要能读回来（否则规则会被重置）
+        let legacy: GuardRules = serde_json::from_str(
+            r#"{"deny":[],"approval":[],"whitelist_mode":true,"whitelist":[],
+                "readonly":true,"rate_per_min":9,"strict_groups":["db"]}"#,
+        )
+        .unwrap();
+        assert!(legacy.whitelist_mode);
+        assert_eq!(legacy.rate_per_min, 9);
+        assert_eq!(legacy.strict_groups, vec!["db"]);
+
+        // 落库用 camelCase
+        let json = serde_json::to_string(&camel).unwrap();
+        assert!(json.contains("whitelistMode") && json.contains("ratePerMin"));
+        assert!(!json.contains("whitelist_mode"));
     }
 
     #[test]

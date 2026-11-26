@@ -35,6 +35,9 @@ const actionOptions = [
   { label: "AI 批量执行", value: "mcp_exec_batch" },
   { label: "AI 文件写入", value: "mcp_write_file" },
   { label: "AI 审批请求", value: "mcp_approval_requested" },
+  { label: "系统通知授权", value: "notify_permission" },
+  { label: "通知通道测试", value: "notify_test" },
+  { label: "活动悬浮窗", value: "float_window" },
   { label: "手动命令", value: "ssh_exec" },
 ];
 

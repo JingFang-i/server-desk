@@ -3,13 +3,18 @@
   "identifier": "default",
   "description": "主窗口默认能力",
   "windows": [
-    "main"
+    "main",
+    "activity-float"
   ],
   "permissions": [
     "core:default",
     "dialog:default",
     "notification:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-position",
+    "core:window:allow-show",
+    "core:window:allow-hide"
   ]
 }

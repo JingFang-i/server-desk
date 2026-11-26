@@ -22,13 +22,14 @@ import {
   NTree,
   useDialog,
   useMessage,
+  type TreeDropInfo,
   type TreeOption,
   type DropdownOption,
   type FormInst,
   type FormRules,
 } from "naive-ui";
 import { EllipsisVertical, FolderOpenOutline } from "@vicons/ionicons5";
-import { api, type SaveServerInput, type ServerConfig } from "../api";
+import { api, type LayoutItem, type SaveServerInput, type ServerConfig } from "../api";
 import { open, save as save$ } from "@tauri-apps/plugin-dialog";
 import { useServersStore } from "../stores/servers";
 
@@ -127,6 +128,14 @@ const filteredServers = computed(() =>
   })
 );
 
+/** 树节点上挂的业务字段（naive-ui 的 TreeOption 允许透传自定义字段） */
+type NodeExt = TreeOption & {
+  isServerNode?: boolean;
+  isGroupNode?: boolean;
+  server?: ServerConfig;
+  groupName?: string | null;
+};
+
 /** 分组 → 该组服务器（未分组用独立键，不会被真实的「默认分组」合并） */
 const groupings = computed(() => {
   const groups = new Map<string, ServerConfig[]>();
@@ -192,11 +201,7 @@ const nodeInfo = computed(() => {
   >();
   const walk = (nodes: TreeOption[]) => {
     for (const n of nodes) {
-      const info = n as TreeOption & {
-        server?: ServerConfig;
-        groupName?: string | null;
-        isGroupNode?: boolean;
-      };
+      const info = n as NodeExt;
       map.set(String(n.key), {
         server: info.server,
         groupName: info.groupName,
@@ -261,6 +266,128 @@ watch(
 );
 
 const groupOptions = computed(() => store.groups.map((g) => ({ label: g, value: g })));
+
+// ---------- 拖拽排序 / 拖到其它分组 ----------
+const savingLayout = ref(false);
+
+/** 分组名归一：空白 → null（默认分组），与后端 group_name 的语义保持一致 */
+function normGroup(group: string | null | undefined): string | null {
+  const trimmed = (group ?? "").trim();
+  return trimmed ? trimmed : null;
+}
+
+/** 树上的可见顺序 → 扁平列表（分组按名称排序、默认分组垫底，与 treeData 一致） */
+function flattenedOrder(): ServerConfig[] {
+  const { groups, ungrouped } = groupings.value;
+  const names = [...groups.keys()].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const flat: ServerConfig[] = [];
+  for (const name of names) flat.push(...groups.get(name)!);
+  flat.push(...ungrouped);
+  return flat;
+}
+
+/**
+ * 允许拖放：搜索态直接禁止（列表是过滤后的子集，按它算出的顺序会错）。
+ * 具体的合法性（只搬服务器、分组不可拖）在 onDrop 里判定——
+ * naive-ui 的 allowDrop 回调拿不到 dragNode，这里拦不住「拖分组」。
+ */
+function allowDrop() {
+  return !keyword.value.trim();
+}
+
+/** 提交整表新顺序 + 分组归属（后端单事务落库），失败回滚本地状态 */
+async function commitLayout(flat: ServerConfig[]) {
+  const normalized = flat.map((s) => ({ ...s, group: normGroup(s.group) }));
+  const items: LayoutItem[] = normalized.map((s, index) => ({
+    id: s.id,
+    group: s.group,
+    sortOrder: index,
+  }));
+  const snapshot = store.servers.slice();
+  // 乐观更新：松手立刻看到新位置，不必等一趟 IPC
+  store.servers = normalized;
+  savingLayout.value = true;
+  try {
+    await api.applyServerLayout(items);
+  } catch (e) {
+    store.servers = snapshot;
+    message.error(`保存排序失败：${String(e)}`);
+  } finally {
+    savingLayout.value = false;
+  }
+}
+
+/**
+ * 落点规则：
+ * - 落到分组行里（inside）→ 移到该分组末尾
+ * - 落到服务器行前/后 → 在目标所在分组内排序
+ * 分组本身不可拖动（按名称排序），搜索态不可拖。
+ */
+async function onDrop({ node, dragNode, dropPosition }: TreeDropInfo) {
+  if (keyword.value.trim()) return;
+  const target = node as NodeExt;
+  const moving = (dragNode as NodeExt).server;
+  if (!moving || !target) return;
+
+  const flat = flattenedOrder().filter((s) => s.id !== moving.id);
+  let group: string | null;
+  let insertAt: number;
+  if (target.isGroupNode) {
+    group = normGroup(target.groupName);
+    const members = flat.filter((s) => normGroup(s.group) === group);
+    const last = members[members.length - 1];
+    insertAt = last ? flat.findIndex((s) => s.id === last.id) + 1 : flat.length;
+  } else if (target.server) {
+    group = normGroup(target.server.group);
+    const index = flat.findIndex((s) => s.id === target.server!.id);
+    if (index < 0) return;
+    insertAt = dropPosition === "before" ? index : index + 1;
+  } else {
+    return;
+  }
+
+  flat.splice(insertAt, 0, { ...moving, group });
+  await commitLayout(flat);
+}
+
+// ---------- 分组重命名 ----------
+const renameModal = ref(false);
+const renaming = ref(false);
+const renameTo = ref("");
+
+function openRename() {
+  const group = selectedGroup.value;
+  if (!group || group.isUngrouped) return;
+  renameTo.value = group.name;
+  renameModal.value = true;
+}
+
+async function submitRename() {
+  const group = selectedGroup.value;
+  if (!group || group.isUngrouped) return;
+  const to = renameTo.value.trim();
+  if (!to) {
+    message.error("分组名不能为空");
+    return;
+  }
+  if (to === group.name) {
+    renameModal.value = false;
+    return;
+  }
+  renaming.value = true;
+  try {
+    const affected = await api.renameServerGroup(group.name, to);
+    message.success(`分组已重命名为「${to}」（${affected} 台服务器）`);
+    renameModal.value = false;
+    await store.load();
+    // 选中改名后的分组节点，避免面板跳空
+    selectedKey.value = `g:${to}`;
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    renaming.value = false;
+  }
+}
 
 // ---------- 连接 / 测试 / 执行 ----------
 async function connectRow(row: ServerConfig) {
@@ -651,11 +778,14 @@ const selectedConnState = computed<ConnState>(() =>
           <n-tree
             v-if="treeData.length"
             block-line
+            draggable
+            :allow-drop="allowDrop"
             :data="treeData"
             :selected-keys="selectedKeys"
             :expanded-keys="expandedKeys"
             @update:selected-keys="onSelect"
             @update:expanded-keys="(k: any) => (expandedKeys = k)"
+            @drop="onDrop"
           />
           <n-empty
             v-else
@@ -666,6 +796,7 @@ const selectedConnState = computed<ConnState>(() =>
         </div>
         <div class="tree-foot">
           {{ store.servers.length }} 台 · {{ treeData.length }} 个分组
+          <span v-if="savingLayout" style="opacity: 0.8"> · 保存排序中…</span>
         </div>
       </aside>
 
@@ -827,7 +958,12 @@ const selectedConnState = computed<ConnState>(() =>
             >
               ＋ 新增到该分组
             </n-button>
+            <n-button v-if="!selectedGroup.isUngrouped" @click="openRename">重命名分组</n-button>
           </div>
+          <p class="hint" style="margin: 12px 0 0">
+            左侧列表支持拖动：拖到某台服务器前/后 = 组内排序，拖到分组行上 = 移入该分组。
+            分组按名称排序，名称可在此重命名。
+          </p>
         </n-card>
 
         <div v-else class="detail-empty">
@@ -939,6 +1075,34 @@ const selectedConnState = computed<ConnState>(() =>
           <n-button :disabled="!model.host" @click="testForm">测试 TCP 连接</n-button>
           <n-button @click="showModal = false">取消</n-button>
           <n-button type="primary" :loading="saving" @click="submit">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <n-modal
+      v-model:show="renameModal"
+      preset="card"
+      title="重命名分组"
+      style="width: 460px"
+    >
+      <n-form label-placement="left" label-width="80">
+        <n-form-item label="分组名">
+          <n-input
+            v-model:value="renameTo"
+            maxlength="60"
+            show-count
+            placeholder="如：生产环境"
+            @keyup.enter="submitRename"
+          />
+        </n-form-item>
+      </n-form>
+      <p class="hint" style="margin: 0">
+        改名会批量更新该分组内的所有服务器；与已有分组同名等同于把两个分组合并。
+      </p>
+      <template #footer>
+        <div style="display: flex; gap: 8px; justify-content: flex-end">
+          <n-button @click="renameModal = false">取消</n-button>
+          <n-button type="primary" :loading="renaming" @click="submitRename">保存</n-button>
         </div>
       </template>
     </n-modal>

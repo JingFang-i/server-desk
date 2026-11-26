@@ -15,6 +15,21 @@ body {
   background: #101014;
   color: rgba(255, 255, 255, 0.9);
 }
+/* AI 实时活动悬浮窗（独立透明窗口）：底色交给面板自己画，
+   否则这块深色底会把圆角和炫彩流光边挡成直角矩形 */
+html.is-float,
+html.is-float body {
+  background: transparent;
+}
+/* 悬浮窗内容自己裁剪：跑马灯/绝对定位元素一旦超出视口，WebView 会给窗口加滚动条 */
+html.is-float,
+html.is-float body,
+html.is-float #app {
+  overflow: hidden;
+}
+html.is-float ::-webkit-scrollbar {
+  display: none;
+}
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -63,4 +78,19 @@ body {
   margin-left: 10px;
   font-size: 12px;
   opacity: 0.55;
+}
+
+/* 侧栏品牌位：应用图标 + 名称（图标由 scripts/gen-icon.py 统一生成） */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex-shrink: 0;
+  /* 图标自带圆角底板，这里只给一点点投影让它从深色侧栏里浮起来 */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
 }

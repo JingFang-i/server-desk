@@ -90,6 +90,57 @@ async function requestPerm() {
     message.warning("授权被拒绝：请到系统设置 → 通知 → ServerDesk 手动允许");
 }
 
+// AI 实时活动悬浮窗：持久化开关（关掉后下次启动不再自动出现）
+const floatEnabled = ref(true);
+
+async function loadFloatEnabled() {
+  try {
+    floatEnabled.value = await api.getFloatEnabled();
+  } catch {
+    /* 后端未就绪时保持默认开启 */
+  }
+}
+
+async function toggleFloat(enabled: boolean) {
+  try {
+    await api.setFloatEnabled(enabled);
+    floatEnabled.value = enabled;
+    message.success(
+      enabled ? "悬浮窗已开启（右下角）" : "悬浮窗已关闭；下次启动不再自动出现，可从托盘或这里再打开"
+    );
+  } catch (e) {
+    floatEnabled.value = !enabled; // 失败回滚开关
+    message.error(String(e));
+  }
+}
+
+/** 试听原生系统音：不经过 WebView 音频上下文，验证系统输出通道 */
+async function playSystemSound() {
+  try {
+    await api.playAlertSound();
+    message.info("已播放系统提示音（Glass）；听不到请检查系统音量与输出设备");
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+const testingNotify = ref(false);
+/** 测试结果留在页面上（toast 一闪就没了，而这条信息要边切应用边看） */
+const notifyTestInfo = ref<{ ok: boolean; text: string } | null>(null);
+
+/** 发送一条测试通知：把「系统通知到底通不通」当场验证清楚 */
+async function testNotification() {
+  testingNotify.value = true;
+  notifyTestInfo.value = null;
+  try {
+    notifyTestInfo.value = { ok: true, text: await api.approvalNotificationTest() };
+  } catch (e) {
+    notifyTestInfo.value = { ok: false, text: String(e) };
+  } finally {
+    testingNotify.value = false;
+  }
+}
+
 // ---------- AI 智能审查（R8） ----------
 const rv = ref<ReviewInfo | null>(null);
 const rvEnabled = ref(false);
@@ -220,6 +271,24 @@ const groupOptions = computed(() =>
   serversStore.groups.map((g) => ({ label: g, value: g }))
 );
 
+/**
+ * 高级策略是否有未保存的改动。
+ *
+ * 这几项（只读模式 / 速率 / 严格分组）以前没有独立的保存入口，用户打开只读开关后
+ * 离开页面其实什么都没写库，重进设置又变回关闭——看起来像「只读模式没生效」。
+ */
+const policyDirty = computed(() => {
+  const saved = guard.value;
+  if (!saved) return false;
+  const sameGroups =
+    [...strictGroups.value].sort().join("\u0000") === [...saved.strictGroups].sort().join("\u0000");
+  return (
+    readonly.value !== saved.readonly ||
+    ratePerMin.value !== saved.ratePerMin ||
+    !sameGroups
+  );
+});
+
 const modeValue = computed({
   get: () => (whitelistMode.value ? "whitelist" : "blacklist"),
   set: (v: string) => {
@@ -232,16 +301,21 @@ const modeOptions = [
   { label: "白名单模式", value: "whitelist" },
 ];
 
+/** 把后端返回的真实规则写回表单（保存后也走这里，界面不会再显示「假状态」） */
+function applyGuardInfo(info: GuardInfo) {
+  guard.value = info;
+  denyText.value = info.deny.join("\n");
+  approvalText.value = info.approval.join("\n");
+  whitelistMode.value = info.whitelistMode;
+  whitelistText.value = info.whitelist.join("\n");
+  readonly.value = info.readonly;
+  ratePerMin.value = info.ratePerMin;
+  strictGroups.value = [...info.strictGroups];
+}
+
 async function loadGuard() {
   try {
-    guard.value = await api.guardInfo();
-    denyText.value = guard.value.deny.join("\n");
-    approvalText.value = guard.value.approval.join("\n");
-    whitelistMode.value = guard.value.whitelistMode;
-    whitelistText.value = guard.value.whitelist.join("\n");
-    readonly.value = guard.value.readonly;
-    ratePerMin.value = guard.value.ratePerMin;
-    strictGroups.value = [...guard.value.strictGroups];
+    applyGuardInfo(await api.guardInfo());
     mcpInfo.value = await api.mcpInfo();
   } catch (e) {
     message.error(String(e));
@@ -261,6 +335,7 @@ onMounted(async () => {
   loadGuard();
   loadReview();
   loadAlertStatus();
+  loadFloatEnabled();
 });
 
 // IntersectionObserver 挂在 DOM 就绪后（卡片 id 存在于模板）
@@ -309,7 +384,7 @@ function parseLines(text: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-async function saveRules() {
+async function saveRules(scope: "rules" | "policy" = "rules") {
   savingRules.value = true;
   try {
     const rules: GuardRules = {
@@ -321,12 +396,13 @@ async function saveRules() {
       ratePerMin: Math.max(0, Math.round(ratePerMin.value || 0)),
       strictGroups: strictGroups.value,
     };
-    guard.value = await api.guardSetRules(rules);
-    denyText.value = guard.value.deny.join("\n");
-    approvalText.value = guard.value.approval.join("\n");
-    whitelistText.value = guard.value.whitelist.join("\n");
-    strictGroups.value = [...guard.value.strictGroups];
-    message.success("安全规则已保存");
+    // 用后端返回值回填：保存失败时界面不会假装已生效
+    applyGuardInfo(await api.guardSetRules(rules));
+    message.success(
+      scope === "policy"
+        ? `高级策略已保存${readonly.value ? "（只读模式已立即生效）" : ""}`
+        : "安全规则已保存"
+    );
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -430,9 +506,12 @@ async function copy(text: string, label: string) {
         <div class="label">
           <div>系统通知（后台可达）</div>
           <div class="desc">
-            后台提醒由系统通知设置控制。打包后的 ServerDesk.app 可在此查询/申请权限；
+            启动时会在「未授权」状态下自动申请一次系统通知权限；投递走 macOS
+            UserNotifications（通知中心里能看到 ServerDesk 这个应用）。
+            窗口在前台时系统会抑制横幅（这是 macOS 的行为），此时只响提示音；
+            请切到其他应用后再验证横幅。
             <template v-if="notifyPerm === 'dev'">
-              当前为<strong>开发模式</strong>——没有应用包身份，系统通知权限无法查询，请以打包版验证。
+              当前为<strong>开发模式</strong>——没有应用包身份，系统通知走回退通道，请以打包版验证。
             </template>
           </div>
         </div>
@@ -454,11 +533,53 @@ async function copy(text: string, label: string) {
                       : "无法确认"
             }}
           </n-tag>
-          <n-button v-if="notifyPerm === 'prompt'" size="small" type="primary" ghost @click="requestPerm">
+          <n-button
+            v-if="notifyPerm === 'prompt' || notifyPerm === 'unknown'"
+            size="small"
+            type="primary"
+            ghost
+            @click="requestPerm"
+          >
             申请授权
           </n-button>
           <n-button v-else size="small" quaternary @click="loadAlertStatus">刷新状态</n-button>
         </div>
+      </div>
+      <div class="row">
+        <div class="label">
+          <div>AI 实时活动悬浮窗</div>
+          <div class="desc">
+            与主窗口同时启动、同时退出；主窗口最小化或关闭都不影响它。默认<strong>折叠</strong>成一行
+            （标题 + 最新一条），点 ▾ 展开成活动列表；有审批时标题栏出现红色 🔔 标识，点它直接进审批中心。
+            关掉这个开关后悬浮窗隐藏，且下次启动不再自动出现（托盘菜单里也能开关）。
+          </div>
+        </div>
+        <n-switch :value="floatEnabled" @update:value="toggleFloat" />
+      </div>
+      <div class="row">
+        <div class="label">
+          <div>验证提醒通道</div>
+          <div class="desc">
+            「试听系统音」直接播放 OS 提示音（不经过 WebView 音频上下文，可用来排除浏览器自动播放策略）；
+            「发送测试通知」走正式投递路径并把系统的报错带回来。
+            窗口在前台时 macOS 不会给应用显示横幅（没有实现通知 delegate 的应用会被直接丢弃，这是系统规则），
+            所以前台点击会<strong>延迟 5 秒投递</strong>——请在这 5 秒内切到别的应用（或桌面）看右上角
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center">
+          <n-button size="small" @click="playSystemSound">试听系统音</n-button>
+          <n-button size="small" :loading="testingNotify" @click="testNotification">
+            发送测试通知
+          </n-button>
+        </div>
+      </div>
+      <div
+        v-if="notifyTestInfo"
+        class="test-result"
+        :class="notifyTestInfo.ok ? 'ok' : 'bad'"
+        style="margin: 0 0 6px"
+      >
+        {{ notifyTestInfo.ok ? "✓ " : "✗ " }}{{ notifyTestInfo.text }}
       </div>
     </n-card>
 
@@ -485,14 +606,22 @@ async function copy(text: string, label: string) {
       <pre class="pre">{{ mcpInfo?.configJson ?? "（应用启动后生成）" }}</pre>
     </n-card>
 
-    <n-card id="sec-policy" title="AI 高级策略" size="small" style="max-width: 720px; margin-top: 16px">
+    <n-card id="sec-policy" size="small" style="max-width: 720px; margin-top: 16px">
+      <template #header>
+        <div style="display: flex; align-items: center; gap: 8px">
+          AI 高级策略
+          <n-tag v-if="policyDirty" size="tiny" type="warning" :bordered="false">有未保存的改动</n-tag>
+          <n-tag v-else-if="readonly" size="tiny" type="success" :bordered="false">只读模式已生效</n-tag>
+        </div>
+      </template>
       <div class="row">
         <div class="label">
           <div>只读模式</div>
           <div class="desc">
             开启后 AI 的一切写入操作被硬拒绝：文件写入/追加/上传/回滚全拒，
             命令按**子命令**逐段检查，含 rm/cp/ln/chmod/systemctl restart 等写入特征即拒（无审批逃生口）；
-            写到 /dev/null 的重定向不算写入，命令替换（$( )、反引号）在受限模式下直接拒。适合临时排查场景
+            写到 /dev/null 的重定向不算写入，命令替换（$( )、反引号）在受限模式下直接拒。适合临时排查场景。
+            <strong>改动要点本卡片底部的「保存高级策略」才会落库生效</strong>（重启应用后依然保留）
           </div>
         </div>
         <n-switch v-model:value="readonly" />
@@ -520,6 +649,14 @@ async function copy(text: string, label: string) {
           style="width: 240px"
         />
       </div>
+      <template #footer>
+        <div style="display: flex; align-items: center; gap: 10px">
+          <n-button type="primary" :loading="savingRules" @click="saveRules('policy')">
+            保存高级策略
+          </n-button>
+          <span class="hint" style="margin: 0">只读模式 / 速率限制 / 严格分组三项都随这里保存</span>
+        </div>
+      </template>
     </n-card>
 
     <n-card id="sec-review" title="AI 智能审查（实验性）" size="small" style="max-width: 720px; margin-top: 16px">
@@ -684,7 +821,7 @@ async function copy(text: string, label: string) {
         凭据泄露防护（env / printenv / 私钥文件 / .pem / /etc/shadow 等）为内置固定规则，不开放编辑且优先级最高。
       </p>
       <template #footer>
-        <n-button type="primary" :loading="savingRules" @click="saveRules">保存全部规则与策略</n-button>
+        <n-button type="primary" :loading="savingRules" @click="saveRules('rules')">保存安全规则</n-button>
       </template>
     </n-card>
     <n-card id="sec-update" title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
@@ -705,7 +842,8 @@ async function copy(text: string, label: string) {
         启动时也会自动检查；发现新版本会弹窗提示，确认后自动下载安装并重启。更新包经数字签名校验，
         Linux 的 deb/rpm 安装不支持应用内更新（AppImage 支持）。
       </p>
-      <UpdatePrompt ref="updatePromptRef" />
+      <!-- 启动检查由 App.vue 的全局实例负责；这里再自动检查会变成「每次进设置都查一遍」 -->
+      <UpdatePrompt ref="updatePromptRef" :auto-check="false" />
     </n-card>
     </div>
   </div>

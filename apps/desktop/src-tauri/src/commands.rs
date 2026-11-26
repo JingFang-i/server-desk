@@ -281,6 +281,8 @@ pub async fn save_server(
         allow_ai: input.allow_ai,
         created_at,
         updated_at: ts,
+        // 排序位由 store.insert 分配（末尾）；编辑不改变排序
+        sort_order: 0,
     };
 
     if is_new {
@@ -321,6 +323,93 @@ pub async fn delete_server(state: State<'_, Arc<AppState>>, id: String) -> Resul
     };
     ops::audit_named(&state, "user", Some(&id), &name, "delete_server", &detail, "ok");
     Ok(())
+}
+
+// ---------- 列表布局与分组管理 ----------
+
+/// 前端拖拽后提交的一行：服务器 id + 所属分组 + 组内顺序。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutItem {
+    pub id: String,
+    /// 目标分组；None / 空串 = 未分组
+    pub group: Option<String>,
+    pub sort_order: i64,
+}
+
+/// 应用服务器列表的拖拽结果：组内排序 + 跨组移动，一个事务落库。
+///
+/// 前端传全量列表（而不是「移动了哪一行」），后端不再猜拖拽意图；
+/// 分组字段在这里统一 trim / 空串归一为 None，避免出现 `""` 与 NULL 两种未分组。
+#[tauri::command]
+pub fn apply_server_layout(
+    state: State<'_, Arc<AppState>>,
+    items: Vec<LayoutItem>,
+) -> Result<(), String> {
+    if items.len() > 5000 {
+        return Err("布局条目过多".into());
+    }
+    // 按前端给的 sortOrder 排序后再统一编号：既尊重提交顺序，
+    // 又保证落库的一定是 0..n-1 的连续整数（重复/跳号不会污染列表）。
+    let mut items = items;
+    items.sort_by_key(|item| item.sort_order);
+    let mut normalized = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let group = item
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty());
+        normalized.push((item.id, group, index as i64));
+    }
+    let updated = state
+        .store
+        .apply_layout(&normalized)?;
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "apply_server_layout",
+        &format!("调整服务器列表顺序（{updated} 台）"),
+        "ok",
+    );
+    Ok(())
+}
+
+/// 重命名分组：分组是服务器资产上的字符串字段，改名 = 批量更新该组所有服务器。
+/// 新名字与已有分组同名等价于合并分组；返回受影响的服务器台数。
+#[tauri::command]
+pub fn rename_server_group(
+    state: State<'_, Arc<AppState>>,
+    from: String,
+    to: String,
+) -> Result<usize, String> {
+    let from = from.trim().to_string();
+    let to = to.trim().to_string();
+    if from.is_empty() {
+        return Err("原分组名不能为空".into());
+    }
+    if to.is_empty() {
+        return Err("新分组名不能为空".into());
+    }
+    if to.chars().count() > 60 {
+        return Err("分组名过长（最多 60 字）".into());
+    }
+    if from == to {
+        return Ok(0);
+    }
+    let n = state.store.rename_group(&from, &to)?;
+    if n == 0 {
+        return Err(format!("分组「{from}」不存在或已没有服务器"));
+    }
+    ops::audit(
+        &state,
+        "user",
+        None,
+        "rename_server_group",
+        &format!("分组「{from}」重命名为「{to}」（{n} 台）"),
+        "ok",
+    );
+    Ok(n)
 }
 
 // ---------- 连接测试 ----------

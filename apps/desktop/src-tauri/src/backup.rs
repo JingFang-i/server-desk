@@ -40,6 +40,9 @@ struct BackupServer {
     allow_ai: bool,
     created_at: String,
     updated_at: String,
+    /// 分组内排序位置。旧备份文件没有该字段 → 默认 0（保持原来的时间倒序观感）。
+    #[serde(default)]
+    sort_order: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -82,6 +85,7 @@ fn payload_from_store(store: &Store) -> Result<BackupPayload, String> {
             allow_ai: r.allow_ai,
             created_at: r.created_at.clone(),
             updated_at: r.updated_at.clone(),
+            sort_order: r.sort_order,
         })
         .collect();
     Ok(BackupPayload {
@@ -111,6 +115,7 @@ fn rows_from_payload(payload: &BackupPayload) -> Result<Vec<ServerRow>, String> 
                 allow_ai: s.allow_ai,
                 created_at: s.created_at.clone(),
                 updated_at: s.updated_at.clone(),
+                sort_order: s.sort_order,
             })
         })
         .collect()
@@ -326,6 +331,7 @@ mod tests {
             allow_ai: true,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            sort_order: 0,
         }]
     }
 

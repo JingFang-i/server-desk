@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS servers (
     notes       TEXT,
     allow_ai    INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    -- 列表排序（drag & drop）：同一分组内按 sort_order 升序，新建行排到末尾。
+    -- 旧库由 open() 里的增量迁移补列，默认 0（等价于原来的 created_at DESC）。
+    sort_order  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_servers_group ON servers(group_name);
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -77,9 +80,11 @@ pub struct ServerRow {
     pub allow_ai: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// 分组内排序位置（拖拽排序）。旧库迁移后统一为 0，等价于原来的时间倒序。
+    pub sort_order: i64,
 }
 
-const COLS: &str = "id,name,host,port,username,auth_type,secret_blob,group_name,tags,notes,allow_ai,created_at,updated_at";
+const COLS: &str = "id,name,host,port,username,auth_type,secret_blob,group_name,tags,notes,allow_ai,created_at,updated_at,sort_order";
 
 /// 审计分页查询结果：total 供前端渲染分页器。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -124,6 +129,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServerRow> {
         allow_ai: row.get::<_, i64>(10)? != 0,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        sort_order: row.get(13)?,
     })
 }
 
@@ -213,6 +219,28 @@ impl Store {
             }
         }
         retire_legacy_secret_refs(&conn).map_err(|e| format!("迁移旧版凭据引用失败: {e}"))?;
+
+        // 列表排序列（拖拽排序）：旧库补列，已有行统一 0 → 保持原来的时间倒序观感
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(servers)")
+                .map_err(|e| format!("检查服务器表失败: {e}"))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("检查服务器表失败: {e}"))?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|e| format!("检查服务器表失败: {e}"))?;
+            if !cols.iter().any(|c| c == "sort_order") {
+                conn.execute_batch(
+                    "ALTER TABLE servers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(|e| format!("迁移服务器排序列失败: {e}"))?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_servers_sort ON servers(sort_order);",
+            )
+            .map_err(|e| format!("创建排序索引失败: {e}"))?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -224,7 +252,7 @@ impl Store {
 
     pub fn list(&self) -> Result<Vec<ServerRow>, String> {
         let conn = self.lock()?;
-        let sql = format!("SELECT {COLS} FROM servers ORDER BY created_at DESC");
+        let sql = format!("SELECT {COLS} FROM servers ORDER BY sort_order ASC, created_at DESC");
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询失败: {e}"))?;
         let rows = stmt
             .query_map([], map_row)
@@ -244,7 +272,7 @@ impl Store {
 
     pub fn list_by_group(&self, group: &str) -> Result<Vec<ServerRow>, String> {
         let conn = self.lock()?;
-        let sql = format!("SELECT {COLS} FROM servers WHERE lower(trim(group_name)) = lower(trim(?1)) ORDER BY created_at DESC");
+        let sql = format!("SELECT {COLS} FROM servers WHERE lower(trim(group_name)) = lower(trim(?1)) ORDER BY sort_order ASC, created_at DESC");
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询失败: {e}"))?;
         let rows = stmt
             .query_map(params![group], map_row)
@@ -262,11 +290,15 @@ impl Store {
             .map_err(|e| format!("查询失败: {e}"))
     }
 
+    /// 新增服务器：sort_order 取当前最大值 +1（排到列表末尾），
+    /// 让「新增」不会插到用户手工排序的中间。
     pub fn insert(&self, r: &ServerRow) -> Result<(), String> {
         let conn = self.lock()?;
         conn.execute(
             &format!(
-                "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+                "INSERT INTO servers({COLS}) VALUES \
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13, \
+                  (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM servers))"
             ),
             params![
                 r.id,
@@ -335,6 +367,39 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// 应用前端拖拽结果：整表「分组归属 + 组内顺序」一次性落库。
+    ///
+    /// 传全量而不是增量是有意的：拖拽只改变列表长相，一个事务覆盖全部行，
+    /// 不会留下「拖到一半、数据库只写了一半」的中间态。返回真实更新的行数。
+    pub fn apply_layout(&self, items: &[(String, Option<String>, i64)]) -> Result<usize, String> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("开启排序事务失败: {e}"))?;
+        let mut updated = 0usize;
+        for (id, group, order) in items {
+            updated += tx
+                .execute(
+                    "UPDATE servers SET group_name=?2, sort_order=?3 WHERE id=?1",
+                    params![id, group, order],
+                )
+                .map_err(|e| format!("更新排序失败: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("提交排序失败: {e}"))?;
+        Ok(updated)
+    }
+
+    /// 重命名分组：分组只是服务器行上的一个字符串列，改名 = 批量改这一列。
+    /// 新名字与已有分组同名时等价于「合并分组」（返回受影响的服务器台数）。
+    pub fn rename_group(&self, from: &str, to: &str) -> Result<usize, String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE servers SET group_name=?2 WHERE lower(trim(group_name)) = lower(trim(?1))",
+            params![from, to],
+        )
+        .map_err(|e| format!("重命名分组失败: {e}"))
+    }
+
     /// 重置前快照：用 `VACUUM INTO` 生成一致性单文件备份（包含 WAL 中已提交的数据）。
     /// 文件内含密文凭据与保险库元数据，可直接用文件替换方式回滚。
     pub fn snapshot_to(&self, path: &std::path::Path) -> Result<(), String> {
@@ -375,14 +440,16 @@ impl Store {
         for row in rows {
             tx.execute(
                 &format!(
-                    "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+                    "INSERT INTO servers({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
                      ON CONFLICT(id) DO UPDATE SET name=?2, host=?3, port=?4, username=?5, auth_type=?6, \
-                     secret_blob=?7, group_name=?8, tags=?9, notes=?10, allow_ai=?11, updated_at=?13"
+                     secret_blob=?7, group_name=?8, tags=?9, notes=?10, allow_ai=?11, updated_at=?13, \
+                     sort_order=?14"
                 ),
                 params![
                     row.id, row.name, row.host, row.port as i64, row.username, row.auth_type,
                     row.secret_blob, row.group_name, row.tags, row.notes,
                     row.allow_ai && !protected.contains(&row.id), row.created_at, row.updated_at,
+                    row.sort_order,
                 ],
             ).map_err(|e| format!("恢复服务器失败: {e}"))?;
         }
@@ -741,6 +808,7 @@ mod tests {
             username: "test".into(), auth_type: "password".into(), secret_blob: vec![],
             group_name: None, tags: "[]".into(), notes: None, allow_ai: true,
             created_at: "2026-11-25T00:00:00Z".into(), updated_at: "2026-11-25T00:00:00Z".into(),
+            sort_order: 0,
         };
         let rows = [row("remote"), row("local"), row("other")];
         for overwrite in [false, true] {
@@ -749,6 +817,46 @@ mod tests {
             assert!(store.get("local").unwrap().unwrap().allow_ai);
             assert!(store.get("other").unwrap().unwrap().allow_ai);
         }
+    }
+
+    #[test]
+    fn layout_reorder_and_group_rename_round_trip() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mk = |id: &str| ServerRow {
+            id: id.into(), name: id.into(), host: "localhost".into(), port: 22,
+            username: "test".into(), auth_type: "password".into(), secret_blob: vec![],
+            group_name: Some("prod".into()), tags: "[]".into(), notes: None, allow_ai: true,
+            created_at: "2026-11-25T00:00:00Z".into(), updated_at: "2026-11-25T00:00:00Z".into(),
+            sort_order: 0,
+        };
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            let mut row = mk(*id);
+            row.created_at = format!("2026-11-25T00:00:0{i}Z");
+            store.insert(&row).unwrap();
+        }
+        // 新插入的行排在末尾（sort_order = max + 1）
+        let ids = |rows: &[ServerRow]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&store.list().unwrap()), vec!["a", "b", "c"]);
+
+        // 拖拽：c 提到最前、a 归入「生产」、b 落到未分组
+        store
+            .apply_layout(&[
+                ("c".into(), Some("prod".into()), 0),
+                ("a".into(), Some("生产".into()), 1),
+                ("b".into(), None, 2),
+            ])
+            .unwrap();
+        let rows = store.list().unwrap();
+        assert_eq!(ids(&rows), vec!["c", "a", "b"], "组内顺序按 sort_order");
+        assert_eq!(rows[0].group_name.as_deref(), Some("prod"));
+        assert_eq!(rows[1].group_name.as_deref(), Some("生产"));
+        assert_eq!(rows[2].group_name, None, "拖进未分组要清空 group_name");
+
+        // 重命名分组：大小写/首尾空格不敏感，返回受影响台数（只有 c 的分组是 prod）
+        assert_eq!(store.rename_group(" PROD ", "生产").unwrap(), 1);
+        let groups: Vec<Option<String>> = store.list().unwrap().into_iter().map(|r| r.group_name).collect();
+        assert_eq!(groups, vec![Some("生产".into()), Some("生产".into()), None]);
+        assert_eq!(store.rename_group("不存在", "x").unwrap(), 0);
     }
 
     #[test]

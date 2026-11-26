@@ -8,7 +8,9 @@ description = "ServerDesk — 本地服务器管理工具"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon：菜单栏常驻图标（关闭主窗口后靠它回来、真正退出也在这里）
+# tray-icon：菜单栏常驻图标；unstable：`Manager::get_window`（右键菜单要拿 Window 弹原生菜单）
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-notification = { workspace = true }
 tauri-plugin-updater = { workspace = true }

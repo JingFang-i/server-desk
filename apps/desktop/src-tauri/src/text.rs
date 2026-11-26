@@ -15,6 +15,8 @@ pub const COMMAND_DIGEST_MAX: usize = 200;
 pub const APPROVAL_DETAIL_MAX: usize = 2000;
 /// 服务器名称快照上限（字符）。
 pub const SERVER_NAME_MAX: usize = 80;
+/// 实时活动窗口展开显示的调用内容上限（字符）：够看清一条命令，又不会把事件流撑大。
+pub const ACTIVITY_DETAIL_MAX: usize = 400;
 
 /// 按**字符**截断：不会切坏 UTF-8，也不会 panic（区别于 `String::truncate` 的字节语义）。
 pub fn truncate(s: &str, max: usize) -> String {

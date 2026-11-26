@@ -130,21 +130,15 @@ async fn handle_conn(
 
     // 每个 IPC 请求只产生一对活动事件，审计和审批中间状态单独记录。
     let request_id = uuid::Uuid::new_v4().to_string();
-    let server = req.args.get("server")
-        .or_else(|| req.args.get("group"))
-        .and_then(|v| v.as_str())
-        .map(|name| crate::text::summary(&state.guard.sanitize(name), 120))
-        .unwrap_or_default();
-    let _ = state.handle.emit("tool-activity", serde_json::json!({
-        "id": request_id, "phase": "start", "tool": req.tool, "server": server,
-    }));
+    let server = activity_server_label(&state, &req.tool, &req.args);
+    let detail = activity_detail(&state, &req.tool, &req.args);
 
     let resp = match ops::with_session(req.session, handle_tool(&state, &req.tool, req.args)).await {
         Ok(data) => IpcResponse::ok(data),
         Err(e) => IpcResponse::err(e),
     };
     let _ = state.handle.emit("tool-activity", serde_json::json!({
-        "id": request_id, "phase": "done", "tool": req.tool, "server": server,
+        "id": request_id, "phase": "done", "tool": req.tool, "server": server, "detail": detail,
         "ok": activity_succeeded(&req.tool, &resp),
     }));
     let out = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
@@ -155,6 +149,126 @@ async fn handle_conn(
     stream.write_all(http.as_bytes()).await.map_err(|e| e.to_string())?;
     stream.write_all(&out).await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 实时活动窗口里显示的「服务器」标签。
+///
+/// AI 传的 `server` 既可能是服务器 id（UUID）也可能是名称；原样回显会让活动窗口里
+/// 一半显示 UUID、一半显示名字（看起来就像「没显示服务器名」）。这里统一解析：
+/// - 命中资产库（按 id 或名称）→ 回显**服务器名**
+/// - `exec_batch` 按 servers 列表 / group 汇总成人类可读的一行
+/// - 解析不到（服务器已删除等）→ 脱敏后原样回显，不留空
+/// 全程只读资产表、只用于展示，不参与任何安全判定。
+fn activity_server_label(state: &AppState, tool: &str, args: &serde_json::Value) -> String {
+    let clean = |raw: &str| crate::text::summary(&state.guard.sanitize(raw), 120);
+    let resolve = |raw: &str| -> String {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+        match state.store.get(raw) {
+            Ok(Some(row)) => clean(&row.name),
+            _ => match state.store.find_by_name(raw) {
+                Ok(Some(row)) => clean(&row.name),
+                _ => clean(raw),
+            },
+        }
+    };
+    match tool {
+        // 唯一不针对具体服务器的工具：活动窗口显示「全局」
+        "list_servers" => String::new(),
+        "exec_batch" => {
+            let names: Vec<String> = args
+                .get("servers")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(resolve)
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !names.is_empty() {
+                return if names.len() <= 3 {
+                    names.join("、")
+                } else {
+                    format!("{} 等 {} 台", names[..3].join("、"), names.len())
+                };
+            }
+            match args.get("group").and_then(|v| v.as_str()) {
+                Some(group) => clean(&format!("分组「{group}」")),
+                None => String::new(),
+            }
+        }
+        _ => args
+            .get("server")
+            .or_else(|| args.get("group"))
+            .and_then(|v| v.as_str())
+            .map(resolve)
+            .unwrap_or_default(),
+    }
+}
+
+/// 活动记录展开时显示的内容：这条调用**到底做了什么**。
+///
+/// 只看工具名（`exec_command`）等于什么都没说，用户点开记录要的是那条命令/那个路径。
+/// 统一走 `guard.sanitize`（口令、令牌、私钥片段一律 `[REDACTED]`）+ 字符截断，
+/// 事件只发往本机两个 webview，不落盘、不出网。
+fn activity_detail(state: &AppState, tool: &str, args: &serde_json::Value) -> String {
+    use crate::text::{truncate, ACTIVITY_DETAIL_MAX};
+    let clean = |raw: &str| truncate(&state.guard.sanitize(raw), ACTIVITY_DETAIL_MAX);
+    let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    match tool {
+        "list_servers" => "列出全部服务器资产".to_string(),
+        "exec_command" => clean(arg("command")),
+        "exec_batch" => {
+            let targets = args
+                .get("servers")
+                .and_then(|v| v.as_array())
+                .map(|list| list.len())
+                .unwrap_or(0);
+            let group = arg("group");
+            let scope = if !group.is_empty() {
+                format!("分组「{group}」")
+            } else if targets > 0 {
+                format!("{targets} 台")
+            } else {
+                "批量目标".to_string()
+            };
+            clean(&format!("[{scope}] {}", arg("command")))
+        }
+        "server_status" => "固定模板：uptime / CPU / 内存 / 磁盘 / 负载".to_string(),
+        "read_file" | "list_files" => clean(&format!("{}", arg("path"))),
+        "write_file" | "append_file" => clean(&format!(
+            "{}（内容 {} 字符）",
+            arg("path"),
+            arg("content").chars().count()
+        )),
+        "upload_file" => clean(&format!("{} → {}", arg("local_path"), arg("remote_path"))),
+        "download_file" => clean(arg("path")),
+        "restore_file" => clean(&format!("备份回滚 {}", arg("backup_id"))),
+        "list_file_backups" => {
+            let server = arg("server");
+            if server.is_empty() {
+                "列出全部写前备份".to_string()
+            } else {
+                clean(&format!("「{server}」的写前备份"))
+            }
+        }
+        "tail_log" => clean(&format!(
+            "{}（末 {} 行）",
+            arg("path"),
+            args.get("lines").and_then(|v| v.as_u64()).unwrap_or(200)
+        )),
+        "log_search" => clean(&format!("{} 中搜索「{}」", arg("path"), arg("pattern"))),
+        "list_services" => "列出 systemd 服务状态".to_string(),
+        "port_check" => format!(
+            "检查端口 {}",
+            args.get("port").and_then(|v| v.as_u64()).unwrap_or(0)
+        ),
+        other => other.to_string(),
+    }
 }
 
 fn activity_succeeded(tool: &str, resp: &IpcResponse) -> bool {

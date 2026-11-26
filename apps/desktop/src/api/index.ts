@@ -88,6 +88,14 @@ export interface PendingApproval {
   expiresAt: string;
 }
 
+/** 列表拖拽结果的一行：服务器 id + 目标分组 + 组内顺序 */
+export interface LayoutItem {
+  id: string;
+  /** null = 未分组（默认分组） */
+  group: string | null;
+  sortOrder: number;
+}
+
 /** 后端写入的审计动作（字面量）；未列出的值仍可透传（自定义/新增动作） */
 export type AuditAction =
   | "mcp_exec_command"
@@ -114,6 +122,8 @@ export type AuditAction =
   | "sftp_download"
   | "save_server"
   | "delete_server"
+  | "apply_server_layout"
+  | "rename_server_group"
   | "backup_export"
   | "backup_restore"
   | "file_backup_restore"
@@ -124,7 +134,10 @@ export type AuditAction =
   | "ssh_test"
   | "ai_review"
   | "ai_review_save"
-  | "ai_review_test";
+  | "ai_review_test"
+  | "notify_permission"
+  | "notify_test"
+  | "float_window";
 
 export interface AuditPage {
   entries: AuditEntry[];
@@ -294,6 +307,12 @@ export const api = {
   listServers: () => invoke<ListServersResult>("list_servers"),
   saveServer: (input: SaveServerInput) => invoke<ServerConfig>("save_server", { input }),
   deleteServer: (id: string) => invoke<void>("delete_server", { id }),
+  /** 拖拽排序 / 跨组移动：整表提交，后端一个事务落库 */
+  applyServerLayout: (items: LayoutItem[]) =>
+    invoke<void>("apply_server_layout", { items }),
+  /** 重命名分组：批量改该组内所有服务器，返回受影响台数 */
+  renameServerGroup: (from: string, to: string) =>
+    invoke<number>("rename_server_group", { from, to }),
   // 连接测试
   testConnection: (host: string, port: number) =>
     invoke<TestResult>("test_connection", { host, port }),
@@ -322,6 +341,23 @@ export const api = {
   auditSessions: () => invoke<string[]>("audit_sessions"),
   auditFailures: () => invoke<number>("audit_failures"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
+  // 悬浮窗 ↔ 主窗口
+  /** 打开主窗口（悬浮窗调用）；page 可指定落地页，如 "approvals" */
+  showMainWindow: (page?: string) => invoke<void>("show_main_window", { page: page ?? null }),
+  /** 在悬浮窗上弹出原生右键菜单（选项通过 float-menu 事件回到前端） */
+  floatContextMenu: () => invoke<void>("float_context_menu"),
+  /** 悬浮窗开关的持久化状态（默认开启） */
+  getFloatEnabled: () => invoke<boolean>("get_float_enabled"),
+  /** 开关悬浮窗并持久化：关闭后下次启动不再自动出现 */
+  setFloatEnabled: (enabled: boolean) =>
+    invoke<void>("set_float_enabled", { enabled }),
+  // 审批提醒通道（声音 / 系统通知）
+  /** 上报应用内提示音是否已能出声（后端据此决定是否用原生系统音兜底） */
+  alertAudioReady: (ready: boolean) => invoke<void>("alert_audio_ready", { ready }),
+  /** 试听原生系统提示音（不依赖 WebView 音频上下文） */
+  playAlertSound: () => invoke<void>("play_alert_sound"),
+  /** 发送一条测试系统通知，返回投递说明；失败时抛出可直接展示的中文原因 */
+  approvalNotificationTest: () => invoke<string>("approval_notification_test"),
   // AI 智能审查（R8）
   aiReviewInfo: () => invoke<ReviewInfo>("ai_review_info"),
   aiReviewSave: (config: ReviewConfig, apiKey?: string) =>

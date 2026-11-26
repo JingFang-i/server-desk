@@ -8,6 +8,7 @@ mod backup;
 mod commands;
 mod crypto;
 mod fbackups;
+mod float;
 mod guard;
 mod ipc;
 mod notify;
@@ -93,6 +94,18 @@ fn main() {
             // 审批到达提醒：注册通知点击回调（点击系统通知 → 唤起主窗口）
             notify::init(app.handle());
 
+            // 关闭主窗口 = 收起来，不退出：悬浮窗和托盘还在，随时能再打开。
+            // 真正退出只有托盘「退出 ServerDesk」（或 Cmd+Q）。
+            if let Some(main) = app.get_webview_window("main") {
+                let win = main.clone();
+                main.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
+            }
+
             // 原生应用菜单：mac/win 菜单里提供「检查更新」「锁定保险库」入口，
             // 触发后以事件形式转给前端（复用 UpdatePrompt 的检查与锁屏流程）
             let check_item = MenuItem::with_id(
@@ -133,6 +146,11 @@ fn main() {
                 let _ = match event.id().as_ref() {
                     "menu-check-update" => handle.emit("menu-check-update", ()),
                     "menu-lock-vault" => handle.emit("menu-lock-vault", ()),
+                    // 悬浮窗右键菜单：选项转给前端处理。
+                    // 与 float.rs 里的窗口级监听同时保留——弹出式菜单的事件按窗口分发，
+                    // 两条路径都接一遍，动作本身幂等，重复触发无副作用。
+                    "float-open-main" => handle.emit("float-menu", "open-main"),
+                    "float-hide" => handle.emit("float-menu", "hide"),
                     _ => Ok(()),
                 };
             });
@@ -235,6 +253,69 @@ fn main() {
             });
             app.manage(state.clone());
 
+            // AI 实时活动悬浮窗：与主窗口同生共死的对等窗口，启动即常驻显示。
+            // 必须放在 manage 之后：创建结果要写审计（`try_state` 才能拿到 AppState），
+            // 而 stderr 在打包版里是看不见的——建没建出来只能靠这条记录区分。
+            let float_result = float::create(app.handle());
+            {
+                let (detail, outcome) = match &float_result {
+                    Ok(_) => ("AI 实时活动悬浮窗创建成功".to_string(), "ok"),
+                    Err(e) => (format!("AI 实时活动悬浮窗创建失败：{e}"), "failed"),
+                };
+                ops::audit(&state, "user", None, "float_window", &detail, outcome);
+            }
+            match float_result {
+                Ok(_) => {
+                    // 开关持久化：用户关掉悬浮窗后，下次启动不再自动出现
+                    if float::enabled(&state.store) {
+                        float::show_on_start(app.handle().clone());
+                    }
+                }
+                Err(e) => eprintln!("悬浮窗创建失败（将看不到实时活动）: {e}"),
+            }
+
+            // 菜单栏常驻图标：主窗口关掉之后靠它回来；真正退出也在这里。
+            match app.default_window_icon().cloned() {
+                Some(icon) => {
+                    let tray_menu = MenuBuilder::new(app)
+                        .text("tray-open-main", "打开主界面")
+                        .separator()
+                        .text("tray-show-float", "显示 AI 活动悬浮窗")
+                        .text("tray-hide-float", "隐藏 AI 活动悬浮窗")
+                        .separator()
+                        .text("tray-quit", "退出 ServerDesk")
+                        .build()?;
+                    if let Err(e) = tauri::tray::TrayIconBuilder::new()
+                        .icon(icon)
+                        .menu(&tray_menu)
+                        .show_menu_on_left_click(true)
+                        .on_menu_event(|app, event| match event.id().as_ref() {
+                            "tray-open-main" => {
+                                if let Err(e) = float::show_main_window(app.clone(), None) {
+                                    eprintln!("托盘唤起主窗口失败: {e}");
+                                }
+                            }
+                            "tray-show-float" => {
+                                if let Err(e) = float::set_enabled(app, true) {
+                                    eprintln!("托盘显示悬浮窗失败: {e}");
+                                }
+                            }
+                            "tray-hide-float" => {
+                                if let Err(e) = float::set_enabled(app, false) {
+                                    eprintln!("托盘隐藏悬浮窗失败: {e}");
+                                }
+                            }
+                            "tray-quit" => app.exit(0),
+                            _ => {}
+                        })
+                        .build(app)
+                    {
+                        eprintln!("托盘图标创建失败（关闭主窗口后将无法从菜单栏唤起）: {e}");
+                    }
+                }
+                None => eprintln!("没有可用的应用图标，托盘不可用"),
+            }
+
             // 本地 IPC（MCP sidecar 桥）：token 文件 0600，端口随机
             let state_for_ipc = state.clone();
             let dir_for_ipc = dir.clone();
@@ -257,6 +338,9 @@ fn main() {
             commands::list_servers,
             commands::save_server,
             commands::delete_server,
+            // 列表拖拽排序 / 分组重命名
+            commands::apply_server_layout,
+            commands::rename_server_group,
             // 连接测试
             commands::test_connection,
             commands::ssh_test,
@@ -276,8 +360,18 @@ fn main() {
             commands::ai_review_save,
             commands::ai_review_test,
             commands::ai_review_recent,
+            // 悬浮窗 ↔ 主窗口
+            float::show_main_window,
+            float::show_float_window,
+            float::hide_float_window,
+            float::float_context_menu,
+            float::get_float_enabled,
+            float::set_float_enabled,
             // 审批
             notify::approval_notification_permission,
+            notify::approval_notification_test,
+            notify::alert_audio_ready,
+            notify::play_alert_sound,
             commands::approvals_pending,
             commands::approval_decide,
             // 审计
