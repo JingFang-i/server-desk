@@ -74,7 +74,7 @@ async fn observe_exec(
         return Err(format!("已拦截：{reason}"));
     }
     // 严格分组：只读命令同样需要人工审批（设置页承诺「包括只读命令」）
-    if state.guard.is_strict_group(cfg.group.as_deref()) {
+    if state.guard.server_requires_approval(&state.store, &cfg.id)? {
         crate::ops::request_approval(state, cfg, command, "observe").await?;
     }
     let res = state

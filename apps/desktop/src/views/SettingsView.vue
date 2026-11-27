@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   NButton,
   NCard,
@@ -92,6 +93,7 @@ async function requestPerm() {
 
 // AI 实时活动悬浮窗：持久化开关（关掉后下次启动不再自动出现）
 const floatEnabled = ref(true);
+let unlistenFloat: UnlistenFn | undefined;
 
 async function loadFloatEnabled() {
   try {
@@ -302,15 +304,19 @@ const modeOptions = [
 ];
 
 /** 把后端返回的真实规则写回表单（保存后也走这里，界面不会再显示「假状态」） */
-function applyGuardInfo(info: GuardInfo) {
+function applyGuardInfo(info: GuardInfo, scope?: "rules" | "policy") {
   guard.value = info;
-  denyText.value = info.deny.join("\n");
-  approvalText.value = info.approval.join("\n");
-  whitelistMode.value = info.whitelistMode;
-  whitelistText.value = info.whitelist.join("\n");
-  readonly.value = info.readonly;
-  ratePerMin.value = info.ratePerMin;
-  strictGroups.value = [...info.strictGroups];
+  if (scope !== "policy") {
+    denyText.value = info.deny.join("\n");
+    approvalText.value = info.approval.join("\n");
+    whitelistMode.value = info.whitelistMode;
+    whitelistText.value = info.whitelist.join("\n");
+  }
+  if (scope !== "rules") {
+    readonly.value = info.readonly;
+    ratePerMin.value = info.ratePerMin;
+    strictGroups.value = [...info.strictGroups];
+  }
 }
 
 async function loadGuard() {
@@ -336,6 +342,14 @@ onMounted(async () => {
   loadReview();
   loadAlertStatus();
   loadFloatEnabled();
+  // 悬浮窗自己隐藏（✕ / 右键菜单）时，这里的开关要跟着变
+  unlistenFloat = await listen<boolean>("float-enabled", (event) => {
+    floatEnabled.value = event.payload;
+  });
+});
+
+onUnmounted(() => {
+  unlistenFloat?.();
 });
 
 // IntersectionObserver 挂在 DOM 就绪后（卡片 id 存在于模板）
@@ -384,7 +398,8 @@ function parseLines(text: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-async function saveRules(scope: "rules" | "policy" = "rules") {
+async function saveRules(scope: "rules" | "policy") {
+  if (!guard.value || savingRules.value) return;
   savingRules.value = true;
   try {
     const rules: GuardRules = {
@@ -396,8 +411,8 @@ async function saveRules(scope: "rules" | "policy" = "rules") {
       ratePerMin: Math.max(0, Math.round(ratePerMin.value || 0)),
       strictGroups: strictGroups.value,
     };
-    // 用后端返回值回填：保存失败时界面不会假装已生效
-    applyGuardInfo(await api.guardSetRules(rules));
+    // 仅回填本次保存的卡片，保留另一张卡片的草稿。
+    applyGuardInfo(await api.guardSetRules(rules, scope), scope);
     message.success(
       scope === "policy"
         ? `高级策略已保存${readonly.value ? "（只读模式已立即生效）" : ""}`
@@ -549,8 +564,7 @@ async function copy(text: string, label: string) {
         <div class="label">
           <div>AI 实时活动悬浮窗</div>
           <div class="desc">
-            与主窗口同时启动、同时退出；主窗口最小化或关闭都不影响它。默认<strong>折叠</strong>成一行
-            （标题 + 最新一条），点 ▾ 展开成活动列表；有审批时标题栏出现红色 🔔 标识，点它直接进审批中心。
+            主窗口最小化或关闭后，悬浮窗继续显示最新活动。点悬浮窗左上角的时钟图标查看近期调用的命令和路径，点红色审批角标进入审批中心。
             关掉这个开关后悬浮窗隐藏，且下次启动不再自动出现（托盘菜单里也能开关）。
           </div>
         </div>
@@ -651,7 +665,7 @@ async function copy(text: string, label: string) {
       </div>
       <template #footer>
         <div style="display: flex; align-items: center; gap: 10px">
-          <n-button type="primary" :loading="savingRules" @click="saveRules('policy')">
+          <n-button type="primary" :loading="savingRules" :disabled="!guard" @click="saveRules('policy')">
             保存高级策略
           </n-button>
           <span class="hint" style="margin: 0">只读模式 / 速率限制 / 严格分组三项都随这里保存</span>
@@ -821,7 +835,9 @@ async function copy(text: string, label: string) {
         凭据泄露防护（env / printenv / 私钥文件 / .pem / /etc/shadow 等）为内置固定规则，不开放编辑且优先级最高。
       </p>
       <template #footer>
-        <n-button type="primary" :loading="savingRules" @click="saveRules('rules')">保存安全规则</n-button>
+        <n-button type="primary" :loading="savingRules" :disabled="!guard" @click="saveRules('rules')">
+          保存安全规则
+        </n-button>
       </template>
     </n-card>
     <n-card id="sec-update" title="应用更新" size="small" style="max-width: 720px; margin-top: 16px">
@@ -839,7 +855,8 @@ async function copy(text: string, label: string) {
         </n-button>
       </div>
       <p class="hint" style="margin: 8px 0 0">
-        启动时也会自动检查；发现新版本会弹窗提示，确认后自动下载安装并重启。更新包经数字签名校验，
+        启动时和之后每 6 小时会自动检查一次（「下次再说」后同一版本 24 小时内不再弹）；
+        发现新版本会弹窗提示，确认后自动下载安装并重启。更新包经数字签名校验，
         Linux 的 deb/rpm 安装不支持应用内更新（AppImage 支持）。
       </p>
       <!-- 启动检查由 App.vue 的全局实例负责；这里再自动检查会变成「每次进设置都查一遍」 -->

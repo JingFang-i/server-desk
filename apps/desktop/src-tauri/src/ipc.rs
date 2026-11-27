@@ -128,19 +128,35 @@ async fn handle_conn(
     let req: IpcRequest =
         serde_json::from_slice(&body).map_err(|e| format!("请求体解析失败: {e}"))?;
 
-    // 每个 IPC 请求只产生一对活动事件，审计和审批中间状态单独记录。
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let server = activity_server_label(&state, &req.tool, &req.args);
-    let detail = activity_detail(&state, &req.tool, &req.args);
-
-    let resp = match ops::with_session(req.session, handle_tool(&state, &req.tool, req.args)).await {
-        Ok(data) => IpcResponse::ok(data),
-        Err(e) => IpcResponse::err(e),
-    };
-    let _ = state.handle.emit("tool-activity", serde_json::json!({
-        "id": request_id, "phase": "done", "tool": req.tool, "server": server, "detail": detail,
-        "ok": activity_succeeded(&req.tool, &resp),
-    }));
+    let resp = ops::with_session(req.session, async {
+        let gate = check_tool_access(&state, &req.tool);
+        // 被入口拒绝的调用只保留状态，避免查询资产或广播原始参数。
+        let (server, detail) = if gate.is_ok() {
+            (
+                activity_server_label(&state, &req.tool, &req.args),
+                activity_detail(&state, &req.tool, &req.args),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let tool = crate::text::summary(&state.guard.sanitize(&req.tool), 64);
+        let _ = state.handle.emit("tool-activity", serde_json::json!({
+            "id": request_id, "phase": "start", "tool": tool, "server": server, "detail": detail,
+        }));
+        let resp = match gate {
+            Ok(()) => match handle_tool(&state, &req.tool, req.args).await {
+                Ok(data) => IpcResponse::ok(data),
+                Err(e) => IpcResponse::err(e),
+            },
+            Err(e) => IpcResponse::err(e),
+        };
+        let _ = state.handle.emit("tool-activity", serde_json::json!({
+            "id": request_id, "phase": "done", "tool": tool, "server": server, "detail": detail,
+            "ok": activity_succeeded(&req.tool, &resp),
+        }));
+        resp
+    }).await;
     let out = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
     let http = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -178,23 +194,12 @@ fn activity_server_label(state: &AppState, tool: &str, args: &serde_json::Value)
         // 唯一不针对具体服务器的工具：活动窗口显示「全局」
         "list_servers" => String::new(),
         "exec_batch" => {
-            let names: Vec<String> = args
+            if let Some(label) = args
                 .get("servers")
                 .and_then(|v| v.as_array())
-                .map(|list| {
-                    list.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(resolve)
-                        .filter(|name| !name.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !names.is_empty() {
-                return if names.len() <= 3 {
-                    names.join("、")
-                } else {
-                    format!("{} 等 {} 台", names[..3].join("、"), names.len())
-                };
+                .and_then(|list| batch_activity_label(list, resolve))
+            {
+                return label;
             }
             match args.get("group").and_then(|v| v.as_str()) {
                 Some(group) => clean(&format!("分组「{group}」")),
@@ -208,6 +213,31 @@ fn activity_server_label(state: &AppState, tool: &str, args: &serde_json::Value)
             .map(resolve)
             .unwrap_or_default(),
     }
+}
+
+fn batch_activity_label(
+    list: &[serde_json::Value],
+    resolve: impl FnMut(&str) -> String,
+) -> Option<String> {
+    let targets = list.iter().filter_map(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+    let count = targets.clone().count();
+    if count == 0 {
+        return None;
+    }
+    let names = targets.take(3).map(resolve).collect::<Vec<_>>().join("、");
+    Some(if count <= 3 { names } else { format!("{names} 等 {count} 台") })
+}
+
+#[test]
+fn batch_activity_resolves_only_displayed_targets() {
+    let input = serde_json::json!(["a", " ", 1, "b", "c", "d", "e"]);
+    let mut resolved = Vec::new();
+    let label = batch_activity_label(input.as_array().unwrap(), |name| {
+        resolved.push(name.to_string());
+        name.to_uppercase()
+    });
+    assert_eq!(resolved, ["a", "b", "c"]);
+    assert_eq!(label.as_deref(), Some("A、B、C 等 5 台"));
 }
 
 /// 活动记录展开时显示的内容：这条调用**到底做了什么**。
@@ -267,7 +297,7 @@ fn activity_detail(state: &AppState, tool: &str, args: &serde_json::Value) -> St
             "检查端口 {}",
             args.get("port").and_then(|v| v.as_u64()).unwrap_or(0)
         ),
-        other => other.to_string(),
+        other => clean(other),
     }
 }
 
@@ -304,12 +334,7 @@ fn tool_arg<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, Strin
         .ok_or_else(|| format!("缺少参数 {key}"))
 }
 
-/// MCP 工具实现：全部经主应用安全管线（guard + 审批 + 审计 + 脱敏）。
-async fn handle_tool(
-    state: &Arc<AppState>,
-    tool: &str,
-    args: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+fn check_tool_access(state: &AppState, tool: &str) -> Result<(), String> {
     if !state.guard.ai_enabled() {
         return Err("MCP 工具已被禁用：请在应用「设置」中开启 AI 接入".into());
     }
@@ -323,7 +348,15 @@ async fn handle_tool(
     if !state.vault.is_unlocked() {
         return Err("保险库已锁定：请在应用中解锁后再使用 MCP 工具".into());
     }
+    Ok(())
+}
 
+/// 已通过入口检查；各操作继续走自己的审批、审计与脱敏管线。
+async fn handle_tool(
+    state: &Arc<AppState>,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     match tool {
         "list_servers" => {
             let rows = state.store.list()?;

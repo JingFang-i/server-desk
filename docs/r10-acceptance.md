@@ -100,6 +100,7 @@ $ defaults read com.apple.ncprefs | grep -c serverdesk
   不落审计就只能靠猜。
 - 「发送测试通知」通过 `addNotificationRequest` 的**完成回调**回读 `NSError`，
   系统拒绝时把原文提示出来。
+- 正式审批通知也等待同一投递回调。后台投递失败且 Web Audio 不可用时，播放原生提示音。
 - **前台不弹横幅是 macOS 的规则**：没有实现 `UNUserNotificationCenterDelegate` 的应用，
   前台到达的通知会被系统直接丢弃（不是故障、也查不到错误）。因此测试通知在窗口前台时
   **延迟 5 秒**（`UNTimeIntervalNotificationTrigger`），让用户有时间切到别的应用；
@@ -131,6 +132,7 @@ notify_test | ok | auth=granted focused=true channel=native delay=Some(5.0) acce
   空格不敏感）+ 命令 `rename_server_group`，写审计（`rename_server_group`）。
 - 前端：选中分组后在详情面板点「重命名分组」；与已有分组同名等价于合并分组
   （提示受影响台数）。「默认分组」（未分组）不可改名。
+- 严格分组改名时，资产分组和审批规则在同一事务里迁移。严格分组合并到普通分组后，合并后的分组要求审批。
 
 ### 8. 实时活动窗口：收起时显示最新一条 + 炫彩流光边框
 
@@ -170,7 +172,7 @@ notify_test | ok | auth=granted focused=true channel=native delay=Some(5.0) acce
     同时车尾出现速度线、车身带一圈蓝色辉光；移出即恢复。纯 CSS，无 JS 定时器
   - 左键点它 → 打开主界面；右键 → 原生菜单（打开主界面 / 隐藏整个悬浮窗）
   - 右上角红色数字角标 = 待审批数，点它直接进审批中心
-  - 曾试过「点击从下方展开两条活动的小窗」，已按需求取消，窗口高度恒定
+  - 点击「活动记录」可在固定尺寸的悬浮窗内查看近期记录和展开详情，按 Esc 返回鹈鹕画面。
 - 右键菜单走原生 `Menu::popup`（需要 enable `tauri` 的 `unstable` feature 才能 `Manager::get_window`
   取到 `Window`），选项通过 `float-menu` 事件回到前端处理（前端掌握形态与持久化状态）。
 - **持久化开关**：`meta.float_window_enabled`（缺省开启）。关掉后悬浮窗隐藏、下次启动不再
@@ -233,7 +235,9 @@ python3 apps/desktop/scripts/check_vue_imports.py   # OK
 | 9 | 只读开启时让 AI 执行 `touch /tmp/x` / `write_file` | 被硬拒并写审计（`blocked:readonly`） |
 | 10 | 拖动服务器到同组另一台之前 | 松手即换位；重启应用后顺序保持 |
 | 11 | 拖动服务器到另一个分组行上 | 归入该分组末尾；重启后仍在 |
-| 12 | 分组详情页「重命名分组」 | 组内所有服务器改名；审计里有 `rename_server_group` |
+| 12 | 重命名严格分组，或将它合并到普通分组 | 严格审批规则跟随改名并持久化；审计里有 `rename_server_group` |
+| 13 | 等待一条 AI 调用完成，期间打开悬浮窗的「活动记录」 | 同一条记录从「执行中」更新为最终状态，点击可展开脱敏详情 |
+| 14 | 修改两张安全设置卡片，只保存其中一张 | 仅保存该卡片的字段，另一张卡片保留草稿 |
 
 ## 四、涉及文件
 

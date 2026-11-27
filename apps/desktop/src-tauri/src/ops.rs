@@ -286,7 +286,7 @@ pub async fn run_fixed_template(
         }
         Decision::NeedsApproval(_) | Decision::Allow => {}
     }
-    if state.guard.is_strict_group(cfg.group.as_deref()) {
+    if state.guard.server_requires_approval(&state.store, &cfg.id)? {
         wait_file_approval(state, &cfg, command).await?;
     }
     let res = state
@@ -333,25 +333,25 @@ pub async fn run_fixed_template(
     }
 }
 
-fn command_policy(guard: &crate::guard::Guard, command: &str, group: Option<&str>) -> Decision {
-    match guard.evaluate(command) {
-        Decision::Allow if guard.is_strict_group(group) => {
+fn command_policy(state: &AppState, command: &str, server_id: &str) -> Result<Decision, String> {
+    Ok(match state.guard.evaluate(command) {
+        Decision::Allow if state.guard.server_requires_approval(&state.store, server_id)? => {
             Decision::NeedsApproval("严格分组要求人工审批".into())
         }
         decision => decision,
-    }
+    })
 }
 
 fn validate_ai_dispatch(
     state: &AppState,
     command: &str,
-    group: Option<&str>,
+    server_id: &str,
     approved: bool,
 ) -> Result<(), String> {
     if !state.guard.ai_enabled() || !state.vault.is_unlocked() {
         return Err("AI 接入已关闭或保险库已锁定，命令未执行".into());
     }
-    match command_policy(&state.guard, command, group) {
+    match command_policy(state, command, server_id)? {
         Decision::Blocked(_) => Err("当前安全规则已阻止该命令".into()),
         Decision::NeedsApproval(_) if !approved => Err("当前安全规则要求审批，请重新提交".into()),
         _ => Ok(()),
@@ -376,7 +376,7 @@ pub async fn run_command(
     // ---- AI 专属安全管线 ----
     if source == "ai" {
         ai_gate(state, &cfg, shared::action::MCP_EXEC_COMMAND, &command)?;
-        let decision = command_policy(&state.guard, &command, cfg.group.as_deref());
+        let decision = command_policy(state, &command, &cfg.id)?;
         // R8.2/R8.4：AI 审查层——只能收紧判定（静态 Blocked 不送审）；ai_note 附到审批卡
         let (outcome, pending) = review_command(
             state,
@@ -436,7 +436,7 @@ pub async fn run_command(
         {
             return Err("服务器配置已变化，请重新提交".into());
         }
-        if let Err(reason) = validate_ai_dispatch(state, &command, current.group.as_deref(), approved) {
+        if let Err(reason) = validate_ai_dispatch(state, &command, &current.id, approved) {
             audit(state, "ai", Some(&current.id), shared::action::MCP_EXEC_COMMAND, &command, "blocked:policy_changed");
             return Err(reason);
         }
@@ -1124,14 +1124,13 @@ pub async fn exec_batch(
 
         // 命令安全判定一次（泄露防护/黑名单/审批）；严格分组目标存在则整批强制审批
         let mut decision = state.guard.evaluate(&command);
-        if matches!(decision, Decision::Allow)
-            && rows
-                .iter()
-                .any(|r| r.allow_ai && state.guard.is_strict_group(r.group_name.as_deref()))
-        {
-            decision = Decision::NeedsApproval(
-                "批量目标包含严格分组服务器：整批需人工审批".to_string(),
-            );
+        if matches!(decision, Decision::Allow) {
+            for row in rows.iter().filter(|row| row.allow_ai) {
+                if state.guard.server_requires_approval(&state.store, &row.id)? {
+                    decision = Decision::NeedsApproval("批量目标包含严格分组服务器：整批需人工审批".into());
+                    break;
+                }
+            }
         }
         // R8.2/R8.4：AI 审查层——整批一条命令只审一次；目标规模仅在 send_server_context 开启时送出
         let (outcome, pending) = review_command(
@@ -1213,7 +1212,7 @@ pub async fn exec_batch(
                 {
                     return Err("服务器配置已变化，请重新提交".into());
                 }
-                validate_ai_dispatch(&st, &cmd, row.group_name.as_deref(), approved)?;
+                validate_ai_dispatch(&st, &cmd, &row.id, approved)?;
                 Ok(row)
             });
             let current = match current {

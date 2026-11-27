@@ -2,7 +2,7 @@
 //! 凭据泄露防护（固定正则）、输出与审计脱敏。仅作用于 AI 来源的操作；
 //! 用户手动操作不受拦截，但审计 detail 一律脱敏。
 
-use crate::store::Store;
+use crate::store::{group_matches, Store};
 use regex::Regex;
 use serde::Serialize;
 use std::sync::{Arc, Mutex, RwLock};
@@ -38,6 +38,15 @@ pub struct GuardRules {
     /// 严格分组：这些分组的服务器上，AI 的一切 exec 都需审批
     #[serde(alias = "strict_groups")]
     pub strict_groups: Vec<String>,
+}
+
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GuardRuleScope {
+    #[default]
+    All,
+    Rules,
+    Policy,
 }
 
 impl Default for GuardRules {
@@ -487,33 +496,65 @@ impl Guard {
         self.read().rules.rate_per_min
     }
 
-    /// 服务器分组是否命中严格分组（需全部审批）。
-    pub fn is_strict_group(&self, group: Option<&str>) -> bool {
+    /// 按当前资产分组判定。持锁读取分组，避免改名时拿旧分组匹配新策略。
+    pub fn server_requires_approval(&self, store: &Store, id: &str) -> Result<bool, String> {
         let g = self.read();
-        match group.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            Some(gname) => g
+        if g.rules.strict_groups.is_empty() {
+            return Ok(false);
+        }
+        Ok(store.server_group(id)?.is_some_and(|name| {
+            !name.trim().is_empty() && g
                 .rules
                 .strict_groups
                 .iter()
-                .any(|s| s.trim().eq_ignore_ascii_case(gname)),
-            None => false,
-        }
+                .any(|group| group_matches(&name, group))
+        }))
     }
 
     pub fn ai_enabled(&self) -> bool {
         self.read().ai_enabled
     }
 
-    /// 保存用户规则（覆盖式，含默认值回填：UI 编辑时先展示完整列表）。
-    pub fn set_rules(&self, store: &Store, rules: GuardRules) -> Result<(), String> {
-        {
-            let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
-            g.rules = rules.clone();
+    /// 保存指定卡片的字段。使用当前规则补齐未提交的字段，避免旧表单覆盖新策略。
+    pub fn set_rules(&self, store: &Store, rules: GuardRules, scope: GuardRuleScope) -> Result<(), String> {
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let mut next = g.rules.clone();
+        match scope {
+            GuardRuleScope::All => next = rules,
+            GuardRuleScope::Rules => {
+                next.deny = rules.deny;
+                next.approval = rules.approval;
+                next.whitelist_mode = rules.whitelist_mode;
+                next.whitelist = rules.whitelist;
+            }
+            GuardRuleScope::Policy => {
+                next.readonly = rules.readonly;
+                next.rate_per_min = rules.rate_per_min;
+                next.strict_groups = rules.strict_groups;
+            }
         }
         store.set_meta(
             META_GUARD_CONFIG,
-            &serde_json::to_string(&rules).map_err(|e| e.to_string())?,
-        )
+            &serde_json::to_string(&next).map_err(|e| e.to_string())?,
+        )?;
+        g.rules = next;
+        Ok(())
+    }
+
+    pub fn rename_group(&self, store: &Store, from: &str, to: &str) -> Result<usize, String> {
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if !g.rules.strict_groups.iter().any(|name| group_matches(name, from)) {
+            return store.rename_group(from, to, &[]);
+        }
+        let mut next = g.rules.clone();
+        next.strict_groups.retain(|name| !group_matches(name, from) && !group_matches(name, to));
+        next.strict_groups.push(to.to_string());
+        let json = serde_json::to_string(&next).map_err(|e| e.to_string())?;
+        let updated = store.rename_group(from, to, &[(META_GUARD_CONFIG, &json)])?;
+        if updated > 0 {
+            g.rules = next;
+        }
+        Ok(updated)
     }
 
     pub fn set_ai_enabled(&self, store: &Store, enabled: bool) -> Result<(), String> {
@@ -1072,15 +1113,45 @@ mod r4_tests {
     }
 
     #[test]
-    fn strict_group_match_case_insensitive() {
-        let mut r = GuardRules::default();
-        r.strict_groups = vec!["prod".into()];
-        let g = guard_with(r);
-        assert!(g.is_strict_group(Some("prod")));
-        assert!(g.is_strict_group(Some("Prod")));
-        assert!(g.is_strict_group(Some(" PROD ")));
-        assert!(!g.is_strict_group(Some("dev")));
-        assert!(!g.is_strict_group(None));
+    fn strict_group_rename_preserves_policy_after_reload() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        for (id, name) in [("a", "\tPrOd "), ("b", "生产"), ("c", "dev")] {
+            store.insert(&crate::store::ServerRow {
+                id: id.into(), name: id.into(), host: "localhost".into(), port: 22,
+                username: "test".into(), auth_type: "password".into(), secret_blob: vec![],
+                group_name: Some(name.into()), tags: "[]".into(), notes: None, allow_ai: true,
+                created_at: String::new(), updated_at: String::new(), sort_order: 0,
+            }).unwrap();
+        }
+        let guard = Guard::load(&store);
+        let rules = GuardRules { strict_groups: vec!["prod".into()], ..GuardRules::default() };
+        guard.set_rules(&store, rules, GuardRuleScope::All).unwrap();
+        assert!(guard.server_requires_approval(&store, "a").unwrap());
+        assert!(!guard.server_requires_approval(&store, "b").unwrap());
+        assert_eq!(guard.rename_group(&store, " PROD ", "生产").unwrap(), 1);
+        for guard in [guard, Guard::load(&store)] {
+            assert_eq!(guard.info().strict_groups, vec!["生产"]);
+            assert_eq!(store.server_group("a").unwrap().as_deref(), Some("生产"));
+            assert!(guard.server_requires_approval(&store, "a").unwrap());
+            assert!(guard.server_requires_approval(&store, "b").unwrap());
+            assert!(!guard.server_requires_approval(&store, "c").unwrap());
+        }
+    }
+
+    #[test]
+    fn saving_one_card_preserves_the_other_cards_rules() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let guard = Guard::load(&store);
+        let rules = GuardRules { deny: vec!["第一条".into()], readonly: true, ..GuardRules::default() };
+        guard.set_rules(&store, rules.clone(), GuardRuleScope::Policy).unwrap();
+        assert!(guard.info().readonly);
+        assert_ne!(guard.info().deny, rules.deny);
+
+        let rules = GuardRules { readonly: false, ..rules };
+        guard.set_rules(&store, rules, GuardRuleScope::Rules).unwrap();
+        let saved = Guard::load(&store).info();
+        assert!(saved.readonly);
+        assert_eq!(saved.deny, vec!["第一条"]);
     }
 
     #[test]

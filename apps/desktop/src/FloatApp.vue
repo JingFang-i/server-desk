@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api } from "./api";
 import { useActivityStore, type ActivityItem } from "./stores/activity";
@@ -15,6 +15,15 @@ import { useActivityStore, type ActivityItem } from "./stores/activity";
  * - 右上角红色数字角标 = 待审批数，点它直接进审批中心
  */
 const activity = useActivityStore();
+const historyOpen = ref(false);
+const historyButton = ref<HTMLButtonElement | null>(null);
+const backButton = ref<HTMLButtonElement | null>(null);
+
+async function toggleHistory() {
+  historyOpen.value = !historyOpen.value;
+  await nextTick();
+  (historyOpen.value ? backButton.value : historyButton.value)?.focus();
+}
 
 const approvals = ref(0);
 let unlisten: UnlistenFn | undefined;
@@ -73,6 +82,9 @@ onMounted(async () => {
         case "hide":
           hideFloat();
           break;
+        case "history":
+          if (!historyOpen.value) void toggleHistory();
+          break;
       }
     });
   } catch {
@@ -90,10 +102,38 @@ onUnmounted(() => {
 
 <template>
   <div class="float-root" :class="{ 'is-running': activity.runningCount > 0 }" @contextmenu.prevent>
+    <section
+      v-if="historyOpen"
+      class="history"
+      aria-label="近期 AI 活动"
+      @keydown.esc.stop="toggleHistory"
+      @contextmenu.prevent.stop="openMenu"
+    >
+      <header>
+        <button ref="backButton" type="button" class="history-button" @click="toggleHistory">‹ 返回</button>
+        <button v-if="approvals > 0" type="button" class="history-button" @click="openApprovals">
+          {{ approvals }} 条待审批
+        </button>
+      </header>
+      <div class="history-list">
+        <p v-if="!activity.entries.length" class="history-empty">暂无 AI 调用</p>
+        <details v-for="item in activity.entries" :key="item.id">
+          <summary>
+            <span class="history-name" :title="`${item.server || '全局'} · ${item.tool}`">
+              {{ item.server || "全局" }} · {{ item.tool }}
+            </span>
+            <span class="history-state">{{ item.running ? "执行中" : item.ok ? "完成" : "失败／拦截" }}</span>
+          </summary>
+          <pre v-if="item.detail" tabindex="0">{{ item.detail }}</pre>
+          <p v-else class="history-empty">无调用详情</p>
+        </details>
+      </div>
+    </section>
     <div
+      v-else
       class="rider"
-      title="左键打开主界面 · 右键菜单"
-      @click="openApp"
+      title="拖动可移动位置 · 右键菜单"
+      data-tauri-drag-region
       @contextmenu.prevent.stop="openMenu"
     >
       <!-- 悬停时出现在车尾的速度线（纯 CSS，鼠标移出即淡出） -->
@@ -194,6 +234,71 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
+.history {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #171c27;
+  border: 1px solid #394357;
+  border-radius: 8px;
+  font-size: 11px;
+}
+.history header {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 4px;
+  border-bottom: 1px solid #394357;
+}
+.history-button {
+  border: 0;
+  border-radius: 4px;
+  padding: 2px 5px;
+  background: #222938;
+  color: #f1f3f9;
+  font: inherit;
+  cursor: pointer;
+}
+.history-open {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  left: 0;
+  font-size: 11px;
+}
+.history-list {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.history-list summary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-bottom: 1px solid #293244;
+  cursor: pointer;
+}
+.history-list summary::before { content: "▸"; }
+.history-list summary::-webkit-details-marker { display: none; }
+.history-list details[open] > summary::before { content: "▾"; }
+.history-name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.history-state { color: #b9c8de; }
+.history-list pre {
+  margin: 0;
+  padding: 4px 6px;
+  max-height: 54px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.history-empty { margin: 4px 6px; }
+
 .rider {
   position: relative;
   width: 100%;
@@ -201,7 +306,8 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  cursor: pointer;
+  /* 整块是窗口拖动区：光标给「可抓取」的暗示 */
+  cursor: grab;
   /* 动画周期集中在这里：悬停/执行中只改变量，所有元素同步变速 */
   --cycle: 1.3s;
   --road: 9s;
@@ -225,6 +331,13 @@ onUnmounted(() => {
   --road: 2.8s;
   --bob: 0.28s;
 }
+/* 拖动区内的装饰元素一律不吃鼠标事件，否则 mousedown 落在子元素上就拖不动窗口 */
+.rider svg,
+.rider .road,
+.rider .streaks {
+  pointer-events: none;
+}
+
 .bike {
   width: 100%;
   height: auto;
@@ -352,6 +465,7 @@ onUnmounted(() => {
 }
 
 .badge {
+  pointer-events: auto;
   position: absolute;
   top: 0;
   right: 0;

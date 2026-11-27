@@ -328,8 +328,8 @@ export const api = {
   sshResetHostkey: (serverId: string) => invoke<void>("ssh_reset_hostkey", { serverId }),
   // AI 安全管线 / 审批 / 审计 / MCP
   guardInfo: () => invoke<GuardInfo>("guard_info"),
-  guardSetRules: (rules: GuardRules) =>
-    invoke<GuardInfo>("guard_set_rules", { rules }),
+  guardSetRules: (rules: GuardRules, scope?: "rules" | "policy") =>
+    invoke<GuardInfo>("guard_set_rules", { rules, scope }),
   mcpSetEnabled: (enabled: boolean) => invoke<GuardInfo>("mcp_set_enabled", { enabled }),
   approvalsPending: () => invoke<PendingApproval[]>("approvals_pending"),
   approvalDecide: (id: string, approve: boolean) =>

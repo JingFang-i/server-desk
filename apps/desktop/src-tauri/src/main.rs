@@ -150,6 +150,7 @@ fn main() {
                     // 与 float.rs 里的窗口级监听同时保留——弹出式菜单的事件按窗口分发，
                     // 两条路径都接一遍，动作本身幂等，重复触发无副作用。
                     "float-open-main" => handle.emit("float-menu", "open-main"),
+                    "float-history" => handle.emit("float-menu", "history"),
                     "float-hide" => handle.emit("float-menu", "hide"),
                     _ => Ok(()),
                 };
@@ -311,6 +312,14 @@ fn main() {
                         .build(app)
                     {
                         eprintln!("托盘图标创建失败（关闭主窗口后将无法从菜单栏唤起）: {e}");
+                        ops::audit(
+                            &state,
+                            "user",
+                            None,
+                            "tray_icon",
+                            &format!("托盘图标创建失败：{e}"),
+                            "failed",
+                        );
                     }
                 }
                 None => eprintln!("没有可用的应用图标，托盘不可用"),

@@ -90,41 +90,45 @@ pub fn approval_requested(app: &AppHandle, pending: &PendingApproval) {
         pending.server_name,
         summary(&pending.command, SUMMARY_MAX)
     );
-    let delivered = notify_now(app, NOTIFICATION_TITLE, &body);
+    #[cfg(target_os = "macos")]
+    if !tauri::is_dev() {
+        // 前台通知由系统抑制，声音兜底无需等待投递回调。
+        let played_fallback = focused && !WEB_AUDIO_READY.load(Ordering::Relaxed);
+        if played_fallback {
+            play_system_alert(app);
+        }
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = macos::deliver(NOTIFICATION_TITLE, &body, None).await {
+                eprintln!("原生审批通知投递失败: {error}");
+                if !played_fallback && !WEB_AUDIO_READY.load(Ordering::Relaxed) {
+                    play_system_alert(&app);
+                }
+            }
+        });
+        return;
+    }
 
-    // 两条声音通道取其一，避免双响：
-    // - 窗口在前台：macOS 不会弹横幅，提示音由应用内（Web Audio）或原生音兜底
-    // - 投递失败（未授权/被系统拦）：同样由原生音兜底
-    // Web Audio 已经能出声时不再叠加，交给可配置的应用内提示音。
+    let delivered = match deliver_plugin(app, NOTIFICATION_TITLE, &body) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("审批通知发送失败: {error}");
+            false
+        }
+    };
     if (focused || !delivered) && !WEB_AUDIO_READY.load(Ordering::Relaxed) {
         play_system_alert(app);
     }
 }
 
-/// 投递一条系统通知；返回「是否已交给系统」（不保证一定展示，前台/勿扰会被抑制）。
-fn notify_now(app: &AppHandle, title: &str, body: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        // 开发模式没有 .app 包身份，UNUserNotificationCenter 投递必然失败 → 走插件
-        if !tauri::is_dev() {
-            match macos::deliver(title, body, None, false) {
-                Ok(_) => return true,
-                Err(e) => eprintln!("原生通知投递失败，回退插件: {e}"),
-            }
-        }
-    }
-    if let Err(e) = app
-        .notification()
+fn deliver_plugin(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    app.notification()
         .builder()
         .title(title)
         .body(body)
         .sound(NOTIFICATION_SOUND)
         .show()
-    {
-        eprintln!("审批通知发送失败: {e}");
-        return false;
-    }
-    true
+        .map_err(|e| e.to_string())
 }
 
 /// 原生系统提示音（不依赖 WebView 的音频上下文）。
@@ -213,7 +217,7 @@ pub async fn approval_notification_test(app: AppHandle) -> Result<String, String
         .get_webview_window("main")
         .and_then(|win| win.is_focused().ok())
         .unwrap_or(false);
-    let delay = if focused { Some(5.0_f64) } else { None };
+    let delay = (focused && cfg!(target_os = "macos") && !tauri::is_dev()).then_some(5.0);
     let body = "如果你看到这条通知，说明系统通知通道正常——AI 请求审批时也会这样提醒";
     let (accepted, error, channel) =
         deliver_test(&app, "ServerDesk · 通知测试", body, delay).await;
@@ -249,10 +253,7 @@ pub async fn approval_notification_test(app: AppHandle) -> Result<String, String
     }
 }
 
-/// 测试专用投递：返回（是否交给系统、系统回报的错误、走的通道）。
-///
-/// 与 [`notify_now`] 的区别只有两点：要错误、可延迟。真实审批路径不延迟
-/// （审批要及时可见），也不捕获错误（每次泄漏一个 block 不值得）。
+/// 复用正式投递通道，返回系统受理结果与通道名。
 async fn deliver_test(
     app: &AppHandle,
     title: &str,
@@ -262,29 +263,13 @@ async fn deliver_test(
     #[cfg(target_os = "macos")]
     {
         if !tauri::is_dev() {
-            match macos::deliver(title, body, delay, true) {
-                Ok(slot) => {
-                    // 系统异步回调：等一小会儿再读错误槽
-                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                    let err = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    return (true, err, "native");
-                }
-                Err(e) => return (false, Some(e), "native"),
-            }
+            let result = macos::deliver(title, body, delay).await;
+            return (result.is_ok(), result.err(), "native");
         }
     }
     let _ = delay;
-    match app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .sound(NOTIFICATION_SOUND)
-        .show()
-    {
-        Ok(()) => (true, None, "plugin"),
-        Err(e) => (false, Some(e.to_string()), "plugin"),
-    }
+    let result = deliver_plugin(app, title, body);
+    (result.is_ok(), result.err(), "plugin")
 }
 
 /// 查询或申请系统权限。没有可用平台查询时保留「未知」状态。
@@ -386,9 +371,13 @@ fn macos_permission(request: bool, tx: tokio::sync::oneshot::Sender<&'static str
 mod macos {
     use objc2::{
         class, msg_send,
+        rc::{autoreleasepool, Retained},
         runtime::{AnyObject, Bool},
     };
     use std::ffi::CString;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
 
     #[link(name = "UserNotifications", kind = "framework")]
     unsafe extern "C" {}
@@ -406,9 +395,6 @@ mod macos {
         unsafe { msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()] }
     }
 
-    /// 系统回调的错误槽：投递是异步的，调用方等一小会儿再读。
-    pub type ErrorSlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
-
     /// NSString → Rust 字符串（用于取系统的错误描述）。
     unsafe fn ns_to_string(value: *mut AnyObject) -> String {
         if value.is_null() {
@@ -423,21 +409,22 @@ mod macos {
             .into_owned()
     }
 
-    /// 投递一条系统通知（带系统默认提示音）。
-    ///
-    /// - `delay_secs`：`Some(n)` 且 n > 0 时用 `UNTimeIntervalNotificationTrigger`
-    ///   延迟 n 秒；`None` 立即投递（trigger 传 nil）
-    /// - `capture_error`：是否通过完成回调把**系统拒绝原因**带回来。
-    ///   需要泄漏一个 block（见函数末尾注释），只在手动测试路径开启。
-    ///
-    /// 返回错误槽；立即投递的失败原因也能从这里拿到，而不是静默丢弃。
-    pub fn deliver(
+    /// 等待系统确认受理，超时或回调丢失也作为投递失败。
+    pub async fn deliver(title: &str, body: &str, delay_secs: Option<f64>) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        autoreleasepool(|_| submit(title, body, delay_secs, tx))?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "等待系统通知投递回调超时".to_string())?
+            .map_err(|_| "系统通知投递未返回结果".to_string())?
+    }
+
+    fn submit(
         title: &str,
         body: &str,
         delay_secs: Option<f64>,
-        capture_error: bool,
-    ) -> Result<ErrorSlot, String> {
-        let slot: ErrorSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        tx: oneshot::Sender<Result<(), String>>,
+    ) -> Result<(), String> {
         unsafe {
             let center = notification_center();
             if center.is_null() {
@@ -449,10 +436,9 @@ mod macos {
                 return Err("通知文本转换失败".into());
             }
 
-            let content: *mut AnyObject = msg_send![class!(UNMutableNotificationContent), new];
-            if content.is_null() {
-                return Err("UNMutableNotificationContent 创建失败".into());
-            }
+            let content: Option<Retained<AnyObject>> = msg_send![class!(UNMutableNotificationContent), new];
+            let content = content.ok_or("UNMutableNotificationContent 创建失败")?;
+            let content = &*content;
             let _: () = msg_send![content, setTitle: ns_title];
             let _: () = msg_send![content, setBody: ns_body];
             let sound: *mut AnyObject = msg_send![class!(UNNotificationSound), defaultSound];
@@ -491,31 +477,24 @@ mod macos {
                 return Err("UNNotificationRequest 创建失败".into());
             }
 
-            if capture_error {
-                let slot_for_block = std::sync::Arc::clone(&slot);
-                let block = block2::RcBlock::new(move |error: *mut AnyObject| {
-                    if !error.is_null() {
-                        let desc = ns_to_string(msg_send![error, localizedDescription]);
-                        *slot_for_block.lock().unwrap_or_else(|e| e.into_inner()) = Some(desc);
-                    }
-                });
-                let _: () = msg_send![
-                    center,
-                    addNotificationRequest: request,
-                    withCompletionHandler: &*block
-                ];
-                // ObjC 一般会 copy block，但这一点从 Rust 侧无法证明；宁可泄漏几十字节，
-                // 也不要冒「系统回调踩到已释放内存」的风险（只在手动测试路径发生）。
-                std::mem::forget(block);
-            } else {
-                let _: () = msg_send![
-                    center,
-                    addNotificationRequest: request,
-                    withCompletionHandler: std::ptr::null_mut::<AnyObject>()
-                ];
-            }
+            let tx = Mutex::new(Some(tx));
+            let block = block2::RcBlock::new(move |error: *mut AnyObject| {
+                let result = if error.is_null() {
+                    Ok(())
+                } else {
+                    Err(ns_to_string(msg_send![error, localizedDescription]))
+                };
+                if let Some(tx) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = tx.send(result);
+                }
+            });
+            let _: () = msg_send![
+                center,
+                addNotificationRequest: request,
+                withCompletionHandler: &*block
+            ];
         }
-        Ok(slot)
+        Ok(())
     }
 
     /// 播放系统提示音（Glass，即通知音）。必须在主线程调用。

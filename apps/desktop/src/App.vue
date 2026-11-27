@@ -165,7 +165,7 @@ onUnmounted(() => {
               </div>
               <n-menu :value="page" :options="menuOptions" @update:value="onMenu" />
               <div style="flex: 1" />
-              <n-button size="small" block quaternary style="margin-top: 12px" @click="lockVault">
+              <n-button size="small" block quaternary @click="lockVault">
                 🔒 锁定保险库
               </n-button>
             </n-layout-sider>

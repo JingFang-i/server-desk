@@ -94,21 +94,44 @@ async function refreshConnStatus() {
   }
 }
 
-const DOT_STYLES: Record<ConnState, string> = {
-  connected: "background:#63c28a;box-shadow:0 0 0 3px rgba(99,194,138,.15)",
-  error: "background:#e88080;box-shadow:0 0 0 3px rgba(232,128,128,.15)",
-  disconnected: "background:transparent;border:1.5px solid rgba(255,255,255,.35)",
-};
-const dotStyle = (id: string) => DOT_STYLES[connMap.value[id] ?? "disconnected"];
+/**
+ * 连接状态用**纯视觉**表达（不用文字）：亮绿实心点 + 白环 + 呼吸光晕，
+ * 配合整行绿色调与左侧色条——深色侧栏上远看也能扫出哪几台在线。
+ */
+const connState = (id: string): ConnState => connMap.value[id] ?? "disconnected";
+const dotClass = (id: string) => `srv-dot s-${connState(id)}`;
+
+/** 给树行加状态 class（行底色、左侧色条、名称变色都靠它） */
+function nodeProps({ option }: { option: TreeOption }) {
+  const info = option as NodeExt;
+  if (!info.isServerNode) return {};
+  const state = connState(String(option.key));
+  return state === "disconnected" ? {} : { class: `conn-${state}` };
+}
+
+/** 乐观更新：连上/断开成功后立刻改本地状态，不等下一次轮询 */
+function markConn(id: string, state: ConnState) {
+  connMap.value = { ...connMap.value, [id]: state };
+}
 
 onMounted(() => {
   store.load().catch((e) => message.error(String(e)));
   refreshConnStatus();
-  statusTimer = window.setInterval(refreshConnStatus, 5000);
+  // 1.5s：ssh_status 只读连接池内存、无 SSH 往返，代价可忽略，
+  // 换来「AI 那边连上/断开，这里 1-2 秒内就能看到」。
+  statusTimer = window.setInterval(refreshConnStatus, 1500);
+  window.addEventListener("focus", refreshConnStatus);
+  document.addEventListener("visibilitychange", onVisibleRefresh);
 });
 onUnmounted(() => {
   if (statusTimer) window.clearInterval(statusTimer);
+  window.removeEventListener("focus", refreshConnStatus);
+  document.removeEventListener("visibilitychange", onVisibleRefresh);
 });
+
+function onVisibleRefresh() {
+  if (document.visibilityState === "visible") void refreshConnStatus();
+}
 
 // ---------- 左侧树（只显示名称） ----------
 const keyword = ref("");
@@ -186,8 +209,8 @@ function serverNode(s: ServerConfig): TreeOption {
   return {
     key: s.id,
     label: s.name,
-    // 状态点：绿=已连接，红=最近一次连接失败，灰=未连接
-    prefix: () => h("span", { class: "srv-dot", style: dotStyle(s.id) }),
+    // 状态点：绿=已连接（带呼吸光晕），红=最近一次连接失败，灰=未连接
+    prefix: () => h("span", { class: dotClass(s.id) }),
     isServerNode: true,
     server: s,
   };
@@ -396,11 +419,13 @@ async function connectRow(row: ServerConfig) {
     if (connMap.value[row.id] === "connected") {
       await api.sshDisconnect(row.id);
       connectFailures.delete(row.id); // 主动断开 → 灰点
+      markConn(row.id, "disconnected");
       message.info(`「${row.name}」已断开`);
     } else {
       try {
         await api.sshConnect(row.id);
         connectFailures.delete(row.id);
+        markConn(row.id, "connected");
         message.success(`「${row.name}」已连接（保活 30s）`);
       } catch (e) {
         const msg = String(e);
@@ -409,6 +434,7 @@ async function connectRow(row: ServerConfig) {
           message.info(`「${row.name}」已取消连接`);
         } else {
           connectFailures.add(row.id); // 连接失败 → 红点保持
+          markConn(row.id, "error");
           message.error(`「${row.name}」连接失败：${msg}`);
         }
       }
@@ -783,6 +809,7 @@ const selectedConnState = computed<ConnState>(() =>
             :data="treeData"
             :selected-keys="selectedKeys"
             :expanded-keys="expandedKeys"
+            :node-props="nodeProps"
             @update:selected-keys="onSelect"
             @update:expanded-keys="(k: any) => (expandedKeys = k)"
             @drop="onDrop"
@@ -809,7 +836,7 @@ const selectedConnState = computed<ConnState>(() =>
         >
           <template #header>
             <div class="detail-head">
-              <span class="srv-dot big" :style="dotStyle(selectedServer.id)" />
+              <span class="srv-dot big" :class="`s-${selectedConnState}`" />
               <span class="detail-name">{{ selectedServer.name }}</span>
               <n-tag
                 size="small"
@@ -944,7 +971,7 @@ const selectedConnState = computed<ConnState>(() =>
               class="member-row"
               @click="selectedKey = m.id"
             >
-              <span class="srv-dot" :style="dotStyle(m.id)" />
+              <span class="srv-dot" :class="`s-${connState(m.id)}`" />
               <span>{{ m.name }}</span>
               <span class="mono" style="opacity: 0.55; margin-left: auto">
                 {{ m.host }}:{{ m.port }}
@@ -1274,17 +1301,89 @@ const selectedConnState = computed<ConnState>(() =>
   min-height: 320px;
 }
 
-/* 状态点 */
+/* 状态点：10px 实心 + 白环 + 外发光；已连接再加呼吸光晕，扫一眼就能看到 */
 .srv-dot {
   display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.srv-dot.big {
   width: 10px;
   height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background-clip: padding-box;
+}
+.srv-dot.big {
+  width: 12px;
+  height: 12px;
+}
+.srv-dot.s-connected {
+  background: #22c55e;
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, 0.95),
+    0 0 9px rgba(34, 197, 94, 0.8);
+  animation: conn-breathe 1.9s ease-in-out infinite;
+}
+.srv-dot.s-error {
+  background: #ef4444;
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, 0.95),
+    0 0 9px rgba(239, 68, 68, 0.75);
+}
+.srv-dot.s-disconnected {
+  background: transparent;
+  border: 1.5px solid rgba(255, 255, 255, 0.3);
+}
+@keyframes conn-breathe {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1.5px rgba(255, 255, 255, 0.95),
+      0 0 7px rgba(34, 197, 94, 0.65);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1.5px rgba(255, 255, 255, 0.95),
+      0 0 15px rgba(34, 197, 94, 1);
+  }
+}
+
+/* 整行强调（非文字）：左侧 3px 绿条 + 行底淡绿渐变 + 名称变绿 */
+.tree-scroll :deep(.n-tree-node) {
+  position: relative;
+}
+.tree-scroll :deep(.n-tree-node.conn-connected) {
+  background: linear-gradient(90deg, rgba(34, 197, 94, 0.16), rgba(34, 197, 94, 0));
+}
+.tree-scroll :deep(.n-tree-node.conn-connected)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: #22c55e;
+}
+.tree-scroll :deep(.n-tree-node.conn-connected .n-tree-node-content__text) {
+  color: #6ee7a8;
+  font-weight: 600;
+}
+.tree-scroll :deep(.n-tree-node.conn-error .n-tree-node-content__text) {
+  color: #fca5a5;
+}
+.tree-scroll :deep(.n-tree-node.conn-error)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: #ef4444;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .srv-dot.s-connected {
+    animation: none;
+  }
 }
 
 /* 让树节点留出状态点的位置间距 */

@@ -2,7 +2,7 @@
 //! 凭据仅在解密后短暂存在于内存；用户本人的增删改查会经由前端表单往返（属预期行为）。
 //! AI 侧走 MCP sidecar → ipc → ops 安全管线，结果不含凭据且已脱敏。
 
-use crate::guard::GuardRules;
+use crate::guard::{GuardRuleScope, GuardRules};
 use crate::ops;
 use crate::state::AppState;
 use crate::text::{truncate, AUDIT_DETAIL_MAX, ERROR_MAX};
@@ -397,7 +397,7 @@ pub fn rename_server_group(
     if from == to {
         return Ok(0);
     }
-    let n = state.store.rename_group(&from, &to)?;
+    let n = state.guard.rename_group(&state.store, &from, &to)?;
     if n == 0 {
         return Err(format!("分组「{from}」不存在或已没有服务器"));
     }
@@ -567,14 +567,13 @@ pub fn guard_info(state: State<'_, Arc<AppState>>) -> crate::guard::GuardInfo {
 pub fn guard_set_rules(
     state: State<'_, Arc<AppState>>,
     rules: GuardRules,
+    scope: Option<GuardRuleScope>,
 ) -> Result<crate::guard::GuardInfo, String> {
-    // 安全策略是整表覆盖：先取旧值，改完把差异写进审计，否则「谁在什么时候放开了什么」
-    // 事后完全查不到（红线 5 要求逐次可追溯）。
+    // 记录前后差异，便于追溯生效的策略变化。
     let before = state.guard.info();
     state
         .guard
-        .set_rules(&state.store, rules)
-        .map_err(|e| e.to_string())?;
+        .set_rules(&state.store, rules, scope.unwrap_or_default())?;
     let after = state.guard.info();
     let detail = summarize_rule_change(&before, &after);
     ops::audit(&state, "user", None, "guard_set_rules", &detail, "ok");

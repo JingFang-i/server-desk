@@ -31,6 +31,8 @@ const SHOW_DELAY_MS: u64 = 900;
 
 /// 持久化开关：0 = 关闭悬浮窗（启动不显示），缺省 = 开启
 pub const META_ENABLED: &str = "float_window_enabled";
+/// 用户拖动后的窗口位置（物理坐标 "x,y"）；没有记录时贴右下角
+pub const META_POS: &str = "float_window_pos";
 
 /// 创建悬浮窗（初始隐藏，[`show_on_start`] 随后亮出）。
 pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
@@ -57,6 +59,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     win.on_menu_event(move |_window, event| {
         let action = match event.id().as_ref() {
             "float-open-main" => "open-main",
+            "float-history" => "history",
             "float-hide" => "hide",
             _ => return,
         };
@@ -80,6 +83,52 @@ fn place(app: &AppHandle, win: &WebviewWindow) {
     let x = origin.x + screen.width - width - MARGIN;
     let y = origin.y + screen.height - SIZE_ORB.1 - ANCHOR_BOTTOM;
     let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+}
+
+/// 记住用户拖动后的位置（物理坐标，换缩放不用换算）。
+fn save_pos(app: &AppHandle, win: &WebviewWindow) {
+    let Ok(pos) = win.outer_position() else {
+        return;
+    };
+    if let Some(state) = app.try_state::<std::sync::Arc<crate::state::AppState>>() {
+        let _ = state
+            .store
+            .set_meta(META_POS, &format!("{},{}", pos.x, pos.y));
+    }
+}
+
+/// 读取记住的位置；落在任何一块屏幕之外（换显示器/分辨率）就当没用过。
+fn saved_pos(app: &AppHandle) -> Option<tauri::PhysicalPosition<i32>> {
+    let state = app.try_state::<std::sync::Arc<crate::state::AppState>>()?;
+    let raw = state.store.get_meta(META_POS).ok().flatten()?;
+    let (x, y) = raw.split_once(',')?;
+    let (x, y) = (x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?);
+    let point = tauri::PhysicalPosition::new(x, y);
+    // 至少要落在某块屏幕里，否则会把窗口放到看不见的地方
+    let visible = app
+        .available_monitors()
+        .ok()
+        .unwrap_or_default()
+        .iter()
+        .any(|m| {
+            let origin = m.position();
+            let size = m.size();
+            point.x >= origin.x
+                && point.y >= origin.y
+                && point.x < origin.x + size.width as i32
+                && point.y < origin.y + size.height as i32
+        });
+    visible.then_some(point)
+}
+
+/// 显示前定位：优先用用户拖动后的位置，没有就贴右下角。
+fn position_window(app: &AppHandle, win: &WebviewWindow) {
+    match saved_pos(app) {
+        Some(pos) => {
+            let _ = win.set_position(pos);
+        }
+        None => place(app, win),
+    }
 }
 
 /// 在主线程序列化执行。AppKit / WebKit 的窗口操作只能碰主线程。
@@ -136,7 +185,8 @@ pub fn show_on_start(app: AppHandle) {
             let Some(float) = app_for_main.get_webview_window(LABEL) else {
                 return Err("悬浮窗不存在".to_string());
             };
-            place(&app_for_main, &float);
+            // 启动时优先回到用户拖动后的位置
+            position_window(&app_for_main, &float);
             show_float(&float)
         })
         .unwrap_or_else(|e| Err(e));
@@ -159,8 +209,9 @@ pub fn show_on_start(app: AppHandle) {
 pub fn float_context_menu(app: AppHandle) -> Result<(), String> {
     let menu = MenuBuilder::new(&app)
         .text("float-open-main", "打开主界面")
+        .text("float-history", "调用记录")
         .separator()
-        .text("float-hide", "隐藏整个悬浮窗")
+        .text("float-hide", "隐藏")
         .build()
         .map_err(|e| format!("构建菜单失败：{e}"))?;
     let win = app
@@ -192,15 +243,19 @@ pub fn set_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
             let float = app_for_main
                 .get_webview_window(LABEL)
                 .ok_or_else(|| "悬浮窗尚未创建".to_string())?;
-            place(&app_for_main, &float);
+            position_window(&app_for_main, &float);
             show_float(&float)
-        })?
+        })??
     } else {
         if let Some(float) = app.get_webview_window(LABEL) {
+            save_pos(app, &float); // 隐藏前记住拖动后的位置
             let _ = float.hide();
         }
-        Ok(())
     }
+    // 广播开关状态：主界面侧栏按钮与设置页开关据此同步
+    // （隐藏动作可能发生在悬浮窗自己身上，主窗口不会自然知道）
+    let _ = app.emit("float-enabled", enabled);
+    Ok(())
 }
 
 #[tauri::command]
@@ -221,7 +276,7 @@ pub fn show_float_window(app: AppHandle) -> Result<(), String> {
         let float = app_for_main
             .get_webview_window(LABEL)
             .ok_or_else(|| "悬浮窗尚未创建（检查启动时的审计记录 float_window）".to_string())?;
-        place(&app_for_main, &float);
+        position_window(&app_for_main, &float);
         show_float(&float)
     })?
 }
@@ -230,6 +285,7 @@ pub fn show_float_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn hide_float_window(app: AppHandle) {
     if let Some(float) = app.get_webview_window(LABEL) {
+        save_pos(&app, &float); // 记住拖动后的位置
         let _ = float.hide();
     }
 }

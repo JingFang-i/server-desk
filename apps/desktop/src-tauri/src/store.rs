@@ -86,6 +86,10 @@ pub struct ServerRow {
 
 const COLS: &str = "id,name,host,port,username,auth_type,secret_blob,group_name,tags,notes,allow_ai,created_at,updated_at,sort_order";
 
+pub(crate) fn group_matches(name: &str, group: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(group.trim())
+}
+
 /// 审计分页查询结果：total 供前端渲染分页器。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -391,13 +395,37 @@ impl Store {
 
     /// 重命名分组：分组只是服务器行上的一个字符串列，改名 = 批量改这一列。
     /// 新名字与已有分组同名时等价于「合并分组」（返回受影响的服务器台数）。
-    pub fn rename_group(&self, from: &str, to: &str) -> Result<usize, String> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE servers SET group_name=?2 WHERE lower(trim(group_name)) = lower(trim(?1))",
-            params![from, to],
-        )
-        .map_err(|e| format!("重命名分组失败: {e}"))
+    pub fn rename_group(
+        &self,
+        from: &str,
+        to: &str,
+        meta: &[(&str, &str)],
+    ) -> Result<usize, String> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|e| format!("开启分组改名事务失败: {e}"))?;
+        let groups = (|| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = tx.prepare("SELECT DISTINCT group_name FROM servers WHERE group_name IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect()
+        })().map_err(|e| format!("读取服务器分组失败: {e}"))?;
+        let mut updated = 0;
+        for group in groups.iter().filter(|name| group_matches(name, from)) {
+            updated += tx.execute(
+                "UPDATE servers SET group_name=?2 WHERE group_name=?1",
+                params![group, to],
+            ).map_err(|e| format!("重命名分组失败: {e}"))?;
+        }
+        if updated > 0 {
+            Self::write_meta_values(&tx, meta)?;
+        }
+        tx.commit().map_err(|e| format!("提交分组改名失败: {e}"))?;
+        Ok(updated)
+    }
+
+    pub fn server_group(&self, id: &str) -> Result<Option<String>, String> {
+        self.lock()?
+            .query_row("SELECT group_name FROM servers WHERE id = ?1", params![id], |r| r.get(0))
+            .map_err(|e| format!("读取服务器分组失败: {e}"))
     }
 
     /// 重置前快照：用 `VACUUM INTO` 生成一致性单文件备份（包含 WAL 中已提交的数据）。
@@ -504,15 +532,20 @@ impl Store {
     pub fn set_meta_values(&self, entries: &[(&str, &str)]) -> Result<(), String> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(|e| format!("写入 meta 失败: {e}"))?;
+        Self::write_meta_values(&tx, entries)?;
+        tx.commit().map_err(|e| format!("提交 meta 失败: {e}"))
+    }
+
+    fn write_meta_values(conn: &Connection, entries: &[(&str, &str)]) -> Result<(), String> {
         for (key, value) in entries {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO meta(key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![key, value],
             )
             .map_err(|e| format!("写入 meta 失败: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("提交 meta 失败: {e}"))
+        Ok(())
     }
 
     // ---------- 审计 ----------
@@ -853,10 +886,10 @@ mod tests {
         assert_eq!(rows[2].group_name, None, "拖进未分组要清空 group_name");
 
         // 重命名分组：大小写/首尾空格不敏感，返回受影响台数（只有 c 的分组是 prod）
-        assert_eq!(store.rename_group(" PROD ", "生产").unwrap(), 1);
+        assert_eq!(store.rename_group(" PROD ", "生产", &[]).unwrap(), 1);
         let groups: Vec<Option<String>> = store.list().unwrap().into_iter().map(|r| r.group_name).collect();
         assert_eq!(groups, vec![Some("生产".into()), Some("生产".into()), None]);
-        assert_eq!(store.rename_group("不存在", "x").unwrap(), 0);
+        assert_eq!(store.rename_group("不存在", "x", &[]).unwrap(), 0);
     }
 
     #[test]
