@@ -4873,7 +4873,7 @@ dependencies = [
 
 [[package]]
 name = "serverdesk"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
@@ -4906,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "serverdesk-mcp"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4990,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
