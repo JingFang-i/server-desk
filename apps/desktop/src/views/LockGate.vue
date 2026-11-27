@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { NButton, NInput, NPopconfirm, NResult, useMessage } from "naive-ui";
+import { NButton, NInput, NPopconfirm, useMessage } from "naive-ui";
+import logoUrl from "../assets/logo.png";
 import { api, type VaultStatus } from "../api";
 
 const props = defineProps<{ status: VaultStatus }>();
@@ -15,6 +16,10 @@ const showReset = ref(false);
 
 async function submit() {
   if (busy.value) return;
+  if (!password.value) {
+    message.error("请输入主密码");
+    return;
+  }
   busy.value = true;
   try {
     if (!props.status.initialized) {
@@ -48,6 +53,7 @@ async function submit() {
 }
 
 async function doReset() {
+  if (busy.value) return;
   if (resetText.value !== "RESET") {
     message.error('请输入大写 RESET 以确认');
     return;
@@ -70,40 +76,39 @@ async function doReset() {
 
 <template>
   <div class="lockgate">
-    <n-result
-      :status="status.initialized ? 'warning' : 'info'"
-      :title="status.initialized ? '保险库已锁定' : '欢迎使用 ServerDesk'"
-      :description="
-        status.initialized
-          ? '输入主密码解锁，以访问服务器凭据'
-          : '首次使用：请设置主密码。主密码用于加密所有服务器凭据，一旦遗忘无法找回（只能重置并清空全部数据）'
-      "
-      style="max-width: 560px"
-    />
-    <div class="lockform">
-      <n-input
-        v-model:value="password"
-        type="password"
-        show-password-on="click"
-        :placeholder="status.initialized ? '主密码' : '设置主密码（至少 8 位）'"
-        @keyup.enter="submit"
-      />
-      <n-input
-        v-if="!status.initialized"
-        v-model:value="confirm"
-        type="password"
-        show-password-on="click"
-        placeholder="再次输入主密码"
-        @keyup.enter="submit"
-      />
-      <n-button type="primary" block :loading="busy" @click="submit">
-        {{ status.initialized ? "解锁" : "设置主密码并开始使用" }}
-      </n-button>
+    <section class="lock-panel" aria-labelledby="lock-title">
+      <header class="lock-heading">
+        <img :src="logoUrl" class="brand-logo" alt="" />
+        <h1 id="lock-title">{{ status.initialized ? "保险库已锁定" : "设置主密码" }}</h1>
+        <p>{{ status.initialized
+          ? "输入主密码，继续管理服务器。"
+          : "主密码用于加密服务器凭据。主密码遗忘后，只能重置保险库并清空数据。" }}</p>
+      </header>
+      <form class="lockform" novalidate @submit.prevent="submit">
+        <n-input
+          v-model:value="password"
+          type="password"
+          show-password-on="click"
+          :placeholder="status.initialized ? '主密码' : '设置主密码（至少 8 位）'"
+          :input-props="{ 'aria-label': '主密码', autocomplete: status.initialized ? 'current-password' : 'new-password' }"
+        />
+        <n-input
+          v-if="!status.initialized"
+          v-model:value="confirm"
+          type="password"
+          show-password-on="click"
+          placeholder="再次输入主密码"
+          :input-props="{ 'aria-label': '确认主密码', autocomplete: 'new-password' }"
+        />
+        <n-button attr-type="submit" type="primary" block :loading="busy">
+          {{ status.initialized ? "解锁" : "设置主密码并开始使用" }}
+        </n-button>
+      </form>
 
       <div v-if="status.initialized" class="lockfoot">
         <n-popconfirm @positive-click="showReset = true">
           <template #trigger>
-            <button class="linklike">忘记主密码？</button>
+            <n-button text class="linklike">忘记主密码？</n-button>
           </template>
           重置将删除所有服务器记录与凭据。重置前会自动保存一份数据库快照到数据目录
           backups/，但请确认那确实是你要的操作。确定继续？
@@ -116,45 +121,46 @@ async function doReset() {
           重置前会自动保存一份数据库快照（可用旧主密码解密或直接替换回滚），
           但界面上的数据仍会清空。输入大写 <code>RESET</code> 确认：
         </p>
-        <n-input v-model:value="resetText" placeholder="RESET" />
+        <n-input v-model:value="resetText" placeholder="RESET" :input-props="{ 'aria-label': '重置确认文字' }" />
         <n-button type="error" block :loading="busy" @click="doReset">
           我已知晓后果，清空全部数据
         </n-button>
       </div>
-    </div>
+    </section>
   </div>
 </template>
 
 <style scoped>
 .lockgate {
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 20px;
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(ellipse at top, var(--surface), var(--canvas) 65%);
 }
-.lockform {
-  width: 380px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+.lock-panel {
+  width: min(100%, 420px);
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--sidebar);
 }
-.lockfoot {
-  text-align: center;
-  margin-top: 4px;
-}
+.lock-heading { text-align: center; }
+.lock-heading h1 { margin: 8px 0 4px; font-size: 23px; }
+.lock-heading p { margin: 0 0 18px; color: var(--muted); line-height: 1.6; }
+.lockform { display: flex; flex-direction: column; gap: 10px; }
+.lockfoot { text-align: center; margin-top: 12px; }
 .linklike {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--muted);
   font-size: 12px;
   cursor: pointer;
   text-decoration: underline;
   padding: 0;
 }
 .linklike:hover {
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--text);
 }
 .resetbox {
   border: 1px solid rgba(255, 99, 99, 0.4);

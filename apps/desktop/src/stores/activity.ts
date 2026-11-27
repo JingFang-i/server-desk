@@ -34,11 +34,12 @@ export const useActivityStore = defineStore("activity", {
     runningCount: (s) => s.entries.filter((e) => e.running).length,
   },
   actions: {
-    async init() {
+    async init(isVisible: () => boolean = () => true) {
       if (subscribed) return;
       subscribed = true;
       try {
         await listen<ActivityEvent>("tool-activity", ({ payload }) => {
+          if (!isVisible()) return;
           const { id, phase, tool, server, detail, ok } = payload;
           const ts = new Date().toISOString();
           const item = this.entries.find((entry) => entry.id === id);

@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, h, nextTick, onActivated, onDeactivated, reactive, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
   NCard,
-  NDescriptions,
-  NDescriptionsItem,
   NDropdown,
   NEmpty,
   NForm,
@@ -28,128 +26,125 @@ import {
   type FormInst,
   type FormRules,
 } from "naive-ui";
-import { EllipsisVertical, FolderOpenOutline } from "@vicons/ionicons5";
+import { FolderOpenOutline, RefreshOutline, SearchOutline, ServerOutline } from "@vicons/ionicons5";
 import { api, type LayoutItem, type SaveServerInput, type ServerConfig } from "../api";
 import { open, save as save$ } from "@tauri-apps/plugin-dialog";
-import { useServersStore } from "../stores/servers";
+import { matchesServer, useServersStore } from "../stores/servers";
 
 const store = useServersStore();
 const message = useMessage();
 const dialog = useDialog();
 
 
-// ---------- 行内下拉操作菜单 ----------
-const actionOptions: DropdownOption[] = [
-  { label: "SSH 测试", key: "test" },
-  { label: "编辑", key: "edit" },
-  { label: "文件传输", key: "files" },
-  { label: "重置指纹", key: "reset" },
-  { type: "divider", key: "d1" },
-  { label: "删除", key: "delete", props: { style: { color: "#e88080" } } },
-];
+const props = defineProps<{ focusRequest?: { id: string } | null }>();
+const emit = defineEmits<{ focusHandled: [] }>();
+const detailTitle = ref<HTMLElement | null>(null);
+
+const actionOptions = computed<DropdownOption[]>(() => {
+  const connected = selectedConnState.value === "connected";
+  return [
+    { label: "SSH 测试", key: "test" },
+    ...(connected
+      ? [{ label: "断开连接", key: "disconnect", disabled: selectedServer.value ? disconnectingIds.has(selectedServer.value.id) : false }]
+      : [{ label: "执行命令", key: "exec" }, { label: "文件传输", key: "files" }]),
+    { label: "组内上移", key: "move-up", disabled: !canMove(-1) },
+    { label: "组内下移", key: "move-down", disabled: !canMove(1) },
+    { label: "重置指纹", key: "reset" },
+    { type: "divider", key: "divider" },
+    { label: "删除服务器", key: "delete", props: { style: { color: "var(--danger)" } } },
+  ];
+});
 
 function handleAction(key: string, row: ServerConfig) {
   switch (key) {
-    case "test":
-      testRow(row);
-      break;
-    case "edit":
-      openEdit(row);
-      break;
-    case "files":
-      openFiles(row);
-      break;
-    case "reset":
-      confirmResetHostkey(row);
-      break;
-    case "delete":
-      confirmRemove(row);
-      break;
+    case "test": void testRow(row); break;
+    case "disconnect": void disconnectRow(row); break;
+    case "exec": openExec(row); break;
+    case "files": openFiles(row); break;
+    case "reset": confirmResetHostkey(row); break;
+    case "delete": confirmRemove(row); break;
+    case "move-up": void moveWithinGroup(row, -1); break;
+    case "move-down": void moveWithinGroup(row, 1); break;
   }
 }
 
-// ---------- 连接状态（三态：绿=已连接，红=最近一次连接失败，灰=未连接） ----------
 type ConnState = "connected" | "error" | "disconnected";
 const connMap = ref<Record<string, ConnState>>({});
-/**
- * 最近一次连接/SSH 测试失败的服务器。连接池只有「在/不在」两种状态，
- * 失败不会留痕，所以红点由前端记忆：保持到下一次连接成功、主动断开或删除服务器。
- */
-const connectFailures = new Set<string>();
-const connectingId = ref<string | null>(null);
+const connectFailures = reactive(new Map<string, string>());
+const connectingIds = reactive(new Set<string>());
+const disconnectingIds = reactive(new Set<string>());
+const justConnected = ref<string | null>(null);
+const connLabels = {
+  connected: "已连接",
+  error: "连接失败",
+  disconnected: "未连接",
+  connecting: "连接中",
+};
 let statusTimer: number | undefined;
+let statusVersion = 0;
 
 async function refreshConnStatus() {
+  const version = ++statusVersion;
   try {
     const list = await api.sshStatus();
+    if (version !== statusVersion) return;
     const map: Record<string, ConnState> = {};
-    for (const c of list)
+    for (const c of list) {
       map[c.serverId] = c.status === "connected" ? "connected" : "disconnected";
-    for (const id of connectFailures) {
-      if (map[id] && map[id] !== "connected") map[id] = "error";
+      if (c.status === "connected") connectFailures.delete(c.serverId);
+    }
+    for (const id of connectFailures.keys()) {
+      if (map[id] !== "connected") map[id] = "error";
     }
     connMap.value = map;
   } catch {
-    /* 锁定状态下静默 */
+    // 保险库锁定时由主窗口切换到锁屏。
   }
 }
 
-/**
- * 连接状态用**纯视觉**表达（不用文字）：亮绿实心点 + 白环 + 呼吸光晕，
- * 配合整行绿色调与左侧色条——深色侧栏上远看也能扫出哪几台在线。
- */
-const connState = (id: string): ConnState => connMap.value[id] ?? "disconnected";
-const dotClass = (id: string) => `srv-dot s-${connState(id)}`;
-
-/** 给树行加状态 class（行底色、左侧色条、名称变色都靠它） */
-function nodeProps({ option }: { option: TreeOption }) {
-  const info = option as NodeExt;
-  if (!info.isServerNode) return {};
-  const state = connState(String(option.key));
-  return state === "disconnected" ? {} : { class: `conn-${state}` };
+function connState(id: string) {
+  if (connectingIds.has(id)) return "connecting";
+  return connMap.value[id] ?? "disconnected";
 }
 
-/** 乐观更新：连上/断开成功后立刻改本地状态，不等下一次轮询 */
 function markConn(id: string, state: ConnState) {
+  statusVersion++;
   connMap.value = { ...connMap.value, [id]: state };
 }
 
-onMounted(() => {
-  store.load().catch((e) => message.error(String(e)));
-  refreshConnStatus();
-  // 1.5s：ssh_status 只读连接池内存、无 SSH 往返，代价可忽略，
-  // 换来「AI 那边连上/断开，这里 1-2 秒内就能看到」。
+onActivated(() => {
+  if (!savingLayout.value) void store.load();
+  void refreshConnStatus();
   statusTimer = window.setInterval(refreshConnStatus, 1500);
   window.addEventListener("focus", refreshConnStatus);
   document.addEventListener("visibilitychange", onVisibleRefresh);
 });
-onUnmounted(() => {
-  if (statusTimer) window.clearInterval(statusTimer);
+onDeactivated(() => {
+  statusVersion++;
+  window.clearInterval(statusTimer);
   window.removeEventListener("focus", refreshConnStatus);
   document.removeEventListener("visibilitychange", onVisibleRefresh);
+  showModal.value = false;
+  Object.assign(model, emptyModel());
+  renameModal.value = false;
+  execModal.value = false;
+  filesModal.value = false;
 });
 
 function onVisibleRefresh() {
   if (document.visibilityState === "visible") void refreshConnStatus();
 }
 
-// ---------- 左侧树（只显示名称） ----------
 const keyword = ref("");
+const failedOnly = ref(false);
 const DEFAULT_GROUP = "默认分组";
 const UNGROUPED_KEY = "g:__ungrouped__";
-
-const filteredServers = computed(() =>
-  store.servers.filter((s) => {
-    const kw = keyword.value.trim().toLowerCase();
-    return (
-      !kw ||
-      [s.name, s.host, s.username, s.group ?? "", ...(s.tags ?? [])]
-        .join(" ")
-        .toLowerCase()
-        .includes(kw)
-    );
-  })
-);
+const filtering = computed(() => Boolean(keyword.value.trim() || failedOnly.value));
+const connectedCount = computed(() => store.servers.filter(({ id }) => connState(id) === "connected").length);
+const failedCount = computed(() => store.servers.filter(({ id }) => connState(id) === "error").length);
+const filteredServers = computed(() => store.servers.filter((server) =>
+  (!failedOnly.value || connState(server.id) === "error") && matchesServer(server, keyword.value)
+));
 
 /** 树节点上挂的业务字段（naive-ui 的 TreeOption 允许透传自定义字段） */
 type NodeExt = TreeOption & {
@@ -185,7 +180,7 @@ const treeData = computed<TreeOption[]>(() => {
       key: `g:${g}`,
       label: `${g}（${children.length}）`,
       prefix: () =>
-        h(NIcon, { size: 15, color: "#e2b93b" }, { default: () => h(FolderOpenOutline) }),
+        h(NIcon, { size: 15, color: "var(--muted)" }, { default: () => h(FolderOpenOutline) }),
       isGroupNode: true,
       groupName: g,
       children: children.map((s) => serverNode(s)),
@@ -196,7 +191,7 @@ const treeData = computed<TreeOption[]>(() => {
       key: UNGROUPED_KEY,
       label: `${DEFAULT_GROUP}（${ungrouped.length}）`,
       prefix: () =>
-        h(NIcon, { size: 15, color: "#e2b93b" }, { default: () => h(FolderOpenOutline) }),
+        h(NIcon, { size: 15, color: "var(--muted)" }, { default: () => h(FolderOpenOutline) }),
       isGroupNode: true,
       groupName: null,
       children: ungrouped.map((s) => serverNode(s)),
@@ -209,8 +204,8 @@ function serverNode(s: ServerConfig): TreeOption {
   return {
     key: s.id,
     label: s.name,
-    // 状态点：绿=已连接（带呼吸光晕），红=最近一次连接失败，灰=未连接
-    prefix: () => h("span", { class: dotClass(s.id) }),
+    prefix: () => h("span", { class: `srv-dot s-${connState(s.id)}`, "aria-hidden": "true" }),
+    suffix: () => h("span", { class: "tree-status" }, connLabels[connState(s.id)]),
     isServerNode: true,
     server: s,
   };
@@ -241,10 +236,7 @@ const selectedKey = ref<string | null>(null);
 const selectedKeys = computed<string[]>(() =>
   selectedKey.value ? [selectedKey.value] : []
 );
-const selectedServer = computed(() => {
-  if (!selectedKey.value) return null;
-  return nodeInfo.value.get(selectedKey.value)?.server ?? null;
-});
+const selectedServer = computed(() => store.servers.find((server) => server.id === selectedKey.value) ?? null);
 const selectedGroup = computed(() => {
   if (!selectedKey.value) return null;
   const info = nodeInfo.value.get(selectedKey.value);
@@ -260,15 +252,21 @@ function onSelect(keys: string[]) {
 }
 
 const expandedKeys = ref<string[]>([]);
-const knownGroups = new Set<string>();
+const collapsedGroups = new Set<string>();
+function updateExpanded(keys: Array<string | number>) {
+  expandedKeys.value = keys.map(String);
+  for (const node of treeData.value) {
+    const key = String(node.key);
+    if (expandedKeys.value.includes(key)) collapsedGroups.delete(key);
+    else collapsedGroups.add(key);
+  }
+}
 // 保留用户已有的折叠状态：搜索/刷新导致数据重算时，只有「新出现的分组」默认展开
 watch(
   treeData,
   (nodes) => {
     const keys = nodes.map((n) => String(n.key));
-    const prev = new Set(expandedKeys.value);
-    expandedKeys.value = keys.filter((k) => prev.has(k) || !knownGroups.has(k));
-    for (const k of keys) knownGroups.add(k);
+    expandedKeys.value = keys.filter((key) => filtering.value || !collapsedGroups.has(key));
     // 数据加载完成且尚未选中时，默认选中第一台服务器
     if (!selectedKey.value) {
       const first = nodes[0]?.children?.[0];
@@ -278,15 +276,27 @@ watch(
   { immediate: true }
 );
 
-// 删除/搜索后选中的服务器消失 → 清空选中（右侧回空态）
-watch(
-  () => store.servers.length,
-  () => {
-    if (selectedKey.value && !nodeInfo.value.has(selectedKey.value)) {
-      selectedKey.value = null;
-    }
+watch(() => store.servers.length, () => {
+  if (selectedKey.value && !selectedServer.value && !nodeInfo.value.has(selectedKey.value)) {
+    selectedKey.value = null;
   }
-);
+});
+
+watch(() => props.focusRequest, async (request) => {
+  if (!request) return;
+  emit("focusHandled");
+  keyword.value = "";
+  failedOnly.value = false;
+  const server = store.servers.find(({ id }) => id === request.id);
+  if (!server) return;
+  const group = normGroup(server.group);
+  const key = group ? `g:${group}` : UNGROUPED_KEY;
+  collapsedGroups.delete(key);
+  selectedKey.value = request.id;
+  await nextTick();
+  if (!expandedKeys.value.includes(key)) expandedKeys.value.push(key);
+  detailTitle.value?.focus();
+}, { immediate: true, flush: "post" });
 
 const groupOptions = computed(() => store.groups.map((g) => ({ label: g, value: g })));
 
@@ -315,7 +325,7 @@ function flattenedOrder(): ServerConfig[] {
  * naive-ui 的 allowDrop 回调拿不到 dragNode，这里拦不住「拖分组」。
  */
 function allowDrop() {
-  return !keyword.value.trim();
+  return !filtering.value && !savingLayout.value;
 }
 
 /** 提交整表新顺序 + 分组归属（后端单事务落库），失败回滚本地状态 */
@@ -326,6 +336,7 @@ async function commitLayout(flat: ServerConfig[]) {
     group: s.group,
     sortOrder: index,
   }));
+  const generation = store.generation;
   const snapshot = store.servers.slice();
   // 乐观更新：松手立刻看到新位置，不必等一趟 IPC
   store.servers = normalized;
@@ -333,11 +344,28 @@ async function commitLayout(flat: ServerConfig[]) {
   try {
     await api.applyServerLayout(items);
   } catch (e) {
-    store.servers = snapshot;
+    if (generation === store.generation) store.servers = snapshot;
     message.error(`保存排序失败：${String(e)}`);
   } finally {
     savingLayout.value = false;
   }
+}
+
+function canMove(step: number) {
+  if (!allowDrop() || !selectedServer.value) return false;
+  const flat = flattenedOrder();
+  const index = flat.findIndex(({ id }) => id === selectedKey.value);
+  const target = flat[index + step];
+  return Boolean(index >= 0 && target && normGroup(target.group) === normGroup(selectedServer.value.group));
+}
+
+async function moveWithinGroup(row: ServerConfig, step: number) {
+  if (!canMove(step)) return;
+  const flat = flattenedOrder();
+  const index = flat.findIndex(({ id }) => id === row.id);
+  flat.splice(index, 1);
+  flat.splice(index + step, 0, row);
+  await commitLayout(flat);
 }
 
 /**
@@ -347,7 +375,7 @@ async function commitLayout(flat: ServerConfig[]) {
  * 分组本身不可拖动（按名称排序），搜索态不可拖。
  */
 async function onDrop({ node, dragNode, dropPosition }: TreeDropInfo) {
-  if (keyword.value.trim()) return;
+  if (!allowDrop()) return;
   const target = node as NodeExt;
   const moving = (dragNode as NodeExt).server;
   if (!moving || !target) return;
@@ -414,36 +442,42 @@ async function submitRename() {
 
 // ---------- 连接 / 测试 / 执行 ----------
 async function connectRow(row: ServerConfig) {
-  connectingId.value = row.id;
+  if (connectingIds.has(row.id)) return;
+  connectingIds.add(row.id);
   try {
-    if (connMap.value[row.id] === "connected") {
-      await api.sshDisconnect(row.id);
-      connectFailures.delete(row.id); // 主动断开 → 灰点
-      markConn(row.id, "disconnected");
-      message.info(`「${row.name}」已断开`);
+    await api.sshConnect(row.id);
+    connectFailures.delete(row.id);
+    markConn(row.id, "connected");
+    justConnected.value = row.id;
+    message.success(`「${row.name}」已连接`);
+  } catch (e) {
+    const error = String(e);
+    if (error.includes("连接已取消")) {
+      message.info(`「${row.name}」已取消连接`);
     } else {
-      try {
-        await api.sshConnect(row.id);
-        connectFailures.delete(row.id);
-        markConn(row.id, "connected");
-        message.success(`「${row.name}」已连接（保活 30s）`);
-      } catch (e) {
-        const msg = String(e);
-        if (msg.includes("连接已取消")) {
-          // 用户主动取消：不算失败，不标红点
-          message.info(`「${row.name}」已取消连接`);
-        } else {
-          connectFailures.add(row.id); // 连接失败 → 红点保持
-          markConn(row.id, "error");
-          message.error(`「${row.name}」连接失败：${msg}`);
-        }
-      }
+      connectFailures.set(row.id, error);
+      markConn(row.id, "error");
+      message.error(`「${row.name}」连接失败`);
     }
+  } finally {
+    connectingIds.delete(row.id);
+    void refreshConnStatus();
+  }
+}
+
+async function disconnectRow(row: ServerConfig) {
+  if (disconnectingIds.has(row.id)) return;
+  disconnectingIds.add(row.id);
+  try {
+    await api.sshDisconnect(row.id);
+    connectFailures.delete(row.id);
+    markConn(row.id, "disconnected");
+    message.info(`「${row.name}」已断开连接`);
   } catch (e) {
     message.error(String(e));
   } finally {
-    connectingId.value = null;
-    refreshConnStatus();
+    disconnectingIds.delete(row.id);
+    void refreshConnStatus();
   }
 }
 
@@ -465,12 +499,12 @@ async function testRow(row: ServerConfig) {
       connectFailures.delete(row.id);
       message.success(`「${row.name}」${r.message}`);
     } else {
-      connectFailures.add(row.id);
-      message.error(`「${row.name}」${r.message}`);
+      connectFailures.set(row.id, r.message);
+      message.error(`「${row.name}」SSH 测试失败`);
     }
   } catch (e) {
-    connectFailures.add(row.id);
-    message.error(String(e));
+    connectFailures.set(row.id, String(e));
+    message.error(`「${row.name}」SSH 测试失败`);
   } finally {
     refreshConnStatus();
   }
@@ -520,7 +554,7 @@ function openExec(row: ServerConfig) {
 }
 
 async function runExec() {
-  if (!execTarget.value || !execCommand.value.trim()) return;
+  if (execRunning.value || !execTarget.value || !execCommand.value.trim()) return;
   execRunning.value = true;
   execOutput.value = null;
   try {
@@ -626,6 +660,7 @@ function buildInput(): SaveServerInput {
 }
 
 async function submit() {
+  if (saving.value) return;
   try {
     await formRef.value?.validate();
   } catch {
@@ -645,7 +680,7 @@ async function submit() {
     message.success(editingId.value ? "服务器已更新" : "服务器已添加");
     showModal.value = false;
     // 新增后直接选中新服务器，详情面板立即可见
-    if (!editingId.value && saved) selectedKey.value = saved.id;
+    selectedKey.value = saved.id;
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -771,186 +806,104 @@ const authLabel = (s: ServerConfig) =>
     ? "密码"
     : `SSH 私钥${s.auth.passphrase ? "（带口令）" : ""}`;
 
-const selectedConnState = computed<ConnState>(() =>
-  selectedServer.value ? (connMap.value[selectedServer.value.id] ?? "disconnected") : "disconnected"
-);
+const selectedConnState = computed(() => selectedServer.value ? connState(selectedServer.value.id) : "disconnected");
 </script>
 
 <template>
-  <div class="page">
-    <div class="toolbar">
-      <span style="font-size: 13px; opacity: 0.7">服务器资产</span>
-      <div style="flex: 1" />
-      <n-button :loading="store.loading" @click="store.load()">刷新</n-button>
+  <div class="page server-page">
+    <div class="toolbar server-toolbar">
+      <span class="summary-status"><span class="srv-dot s-connected" aria-hidden="true" />{{ connectedCount }} 台已连接</span>
+      <button class="failure-filter" :aria-pressed="failedOnly" @click="failedOnly = !failedOnly">
+        <span class="srv-dot" :class="failedCount ? 's-error' : 's-disconnected'" aria-hidden="true" />
+        {{ failedCount }} 台连接失败
+      </button>
+      <div class="toolbar-spacer" />
+      <n-button secondary :loading="store.loading" :disabled="savingLayout" @click="store.load()">
+        <template #icon><n-icon :component="RefreshOutline" /></template>
+        刷新
+      </n-button>
       <n-button type="primary" @click="openCreate()">＋ 新增服务器</n-button>
     </div>
 
-    <n-alert v-if="store.loadError" type="error" style="margin-bottom: 2px">
-      <div style="font-size: 12px; white-space: pre-wrap; line-height: 1.7">
-        {{ store.loadError }}
-      </div>
+    <n-alert v-if="store.loadError" type="error" title="服务器列表加载失败">
+      {{ store.loadError }}
     </n-alert>
 
     <div class="servers-layout">
-      <!-- 左：分组树（只显示名称） -->
-      <aside class="tree-pane">
-        <n-input
-          v-model:value="keyword"
-          size="small"
-          placeholder="搜索名称 / 主机 / 标签"
-          clearable
-        />
+      <aside class="tree-pane" aria-label="服务器分组">
+        <div class="tree-heading"><h2>分组与服务器</h2><span>{{ store.servers.length }} 台</span></div>
+        <n-input v-model:value="keyword" size="small" placeholder="搜索名称、地址或标签" clearable
+          :input-props="{ 'aria-label': '筛选服务器' }">
+          <template #prefix><n-icon :component="SearchOutline" /></template>
+        </n-input>
+        <div v-if="failedOnly" class="tree-filter">
+          <span>仅显示连接失败</span>
+          <button @click="failedOnly = false">清除筛选</button>
+        </div>
         <div class="tree-scroll">
-          <n-tree
-            v-if="treeData.length"
-            block-line
-            draggable
-            :allow-drop="allowDrop"
-            :data="treeData"
-            :selected-keys="selectedKeys"
-            :expanded-keys="expandedKeys"
-            :node-props="nodeProps"
-            @update:selected-keys="onSelect"
-            @update:expanded-keys="(k: any) => (expandedKeys = k)"
-            @drop="onDrop"
-          />
-          <n-empty
-            v-else
-            :description="keyword ? '没有匹配的服务器' : '还没有服务器'"
-            size="small"
-            style="margin-top: 48px"
-          />
+          <n-tree v-if="treeData.length" block-line :draggable="!filtering"
+            :allow-drop="allowDrop" :data="treeData" :selected-keys="selectedKeys" :expanded-keys="expandedKeys"
+            @update:selected-keys="onSelect" @update:expanded-keys="updateExpanded" @drop="onDrop" />
+          <n-empty v-else size="small" class="tree-empty"
+            :description="store.loading ? '正在加载服务器…' : store.loadError ? '请刷新重试' : filtering ? '没有匹配的服务器' : '还没有服务器'" />
         </div>
-        <div class="tree-foot">
-          {{ store.servers.length }} 台 · {{ treeData.length }} 个分组
-          <span v-if="savingLayout" style="opacity: 0.8"> · 保存排序中…</span>
-        </div>
+        <div v-if="savingLayout" class="tree-foot" role="status">正在保存排序…</div>
       </aside>
 
-      <!-- 右：详情面板 -->
-      <section class="detail-pane">
-        <n-card
-          v-if="selectedServer"
-          size="small"
-          class="detail-card"
-        >
-          <template #header>
-            <div class="detail-head">
-              <span class="srv-dot big" :class="`s-${selectedConnState}`" />
-              <span class="detail-name">{{ selectedServer.name }}</span>
-              <n-tag
-                size="small"
-                :type="selectedConnState === 'connected'
-                  ? 'success'
-                  : selectedConnState === 'error'
-                    ? 'error'
-                    : 'default'"
-                :bordered="false"
-              >
-                {{ selectedConnState === "connected"
-                  ? "已连接"
-                  : selectedConnState === "error"
-                    ? "连接失败"
-                    : "未连接" }}
-              </n-tag>
-              <n-tag
-                v-if="!selectedServer.allowAi"
-                size="small"
-                type="warning"
-                :bordered="false"
-              >
-                AI 禁止
-              </n-tag>
-              <n-tag
-                v-for="t in selectedServer.tags"
-                :key="t"
-                size="small"
-                :bordered="false"
-              >
-                {{ t }}
-              </n-tag>
+      <section class="detail-pane" aria-label="服务器详情">
+        <n-card v-if="selectedServer" size="small" class="detail-card">
+          <div class="detail-identity">
+            <div class="server-glyph"><n-icon :component="ServerOutline" size="23" /></div>
+            <div class="detail-heading">
+              <h2 ref="detailTitle" tabindex="-1" class="detail-name">{{ selectedServer.name }}</h2>
+              <div class="detail-sub">
+                <code>{{ selectedServer.host }}:{{ selectedServer.port }}</code>
+                <span>{{ selectedServer.username }}</span>
+              </div>
             </div>
-          </template>
-          <template #header-extra>
-            <n-dropdown
-              :options="actionOptions"
-              trigger="click"
-              @select="(key: string) => handleAction(key, selectedServer!)"
-            >
-              <n-button size="small" circle quaternary>
-                <template #icon>
-                  <n-icon><EllipsisVertical /></n-icon>
-                </template>
-              </n-button>
-            </n-dropdown>
-          </template>
-
-          <div class="detail-sub">
-            <code class="mono">{{ selectedServer.host }}:{{ selectedServer.port }}</code>
-            <span class="mono" style="opacity: 0.7">{{ selectedServer.username }}</span>
+            <n-tag size="small" :type="selectedConnState === 'connected' ? 'success' : selectedConnState === 'error' ? 'error' : 'default'" :bordered="false">
+              <span class="inline-status">
+                <span class="srv-dot" :class="[`s-${selectedConnState}`, { 'connection-flash': justConnected === selectedServer.id }]"
+                  aria-hidden="true" @animationend="justConnected = null" />
+                {{ connLabels[selectedConnState] }}
+              </span>
+            </n-tag>
           </div>
-
           <div class="detail-actions">
-            <!-- 连接进行中：按钮变为「取消连接」，握手可立即中断 -->
-            <n-button
-              v-if="connectingId === selectedServer.id"
-              type="warning"
-              @click="cancelConnect(selectedServer)"
-            >
-              取消连接
+            <n-button v-if="selectedConnState === 'connecting'" @click="cancelConnect(selectedServer)">取消连接</n-button>
+            <template v-else-if="selectedConnState === 'connected'">
+              <n-button type="primary" @click="openExec(selectedServer)">执行命令</n-button>
+              <n-button @click="openFiles(selectedServer)">文件传输</n-button>
+            </template>
+            <n-button v-else type="primary" @click="connectRow(selectedServer)">
+              {{ selectedConnState === "error" ? "重试连接" : "连接" }}
             </n-button>
-            <n-button
-              v-else
-              :type="selectedConnState === 'connected' ? 'warning' : 'primary'"
-              @click="connectRow(selectedServer)"
-            >
-              {{ selectedConnState === "connected" ? "断开连接" : "连接" }}
-            </n-button>
-            <n-button @click="openExec(selectedServer)">执行命令</n-button>
-            <n-button @click="openFiles(selectedServer)">文件传输</n-button>
-            <n-button @click="openEdit(selectedServer)">编辑</n-button>
-            <n-button @click="testRow(selectedServer)">SSH 测试</n-button>
+            <n-dropdown :options="actionOptions" trigger="click" @select="(key: string) => handleAction(key, selectedServer!)">
+              <n-button>更多</n-button>
+            </n-dropdown>
           </div>
-
-          <n-descriptions
-            label-placement="left"
-            bordered
-            size="small"
-            :column="1"
-            style="margin-top: 14px"
-          >
-            <n-descriptions-item label="主机">
-              <code class="mono">{{ selectedServer.host }}</code>
-            </n-descriptions-item>
-            <n-descriptions-item label="端口">
-              {{ selectedServer.port }}
-            </n-descriptions-item>
-            <n-descriptions-item label="用户名">
-              {{ selectedServer.username }}
-            </n-descriptions-item>
-            <n-descriptions-item label="认证方式">
-              {{ authLabel(selectedServer) }}
-            </n-descriptions-item>
-            <n-descriptions-item label="分组">
-              {{ selectedServer.group ?? "默认分组" }}
-            </n-descriptions-item>
-            <n-descriptions-item label="允许 AI">
-              {{ selectedServer.allowAi ? "允许" : "禁止" }}
-            </n-descriptions-item>
-            <n-descriptions-item label="备注">
-              <span style="white-space: pre-wrap">{{ selectedServer.notes || "—" }}</span>
-            </n-descriptions-item>
-            <n-descriptions-item label="创建时间">
-              {{ fmtTs(selectedServer.createdAt) }}
-            </n-descriptions-item>
-            <n-descriptions-item label="更新时间">
-              {{ fmtTs(selectedServer.updatedAt) }}
-            </n-descriptions-item>
-          </n-descriptions>
-
-          <p class="hint" style="margin: 12px 0 0">
-            连接保持 30s 心跳；手动执行与文件传输都会写入审计日志。
-          </p>
+          <n-alert v-if="selectedConnState === 'error'" class="connection-error" type="error" title="连接失败">
+            {{ connectFailures.get(selectedServer.id) }}
+          </n-alert>
+          <div class="detail-section-heading">
+            <h3>概览</h3>
+            <n-button size="small" quaternary @click="openEdit(selectedServer)">编辑服务器</n-button>
+          </div>
+          <dl class="detail-facts">
+            <div><dt>认证方式</dt><dd>{{ authLabel(selectedServer) }}</dd></div>
+            <div><dt>分组</dt><dd>{{ selectedServer.group ?? "默认分组" }}</dd></div>
+            <div><dt>AI 权限</dt><dd>{{ selectedServer.allowAi ? "允许" : "禁止" }}</dd></div>
+            <div><dt>标签</dt><dd class="server-tags">
+              <n-tag v-for="tag in selectedServer.tags" :key="tag" size="small" :bordered="false">{{ tag }}</n-tag>
+              <span v-if="!selectedServer.tags.length">—</span>
+            </dd></div>
+            <div v-if="selectedServer.notes" class="server-notes"><dt>备注</dt><dd>{{ selectedServer.notes }}</dd></div>
+          </dl>
+          <details class="detail-metadata">
+            <summary>资产时间</summary>
+            <p>创建 {{ fmtTs(selectedServer.createdAt) }}</p>
+            <p>更新 {{ fmtTs(selectedServer.updatedAt) }}</p>
+          </details>
         </n-card>
 
         <!-- 选中分组：展示组内成员 -->
@@ -965,18 +918,18 @@ const selectedConnState = computed<ConnState>(() =>
             </div>
           </template>
           <div class="member-list">
-            <div
+            <button
               v-for="m in selectedGroup.members"
               :key="m.id"
-              class="member-row"
+              class="member-row" type="button"
               @click="selectedKey = m.id"
             >
               <span class="srv-dot" :class="`s-${connState(m.id)}`" />
-              <span>{{ m.name }}</span>
+              <span>{{ m.name }} · {{ connLabels[connState(m.id)] }}</span>
               <span class="mono" style="opacity: 0.55; margin-left: auto">
                 {{ m.host }}:{{ m.port }}
               </span>
-            </div>
+            </button>
           </div>
           <div class="detail-actions">
             <n-button
@@ -994,7 +947,11 @@ const selectedConnState = computed<ConnState>(() =>
         </n-card>
 
         <div v-else class="detail-empty">
-          <n-empty description="从左侧选择一台服务器查看详情" style="margin-top: 96px" />
+          <n-empty :description="store.loading ? '正在读取服务器…' : store.loadError ? '暂时无法读取服务器' : store.servers.length ? '从左侧选择一台服务器' : '添加服务器，开始管理连接'">
+            <template v-if="!store.servers.length && !store.loading && !store.loadError" #extra>
+              <n-button type="primary" @click="openCreate()">新增服务器</n-button>
+            </template>
+          </n-empty>
         </div>
       </section>
     </div>
@@ -1212,186 +1169,83 @@ const selectedConnState = computed<ConnState>(() =>
 </template>
 
 <style scoped>
-.servers-layout {
-  display: flex;
-  gap: 14px;
-  flex: 1;
-  min-height: 0;
+.server-page { flex: 1; min-height: 0; }
+.server-toolbar { min-height: 36px; }
+.toolbar-spacer { flex: 1; }
+.summary-status, .failure-filter, .inline-status { display: inline-flex; align-items: center; gap: 7px; }
+.summary-status, .failure-filter { font-size: 12px; color: var(--muted); }
+.failure-filter {
+  background: transparent; border: 1px solid var(--line); border-radius: var(--radius-control);
+  padding: 5px 8px; cursor: pointer;
 }
-
-/* 左：树面板 */
+.failure-filter:hover, .failure-filter[aria-pressed="true"] { color: var(--text); background: var(--surface); }
+.servers-layout { display: grid; grid-template-columns: clamp(220px, 24vw, 285px) minmax(0, 1fr); gap: 14px; flex: 1; min-height: 0; }
 .tree-pane {
-  width: 250px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 8px;
-  padding: 10px;
-  background: rgba(255, 255, 255, 0.02);
+  display: flex; flex-direction: column; gap: 10px; min-height: 0; padding: 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--sidebar);
 }
-.tree-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
+.tree-heading { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 12px; }
+.tree-heading h2 { margin: 0; color: var(--text); font-size: 13px; font-weight: 650; }
+.tree-scroll { flex: 1; min-height: 0; overflow: auto; }
+.tree-empty { padding: 28px 0; }
+.tree-filter { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+.tree-filter button { background: transparent; color: var(--accent); border: 0; cursor: pointer; }
+.tree-foot { font-size: 12px; color: var(--muted); text-align: center; }
+.tree-scroll :deep(.n-tree-node-content) { padding-left: 5px; }
+.tree-scroll :deep(.n-tree-node-content__text) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-scroll :deep(.tree-status) { font-size: 10px; color: var(--muted); white-space: nowrap; }
+.tree-scroll :deep(.n-tree-node--selected .n-tree-node-content) {
+  box-shadow: inset 2px 0 var(--accent);
+  animation: tree-select var(--motion-fast) ease-out;
 }
-.tree-foot {
-  font-size: 12px;
-  opacity: 0.5;
-  text-align: center;
-}
+@keyframes tree-select { from { box-shadow: inset 0 0 transparent; } }
 
-/* 右：详情面板 */
-.detail-pane {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
+.detail-pane { min-width: 0; min-height: 0; overflow: auto; }
+.detail-card { width: 100%; }
+.detail-head, .detail-identity { display: flex; align-items: center; gap: 10px; }
+.detail-identity { flex-wrap: wrap; }
+.detail-heading { flex: 1; min-width: 0; }
+.detail-name { font-size: 20px; font-weight: 680; margin: 0; overflow-wrap: anywhere; }
+.detail-sub { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.server-glyph {
+  display: grid; place-items: center; width: 42px; height: 42px; flex: none;
+  border: 1px solid var(--line); border-radius: 9px; color: var(--accent); background: var(--canvas);
 }
-.detail-card {
-  max-width: 760px;
-}
-.detail-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.detail-name {
-  font-size: 17px;
-  font-weight: 700;
-}
-.detail-sub {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-  margin-top: 2px;
-  font-size: 13px;
-}
-.detail-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-.mono {
-  font-family: ui-monospace, Menlo, monospace;
-  font-size: 12.5px;
-}
-.member-list {
-  display: flex;
-  flex-direction: column;
-}
+.detail-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+.connection-error { margin-top: 12px; overflow-wrap: anywhere; }
+.detail-section-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
+.detail-section-heading h3 { margin: 0; font-size: 14px; }
+.detail-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 8px 0 0; }
+.detail-facts > div { padding: 8px 8px 8px 0; border-top: 1px solid var(--line); }
+.detail-facts dt { color: var(--muted); font-size: 11px; }
+.detail-facts dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+.server-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.server-notes { grid-column: 1 / -1; white-space: pre-wrap; }
+.detail-metadata { border-top: 1px solid var(--line); padding-top: 8px; font-size: 12px; color: var(--muted); }
+.detail-metadata summary { cursor: pointer; }
+.detail-metadata p { margin: 4px 0; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.member-list { display: flex; flex-direction: column; }
 .member-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: none;
+  border-radius: var(--radius-control); background: transparent; color: var(--text); cursor: pointer;
+  text-align: left;
 }
-.member-row:hover {
-  background: rgba(255, 255, 255, 0.05);
-}
+.member-row:hover { background: var(--popover); }
 .detail-empty {
-  border: 1px dashed rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  min-height: 320px;
+  display: grid; place-items: center; min-height: 220px;
+  border: 1px dashed var(--line); border-radius: var(--radius-panel);
 }
 
-/* 状态点：10px 实心 + 白环 + 外发光；已连接再加呼吸光晕，扫一眼就能看到 */
-.srv-dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  background-clip: padding-box;
-}
-.srv-dot.big {
-  width: 12px;
-  height: 12px;
-}
-.srv-dot.s-connected {
-  background: #22c55e;
-  box-shadow:
-    0 0 0 1.5px rgba(255, 255, 255, 0.95),
-    0 0 9px rgba(34, 197, 94, 0.8);
-  animation: conn-breathe 1.9s ease-in-out infinite;
-}
-.srv-dot.s-error {
-  background: #ef4444;
-  box-shadow:
-    0 0 0 1.5px rgba(255, 255, 255, 0.95),
-    0 0 9px rgba(239, 68, 68, 0.75);
-}
-.srv-dot.s-disconnected {
-  background: transparent;
-  border: 1.5px solid rgba(255, 255, 255, 0.3);
-}
-@keyframes conn-breathe {
-  0%,
-  100% {
-    box-shadow:
-      0 0 0 1.5px rgba(255, 255, 255, 0.95),
-      0 0 7px rgba(34, 197, 94, 0.65);
-  }
-  50% {
-    box-shadow:
-      0 0 0 1.5px rgba(255, 255, 255, 0.95),
-      0 0 15px rgba(34, 197, 94, 1);
-  }
-}
-
-/* 整行强调（非文字）：左侧 3px 绿条 + 行底淡绿渐变 + 名称变绿 */
-.tree-scroll :deep(.n-tree-node) {
-  position: relative;
-}
-.tree-scroll :deep(.n-tree-node.conn-connected) {
-  background: linear-gradient(90deg, rgba(34, 197, 94, 0.16), rgba(34, 197, 94, 0));
-}
-.tree-scroll :deep(.n-tree-node.conn-connected)::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 3px;
-  bottom: 3px;
-  width: 3px;
-  border-radius: 0 2px 2px 0;
-  background: #22c55e;
-}
-.tree-scroll :deep(.n-tree-node.conn-connected .n-tree-node-content__text) {
-  color: #6ee7a8;
-  font-weight: 600;
-}
-.tree-scroll :deep(.n-tree-node.conn-error .n-tree-node-content__text) {
-  color: #fca5a5;
-}
-.tree-scroll :deep(.n-tree-node.conn-error)::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 3px;
-  bottom: 3px;
-  width: 3px;
-  border-radius: 0 2px 2px 0;
-  background: #ef4444;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .srv-dot.s-connected {
-    animation: none;
-  }
-}
-
-/* 让树节点留出状态点的位置间距 */
-.tree-scroll :deep(.n-tree-node-content) {
-  padding-left: 6px;
-}
-.tree-scroll :deep(.n-tree-node-content__prefix) {
-  margin-right: 8px;
+.srv-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.srv-dot.s-connected { background: var(--success); }
+.srv-dot.s-error { background: var(--danger); }
+.srv-dot.s-connecting { background: var(--accent); }
+.srv-dot.s-disconnected { border: 1px solid var(--muted); }
+.connection-flash { animation: connection-flash var(--motion-fast) ease-out; }
+@keyframes connection-flash {
+  from { box-shadow: 0 0 0 0 var(--success); }
+  to { box-shadow: 0 0 0 6px transparent; }
 }
 
 .execout {

@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref } from "vue";
+import { computed, h, onActivated, onDeactivated, reactive, ref } from "vue";
 import {
   NAlert,
   NButton,
   NCard,
   NDataTable,
-  NInput,
-  NModal,
+  NDrawer,
+  NDrawerContent,
+  NEmpty,
   NSelect,
   NTag,
   useMessage,
@@ -17,6 +18,8 @@ import { api, type AuditEntry } from "../api";
 const message = useMessage();
 const rows = ref<AuditEntry[]>([]);
 const loading = ref(false);
+const loadError = ref(false);
+let refreshVersion = 0;
 const sourceFilter = ref<string>("all");
 
 const sourceOptions = [
@@ -100,9 +103,18 @@ function outcomeTag(row: AuditEntry) {
 const detailModal = ref(false);
 const detailEntry = ref<AuditEntry | null>(null);
 
-function openDetail(row: AuditEntry) {
+let returnFocus: HTMLElement | null = null;
+
+function openDetail(row: AuditEntry, event: MouseEvent) {
+  returnFocus = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
   detailEntry.value = row;
   detailModal.value = true;
+}
+
+function closeDetail() {
+  detailEntry.value = null;
+  returnFocus?.focus();
+  returnFocus = null;
 }
 
 async function copyDetail() {
@@ -197,10 +209,11 @@ const columns = computed<DataTableColumns<AuditEntry>>(() => [
     title: "",
     key: "actions",
     width: 76,
+    fixed: "right",
     render: (r) =>
       h(
         NButton,
-        { size: "tiny", onClick: () => openDetail(r) },
+        { size: "tiny", onClick: (event: MouseEvent) => openDetail(r, event) },
         { default: () => "详情" }
       ),
   },
@@ -232,7 +245,9 @@ function onFilterChange() {
 }
 
 async function refresh() {
+  const version = ++refreshVersion;
   loading.value = true;
+  loadError.value = false;
   try {
     const res = await api.auditPage(
       pagination.page,
@@ -241,50 +256,63 @@ async function refresh() {
       sessionFilter.value,
       actionFilter.value
     );
+    if (version !== refreshVersion) return;
+    const lastPage = Math.max(1, Math.ceil(res.total / pagination.pageSize));
+    if (pagination.page > lastPage) {
+      pagination.page = lastPage;
+      void refresh();
+      return;
+    }
     rows.value = res.entries;
     pagination.itemCount = res.total;
-    auditFailures.value = await api.auditFailures();
-    sessionList.value = await api.auditSessions();
-  } catch (e) {
-    message.error(String(e));
+    const [failures, sessions] = await Promise.all([api.auditFailures(), api.auditSessions()]);
+    if (version !== refreshVersion) return;
+    auditFailures.value = failures;
+    sessionList.value = sessions;
+  } catch {
+    if (version === refreshVersion) loadError.value = true;
   } finally {
-    loading.value = false;
+    if (version === refreshVersion) loading.value = false;
   }
 }
 
-onMounted(refresh);
+onActivated(() => { void refresh(); });
+onDeactivated(() => {
+  refreshVersion++;
+  detailModal.value = false;
+  returnFocus = null;
+});
 </script>
 
 <template>
   <div class="page">
-    <n-card title="审计日志" size="small">
-      <template #header-extra>
-        <div style="display: flex; gap: 8px; align-items: center">
-          <n-select
-            v-model:value="sourceFilter"
-            :options="sourceOptions"
-            style="width: 160px"
-            size="small"
-            @update:value="onFilterChange"
-          />
-          <n-select
-            v-model:value="actionFilter"
-            :options="actionOptions"
-            style="width: 150px"
-            size="small"
-            @update:value="onFilterChange"
-          />
-          <n-select
-            v-model:value="sessionFilter"
-            :options="sessionOptions"
-            size="small"
-            style="width: 200px"
-            placeholder="按会话筛选"
-            @update:value="onFilterChange"
-          />
-          <n-button size="small" :loading="loading" @click="refresh">刷新</n-button>
-        </div>
-      </template>
+    <div class="toolbar audit-toolbar">
+      <n-select
+        v-model:value="sourceFilter"
+        :options="sourceOptions"
+        class="audit-filter" aria-label="按来源筛选"
+        size="small"
+        @update:value="onFilterChange"
+      />
+      <n-select
+        v-model:value="actionFilter"
+        :options="actionOptions"
+        class="audit-filter" aria-label="按动作筛选"
+        size="small"
+        @update:value="onFilterChange"
+      />
+      <n-select
+        v-model:value="sessionFilter"
+        :options="sessionOptions"
+        size="small"
+        class="audit-filter" aria-label="按会话筛选"
+        placeholder="按会话筛选"
+        @update:value="onFilterChange"
+      />
+      <n-button size="small" :loading="loading" @click="refresh">刷新</n-button>
+    </div>
+    <n-card size="small">
+      <n-alert v-if="loadError" type="error" title="暂时无法加载审计记录" class="audit-error">请点击刷新重试。</n-alert>
       <n-alert
         v-if="auditFailures > 0"
         type="error"
@@ -303,76 +331,77 @@ onMounted(refresh);
         :bordered="false"
         size="small"
         :row-key="rowKey"
-        :max-height="520"
+        :max-height="'max(180px, calc(100vh - 290px))'"
         :scroll-x="1080"
         :pagination="pagination"
-      />
+      >
+        <template #empty>
+          <n-empty :description="loadError ? '审计记录读取失败' : loading ? '正在读取审计记录…' : '没有匹配的审计记录'" />
+        </template>
+      </n-data-table>
       <p class="hint" style="margin-top: 10px">
         所有 AI 操作、人工命令与安全事件（拦截 / 审批 / 授权变更）均记录在案；列表仅显示内容摘要，点「详情」查看全文。服务器列显示操作发生时的名称快照（服务器改名或删除后仍可追溯）。内容已自动脱敏。
       </p>
     </n-card>
 
-    <n-modal
-      v-model:show="detailModal"
-      preset="card"
-      title="审计详情"
-      style="width: 640px"
-    >
-      <div v-if="detailEntry">
-        <div class="detail-grid">
-          <span class="k">时间</span><span>{{ fmtTs(detailEntry.ts) }}</span>
-          <span class="k">来源</span>
-          <span>
-            <n-tag
-              size="small"
-              :bordered="false"
-              :type="detailEntry.source === 'ai' ? 'warning' : detailEntry.source === 'user' ? 'info' : 'default'"
-            >
-              {{ detailEntry.source }}
-            </n-tag>
-          </span>
-          <span class="k">操作</span><span>{{ detailEntry.action }}</span>
-          <span class="k">服务器</span>
-          <span>{{ detailEntry.serverName || detailEntry.serverId || "—" }}</span>
-          <template v-if="detailEntry.serverName && detailEntry.serverId">
-            <span class="k">服务器 ID</span>
-            <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px; opacity: 0.7">
-              {{ detailEntry.serverId }}
+    <n-drawer v-model:show="detailModal" width="min(560px, calc(100vw - 48px))" @after-leave="closeDetail">
+      <n-drawer-content title="审计详情" closable>
+        <div v-if="detailEntry">
+          <div class="detail-grid">
+            <span class="k">时间</span><span>{{ fmtTs(detailEntry.ts) }}</span>
+            <span class="k">来源</span>
+            <span>
+              <n-tag
+                size="small"
+                :bordered="false"
+                :type="detailEntry.source === 'ai' ? 'warning' : detailEntry.source === 'user' ? 'info' : 'default'"
+              >
+                {{ detailEntry.source }}
+              </n-tag>
             </span>
-          </template>
-          <span class="k">结果</span><span>{{ displayOutcome(detailEntry).label }}</span>
-          <template v-if="detailEntry.session">
-            <span class="k">会话</span>
-            <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px">{{ detailEntry.session }}</span>
-          </template>
+            <span class="k">操作</span><span>{{ detailEntry.action }}</span>
+            <span class="k">服务器</span>
+            <span>{{ detailEntry.serverName || detailEntry.serverId || "—" }}</span>
+            <template v-if="detailEntry.serverName && detailEntry.serverId">
+              <span class="k">服务器 ID</span>
+              <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px; opacity: 0.7">
+                {{ detailEntry.serverId }}
+              </span>
+            </template>
+            <span class="k">结果</span><span>{{ displayOutcome(detailEntry).label }}</span>
+            <template v-if="detailEntry.session">
+              <span class="k">会话</span>
+              <span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px">{{ detailEntry.session }}</span>
+            </template>
+          </div>
+          <div class="k" style="margin: 14px 0 6px">内容</div>
+          <pre class="audit-detail">{{ detailEntry.detail || "—" }}</pre>
         </div>
-        <div class="k" style="margin: 14px 0 6px">内容</div>
-        <n-input
-          :value="detailEntry.detail || '—'"
-          type="textarea"
-          :rows="10"
-          readonly
-          style="font-family: ui-monospace, Menlo, monospace; font-size: 12px"
-        />
-      </div>
-      <template #footer>
-        <div style="display: flex; justify-content: flex-end">
+        <template #footer>
           <n-button size="small" @click="copyDetail">复制详情</n-button>
-        </div>
-      </template>
-    </n-modal>
+        </template>
+      </n-drawer-content>
+    </n-drawer>
   </div>
 </template>
 
 <style scoped>
+.audit-toolbar { gap: 8px; }
+.audit-filter { width: 154px; }
+.audit-error { margin-bottom: 10px; }
+.audit-detail {
+  white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--canvas);
+  border-radius: var(--radius-control); font-size: 12px;
+}
 .detail-grid {
   display: grid;
-  grid-template-columns: 72px 1fr;
+  grid-template-columns: 72px minmax(0, 1fr);
+  overflow-wrap: anywhere;
   row-gap: 10px;
   font-size: 13px;
 }
 .k {
-  opacity: 0.55;
+  color: var(--muted);
   font-size: 13px;
 }
 </style>

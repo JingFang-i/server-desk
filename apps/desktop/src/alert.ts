@@ -1,11 +1,12 @@
 import { readonly, shallowRef } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import bicycleBellUrl from "./assets/bicycle-bell.wav";
 
-// 审批到达提示音：用 Web Audio 实时合成，不依赖任何音频资源文件。
+// 审批提示音由 Web Audio 播放。默认使用车铃录音，其他音色实时合成。
 // 浏览器自动播放策略要求「先有用户交互」才允许出声：首次指针/键盘操作时解锁音频上下文。
-// 提示音风格（R8 后置增强）：多种合成音色可选，偏好存 localStorage，选择即试听。
 
 let ctx: AudioContext | null = null;
+let bicycleBell: Promise<AudioBuffer | null> | null = null;
 const audioState = shallowRef<AudioState>("suspended");
 export const alertAudioState = readonly(audioState);
 let lastPlayedAt = 0;
@@ -25,6 +26,20 @@ function reportAudioReady(ready: boolean) {
   });
 }
 
+function loadBicycleBell(context: AudioContext) {
+  bicycleBell ??= fetch(bicycleBellUrl)
+    .then((response) => {
+      if (!response.ok) throw new Error("无法读取自行车铃录音");
+      return response.arrayBuffer();
+    })
+    .then((data) => context.decodeAudioData(data))
+    .catch(() => {
+      bicycleBell = null;
+      return null;
+    });
+  return bicycleBell;
+}
+
 function audioContext(): AudioContext | null {
   if (ctx) return ctx;
   const Ctor =
@@ -41,6 +56,7 @@ function audioContext(): AudioContext | null {
     };
     context.addEventListener("statechange", syncState);
     syncState();
+    if (currentChime() === DEFAULT_CHIME) void loadBicycleBell(context);
   } catch {
     return null;
   }
@@ -122,7 +138,7 @@ export interface ChimeOption {
   label: string;
 }
 
-/** 可选提示音风格（全部纯合成，无资源文件；选择存 localStorage）。 */
+/** 可选提示音风格，选择存入 localStorage。 */
 export const CHIME_OPTIONS: ChimeOption[] = [
   { value: "bell", label: "自行车铃（默认）" },
   { value: "dingdong", label: "经典叮咚" },
@@ -181,17 +197,6 @@ function chimeTones(name: string): Tone[] {
         { type: "triangle", freq: 1318.5, offset: 0, dur: 0.45, gain: 0.12 },
         { type: "sine", freq: 1567.98, freqTo: 2093, offset: 0.12, dur: 0.4, gain: 0.16 },
       ];
-    case "bell":
-      // 自行车铃：两声清脆的「叮叮」。基频约 B6，叠 2×/3× 泛音模拟金属声，
-      // 泛音衰减更快 → 主音余韵长一点，听起来像车铃而不是电子音。
-      return [
-        { type: "sine", freq: 1975.53, offset: 0, dur: 0.42, gain: 0.2 },
-        { type: "sine", freq: 3951.07, offset: 0, dur: 0.28, gain: 0.1 },
-        { type: "sine", freq: 5926.6, offset: 0, dur: 0.18, gain: 0.05 },
-        { type: "sine", freq: 1975.53, offset: 0.23, dur: 0.52, gain: 0.22 },
-        { type: "sine", freq: 3951.07, offset: 0.23, dur: 0.34, gain: 0.11 },
-        { type: "sine", freq: 5926.6, offset: 0.23, dur: 0.2, gain: 0.055 },
-      ];
     case "dingdong":
     default:
       // 经典叮咚：上行两音 + 回落（D6 → G6 → D6）
@@ -203,7 +208,7 @@ function chimeTones(name: string): Tone[] {
   }
 }
 
-/** 播放三声短促提示音（风格可选，force 用于到点提醒与试听）。 */
+/** 播放当前提示音（force 用于到点提醒与试听）。 */
 export function playApprovalChime(force = false) {
   const now = Date.now();
   if (!force && now - lastPlayedAt < MIN_INTERVAL_MS) return;
@@ -232,9 +237,24 @@ export function playApprovalChime(force = false) {
 }
 
 /** 在已解锁的上下文上排一段提示音。 */
-function scheduleChime(c: AudioContext) {
+function scheduleChime(c: AudioContext, name = currentChime()) {
+  if (name === DEFAULT_CHIME) {
+    void loadBicycleBell(c).then((buffer) => {
+      if (c.state !== "running" || currentChime() !== name) return;
+      if (!buffer) {
+        scheduleChime(c, "dingdong");
+        return;
+      }
+      const sound = c.createBufferSource();
+      sound.buffer = buffer;
+      sound.connect(c.destination);
+      sound.start();
+    });
+    return;
+  }
+
   const start = c.currentTime;
-  for (const t of chimeTones(currentChime())) {
+  for (const t of chimeTones(name)) {
     const osc = c.createOscillator();
     const gain = c.createGain();
     osc.type = t.type;

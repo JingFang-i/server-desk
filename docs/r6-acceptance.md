@@ -16,7 +16,7 @@
 | 系统通知 | `tauri-plugin-notification`；标题「ServerDesk · AI 操作待审批」，正文含服务器名与命令摘要（≤140 字、换行折叠），`.sound("Glass")` 带提示音 |
 | 窗口提示 | `request_user_attention(Critical)`：macOS 程序坞跳动 / Windows 任务栏闪烁 |
 | 点击通知 | 恢复并聚焦主窗口（`notify::init` 注册 `on_action`） |
-| 应用内 | `ApprovalAlert.vue` 监听 `approval-requested` → Web Audio 三音提示 + 应用内通知（含「去审批中心」按钮） |
+| 应用内 | `ApprovalAlert.vue` 监听 `approval-requested` → Web Audio 播放当前提示音 + 应用内通知（含「去审批中心」按钮） |
 | 角标 | 侧边栏「审批中心 (N)」随待审批数量变化 |
 | 到点提醒 | 待审批未处理期间每 30 秒再响一次（审批 120 秒后自动拒绝，避免静默过期） |
 
@@ -27,8 +27,12 @@
 - 通知正文与审批卡使用同一条已脱敏摘要，**不含凭据**：`ops::register_approval` 入队前统一
   `guard.sanitize`（含 `-pSecret`、`--password=...`、`https://user:pass@host` 形态），再限长；
   系统通知、应用内提醒、事件广播都只读这一份；发送失败只写 stderr，不影响审批流程。
-- 提示音不引入音频资源：Web Audio 实时合成；首次指针/键盘交互时解锁音频上下文（自动播放策略），
-  1.2 秒内重复触发合并，避免一次审批叠音。
+- 首次指针或键盘交互时解锁 Web Audio。默认自行车铃使用随应用分发的录音，其他音色实时合成。
+- 自行车铃素材来自 bsumusictech 的 [Bike Bell.wav](https://freesound.org/people/bsumusictech/sounds/81875/)，
+  由 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Bsumusictech_bike-bell.wav) 提供原文件，采用
+  [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) 授权。应用版截取 0.36 到 1.58 秒，
+  转为单声道，调整音量并加淡入淡出。
+- 在设置中选择「自行车铃（默认）」或点击「试听」，可听到两下机械铃声。录音读取失败时改用「经典叮咚」。
 
 ### 2. 审计日志显示服务器名称
 

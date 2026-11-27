@@ -54,7 +54,8 @@ let sectionObserver: IntersectionObserver | undefined;
 /** 点击目录：平滑滚动到对应卡片 */
 function jumpTo(id: string) {
   activeSection.value = id;
-  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  document.getElementById(id)?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
 }
 
 // ---------- 审批提醒与声音 ----------
@@ -446,17 +447,17 @@ async function copy(text: string, label: string) {
 
 <template>
   <div class="settings-layout">
-    <aside class="settings-toc">
-      <div
+    <nav class="settings-toc" aria-label="设置目录">
+      <button
         v-for="s in sections"
         :key="s.id"
         class="toc-item"
-        :class="{ active: activeSection === s.id }"
+        :aria-current="activeSection === s.id ? 'location' : undefined"
         @click="jumpTo(s.id)"
       >
         {{ s.label }}
-      </div>
-    </aside>
+      </button>
+    </nav>
     <div class="settings">
     <n-card id="sec-vault" title="保险库安全设置" size="small" style="max-width: 720px">
       <div class="row">
@@ -495,7 +496,7 @@ async function copy(text: string, label: string) {
     <n-card id="sec-alerts" title="审批提醒与声音" size="small" style="max-width: 720px; margin-top: 16px">
       <p class="hint" style="margin: 0 0 6px">
         确保 AI 请求审批时你一定能听到。两条通道互为补充：
-        应用内提示音在窗口内响（三音提示，未处理每 30 秒重复）；
+        应用内提示音在窗口内响（未处理每 30 秒重复）；
         系统通知在后台也可达（带系统音效 + 程序坞/任务栏提醒）。
       </p>
       <div class="row">
@@ -809,9 +810,10 @@ async function copy(text: string, label: string) {
       <textarea
         v-if="whitelistMode"
         v-model="whitelistText"
-        class="rules-input"
+        class="rules-input resize-none"
         rows="4"
         spellcheck="false"
+        aria-label="白名单条目"
         placeholder="uptime&#10;df -h&#10;free"
         style="margin-bottom: 14px"
       />
@@ -821,14 +823,14 @@ async function copy(text: string, label: string) {
             <n-tag size="small" type="error" :bordered="false">硬拦截</n-tag>
             命中即拒绝，不执行、不审批（每行一条，子串匹配）
           </div>
-          <textarea v-model="denyText" class="rules-input" rows="10" spellcheck="false" />
+          <textarea v-model="denyText" aria-label="硬拦截条目" class="rules-input resize-none" rows="10" spellcheck="false" />
         </div>
         <div>
           <div class="rule-title">
             <n-tag size="small" type="warning" :bordered="false">需审批</n-tag>
             AI 提交后需在「审批中心」人工批准（120 秒超时自动拒绝）
           </div>
-          <textarea v-model="approvalText" class="rules-input" rows="10" spellcheck="false" />
+          <textarea v-model="approvalText" aria-label="需审批条目" class="rules-input resize-none" rows="10" spellcheck="false" />
         </div>
       </div>
       <p class="hint">
@@ -873,6 +875,7 @@ async function copy(text: string, label: string) {
   gap: 18px;
   align-items: flex-start;
 }
+.settings { min-width: 0; flex: 1; }
 .settings-toc {
   position: sticky;
   top: 12px;
@@ -884,19 +887,22 @@ async function copy(text: string, label: string) {
 }
 .toc-item {
   padding: 7px 10px;
-  border-radius: 6px;
+  border: 0;
+  border-radius: var(--radius-control);
   font-size: 13px;
+  text-align: left;
   cursor: pointer;
-  opacity: 0.65;
-  transition: background 0.15s, opacity 0.15s;
+  color: var(--muted);
+  background: transparent;
+  transition: background var(--motion-fast), color var(--motion-fast);
 }
 .toc-item:hover {
-  background: rgba(255, 255, 255, 0.06);
-  opacity: 0.9;
+  background: var(--surface);
+  color: var(--text);
 }
-.toc-item.active {
-  background: rgba(255, 255, 255, 0.09);
-  opacity: 1;
+.toc-item[aria-current="location"] {
+  background: var(--surface);
+  color: var(--accent);
   font-weight: 600;
 }
 .row {
@@ -951,8 +957,8 @@ async function copy(text: string, label: string) {
   font-size: 12px;
   line-height: 1.7;
   font-family: ui-monospace, Menlo, monospace;
-  resize: vertical;
 }
+.resize-none { resize: none; }
 .test-result {
   margin-top: 4px;
   font-size: 12px;

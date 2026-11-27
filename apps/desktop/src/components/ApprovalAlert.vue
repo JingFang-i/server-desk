@@ -46,13 +46,15 @@ async function refresh() {
   }
 }
 
+defineExpose({ refresh });
+
 function summarize(item: PendingApproval): string {
   const command = item.command.replace(/\s+/g, " ").trim();
   return command.length > 110 ? `${command.slice(0, 110)}…` : command;
 }
 
 function alertOnce(item: PendingApproval) {
-  // 声音永远播放（三音 + 后续 30 秒重复）；已在审批中心时人正盯着列表，
+  // 到达时播放当前提示音，未处理每 30 秒重复；已在审批中心时人正盯着列表，
   // 不再弹应用内通知卡遮挡视线（系统通知不受影响，后台场景仍有）。
   playApprovalChime(true);
   if (props.currentPage === "approvals") return;

@@ -1,96 +1,229 @@
-* {
-  box-sizing: border-box;
+:root {
+  color-scheme: dark;
+  --canvas: #121923;
+  --sidebar: #101620;
+  --surface: #1b2634;
+  --popover: #222f40;
+  --line: #324254;
+  --text: #eaf1f8;
+  --muted: #a3b3c5;
+  --accent: #73c7ff;
+  --accent-hover: #a5dcff;
+  --accent-pressed: #55afea;
+  --success: #71d4ab;
+  --warning: #f5c279;
+  --danger: #ff9b9a;
+  --radius-panel: 12px;
+  --radius-control: 7px;
+  --motion-fast: 160ms;
+  --mono: ui-monospace, Menlo, Consolas, monospace;
 }
-html,
-body,
-#app {
+
+* { box-sizing: border-box; }
+
+html, body, #app {
   height: 100%;
   margin: 0;
-  padding: 0;
 }
-/* 应用全局为深色基底：NConfigProvider 的 darkTheme 只影响组件配色，
-   不会自动给页面底层上色，必须在这里显式声明，否则出现白底白字 */
-html,
-body {
-  background: #101014;
-  color: rgba(255, 255, 255, 0.9);
+
+html, body {
+  background: var(--canvas);
+  color: var(--text);
 }
-/* AI 实时活动悬浮窗（独立透明窗口）：底色交给面板自己画，
-   否则这块深色底会把圆角和炫彩流光边挡成直角矩形 */
-html.is-float,
-html.is-float body {
-  background: transparent;
-}
-/* 悬浮窗内容自己裁剪：跑马灯/绝对定位元素一旦超出视口，WebView 会给窗口加滚动条 */
-html.is-float,
-html.is-float body,
-html.is-float #app {
-  overflow: hidden;
-}
-html.is-float ::-webkit-scrollbar {
-  display: none;
-}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.18);
-  border-radius: 4px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
 
-.brand-title {
-  font-weight: 700;
-  font-size: 18px;
-  letter-spacing: 0.5px;
+html.is-float, html.is-float body { background: transparent; }
+html.is-float, html.is-float body, html.is-float #app { overflow: hidden; }
+html.is-float ::-webkit-scrollbar { display: none; }
+
+html, body, * {
+  scrollbar-color: #516780 transparent;
+  scrollbar-width: thin;
 }
-.brand-sub {
-  font-size: 12px;
-  opacity: 0.6;
-  margin-top: 2px;
+html.is-float, html.is-float * { scrollbar-width: none; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #516780; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #69819b; }
+
+button { font: inherit; }
+button:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
-.sider-note {
-  margin-top: auto;
-  font-size: 12px;
-  opacity: 0.5;
-  line-height: 1.7;
-}
-.page {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+button:disabled { cursor: not-allowed; }
+textarea { resize: none; }
+code, kbd, pre { font-family: var(--mono); }
+
+.workbench {
+  display: grid;
+  grid-template: 76px minmax(0, 1fr) 44px / 184px minmax(0, 1fr);
   height: 100%;
 }
-.toolbar {
+
+.workbench-nav {
+  grid-row: 1 / -1;
   display: flex;
-  gap: 10px;
-  align-items: center;
-}
-.hint {
-  margin-left: 10px;
-  font-size: 12px;
-  opacity: 0.55;
+  flex-direction: column;
+  gap: 24px;
+  padding: 20px 12px 12px;
+  background: var(--sidebar);
+  border-right: 1px solid var(--line);
+  min-height: 0;
+  overflow-y: auto;
 }
 
-/* 侧栏品牌位：应用图标 + 名称（图标由 scripts/gen-icon.py 统一生成） */
-.brand {
+.brand { display: flex; align-items: center; gap: 10px; padding-inline: 4px; }
+.brand-logo { width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0; }
+.brand-title { font-size: 17px; font-weight: 680; }
+.nav-list { display: grid; gap: 5px; }
+
+.nav-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
+  width: 100%;
+  min-height: 38px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--motion-fast), color var(--motion-fast);
 }
-.brand-logo {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  flex-shrink: 0;
-  /* 图标自带圆角底板，这里只给一点点投影让它从深色侧栏里浮起来 */
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+
+.nav-item:hover { color: var(--text); background: var(--surface); }
+.nav-item[aria-current="page"] { color: var(--accent); background: var(--surface); }
+.nav-item[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  width: 2px;
+  height: 15px;
+  background: var(--accent);
+  border-radius: 2px;
+  animation: nav-mark var(--motion-fast) ease-out;
+}
+@keyframes nav-mark { from { transform: translateX(-3px); opacity: 0; } }
+.nav-lock { margin-top: auto; }
+.nav-count {
+  margin-inline-start: auto;
+  border-radius: 12px;
+  padding: 0 5px;
+  background: #413525;
+  color: var(--warning);
+  font: 11px/18px var(--mono);
+}
+
+.workbench-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+}
+.workbench-header h1 { margin: 0; font-size: 24px; font-weight: 670; }
+.search-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+.search-trigger:hover { color: var(--text); border-color: var(--accent); }
+.search-trigger kbd {
+  margin-inline-start: 12px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--canvas);
+  color: var(--muted);
+  font-size: 11px;
+}
+.workbench-content { min-width: 0; overflow: auto; padding: 16px 24px; }
+.server-workspace { display: flex; flex-direction: column; }
+.activity-track {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 24px;
+  border-top: 1px solid var(--line);
+  background: var(--sidebar);
+  font-size: 12px;
+}
+.track-icon, .track-label { color: var(--accent); flex: none; }
+.track-lane { flex: 1; min-width: 0; overflow: hidden; }
+.track-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.track-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.track-warning, .track-link { color: var(--warning); }
+.track-running { color: var(--accent); }
+.track-running .track-dot { box-shadow: 0 0 10px currentColor; }
+.track-success { color: var(--success); }
+.track-error { color: var(--danger); }
+.track-state { flex: none; }
+.track-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track-link { background: none; border: 0; cursor: pointer; padding: 4px 6px; white-space: nowrap; }
+.track-link:hover { text-decoration: underline; }
+.track-enter-active, .track-leave-active { transition: opacity var(--motion-fast), transform var(--motion-fast); }
+.track-enter-from { opacity: 0; transform: translateX(-12px); }
+.track-leave-to { opacity: 0; }
+
+.search-palette { width: min(530px, calc(100vw - 32px)); }
+.palette-empty { color: var(--muted); text-align: center; padding: 20px; }
+.palette-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 320px; overflow: auto; }
+.palette-list button {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.palette-list small { color: var(--muted); }
+.palette-list button:hover, .palette-list .result-active { background: var(--popover); color: var(--accent); }
+
+.startup-state { height: 100%; display: grid; place-items: center; }
+.page { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hint { margin-left: 10px; font-size: 12px; color: var(--muted); }
+
+@media (max-width: 1020px) {
+  .workbench { grid-template-columns: 64px minmax(0, 1fr); }
+  .workbench-nav { padding-inline: 9px; }
+  .brand { justify-content: center; padding: 0; }
+  .brand-title, .nav-label { display: none; }
+  .nav-item { justify-content: center; padding: 0; }
+  .nav-count { position: absolute; right: 1px; top: 0; }
+  .workbench-header, .workbench-content, .activity-track { padding-inline: 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:not(.is-float) *, html:not(.is-float) *::before, html:not(.is-float) *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

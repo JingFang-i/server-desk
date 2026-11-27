@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import {
+  NAlert,
   NButton,
   NCard,
   NInput,
@@ -11,13 +12,17 @@ import {
   NSelect,
   NSwitch,
   NTag,
+  useDialog,
   useMessage,
 } from "naive-ui";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api, type BackupInfo } from "../api";
 
 const message = useMessage();
+const dialog = useDialog();
 const info = ref<BackupInfo | null>(null);
+const loading = ref(true);
+const loadError = ref(false);
 
 // 手动导出
 const exportPassword = ref("");
@@ -45,13 +50,17 @@ const intervalOptions = [
 ];
 
 async function refresh() {
+  loading.value = true;
+  loadError.value = false;
   try {
     info.value = await api.backupInfo();
     autoEnabled.value = info.value.settings.enabled;
     autoKeep.value = info.value.settings.keep;
     autoInterval.value = info.value.settings.intervalHours;
-  } catch (e) {
-    message.error(String(e));
+  } catch {
+    loadError.value = true;
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -100,7 +109,8 @@ async function pickFile() {
   if (typeof path === "string") restorePath.value = path;
 }
 
-async function doRestore() {
+function requestRestore() {
+  if (restoring.value) return;
   if (!restorePath.value) {
     message.error("请先选择备份文件");
     return;
@@ -109,9 +119,24 @@ async function doRestore() {
     message.error("请输入备份口令");
     return;
   }
+  if (restoreMode.value === "overwrite") {
+    dialog.warning({
+      title: "覆盖恢复服务器资产",
+      content: "当前服务器资产和已保存的 SSH 主机指纹将被清空，然后导入所选备份。",
+      positiveText: "覆盖恢复",
+      negativeText: "取消",
+      onPositiveClick: () => doRestore("overwrite"),
+    });
+    return;
+  }
+  void doRestore("merge");
+}
+
+async function doRestore(mode: "merge" | "overwrite") {
+  if (restoring.value) return;
   restoring.value = true;
   try {
-    const r = await api.backupRestore(restorePath.value, restorePassword.value, restoreMode.value);
+    const r = await api.backupRestore(restorePath.value, restorePassword.value, mode);
     message.success(`恢复完成：${r.imported} 台服务器（${r.mode === "merge" ? "合并" : "覆盖"}）`);
     restorePassword.value = "";
     restorePath.value = "";
@@ -172,8 +197,8 @@ async function deleteAuto(name: string) {
 </script>
 
 <template>
-  <div class="page">
-    <n-card title="导出加密备份（可迁移到其他机器）" size="small" style="max-width: 760px">
+  <div class="page backup-page">
+    <n-card title="导出加密备份" size="small">
       <div class="row">
         <span class="lab">备份口令</span>
         <n-input
@@ -204,7 +229,7 @@ async function deleteAuto(name: string) {
       </template>
     </n-card>
 
-    <n-card title="从备份文件恢复" size="small" style="max-width: 760px; margin-top: 16px">
+    <n-card title="从备份文件恢复" size="small">
       <div class="row">
         <span class="lab">备份文件</span>
         <n-input v-model:value="restorePath" readonly placeholder="尚未选择" style="flex: 1" />
@@ -222,16 +247,23 @@ async function deleteAuto(name: string) {
       <div class="row">
         <span class="lab">恢复模式</span>
         <n-radio-group v-model:value="restoreMode">
-          <n-radio-button value="merge">合并（按 ID 更新/新增，推荐）</n-radio-button>
-          <n-radio-button value="overwrite">覆盖（清空现有后导入）</n-radio-button>
+          <n-radio-button value="merge">合并</n-radio-button>
+          <n-radio-button value="overwrite">覆盖</n-radio-button>
         </n-radio-group>
       </div>
       <template #footer>
-        <n-button type="warning" :loading="restoring" @click="doRestore">开始恢复</n-button>
+        <div class="toolbar">
+          <n-button :type="restoreMode === 'overwrite' ? 'warning' : 'primary'" :loading="restoring" @click="requestRestore">
+            {{ restoreMode === "overwrite" ? "覆盖恢复…" : "合并恢复" }}
+          </n-button>
+          <span class="hint">{{ restoreMode === "overwrite"
+            ? "先清空现有服务器资产及其 SSH 指纹，再导入备份。"
+            : "同 ID 的服务器会更新，备份中的新服务器会添加，其余服务器仍保留。" }}</span>
+        </div>
       </template>
     </n-card>
 
-    <n-card title="自动备份（本机，保险库密钥加密）" size="small" style="max-width: 760px; margin-top: 16px">
+    <n-card title="本机自动备份" size="small">
       <div class="row">
         <div class="label">
           <div>开启定时自动备份</div>
@@ -259,7 +291,10 @@ async function deleteAuto(name: string) {
         </n-button>
       </template>
 
-      <div v-if="info?.files.length" class="filelist">
+      <n-alert v-if="loadError" type="error" title="暂时无法读取自动备份">
+        <n-button size="tiny" secondary @click="refresh">重试</n-button>
+      </n-alert>
+      <div v-else-if="info?.files.length" class="filelist">
         <div v-for="f in info.files" :key="f.name" class="filerow">
           <span class="fname">auto-{{ f.createdAt }}</span>
           <span class="fsize">{{ fmtSize(f.sizeBytes) }}</span>
@@ -277,12 +312,13 @@ async function deleteAuto(name: string) {
           </n-popconfirm>
         </div>
       </div>
-      <p v-else class="hint" style="margin-top: 12px">暂无自动备份文件</p>
+      <p v-else class="hint" role="status">{{ loading ? "正在读取自动备份…" : "暂无自动备份文件" }}</p>
     </n-card>
   </div>
 </template>
 
 <style scoped>
+.backup-page { max-width: 850px; }
 .row {
   display: flex;
   align-items: center;
